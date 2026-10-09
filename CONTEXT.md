@@ -5,7 +5,7 @@ Organiza um squad de agentes de desenvolvimento que executam features através d
 ## Execução
 
 **Adapter**:
-Tipo de motor que o bridge sabe dirigir (hoje `claude` e `codex`), definido no código; traduz as opções e os eventos daquele motor.
+Tipo de motor que o bridge sabe dirigir, registrado no bridge: embutido (`claude`, `codex`) ou trazido por um Plugin; traduz as opções e os eventos daquele motor.
 _Avoid_: engine, provider, runtime
 
 **Perfil**:
@@ -31,8 +31,12 @@ _Avoid_: perfil global, default
 ## Extensão
 
 **Plugin**:
-Pasta fora do repositório com `squad-plugin.json` que estende o catálogo (agentes, categorias, souls, diretrizes, avatares, Temas, padrões de execução) sem alterar o que já está salvo no workspace.
-_Avoid_: pacote, extensão (para a pasta), módulo
+Pasta fora do repositório com `squad-plugin.json` que estende o SQUAD/CODE sem alterar o núcleo nem o que já está salvo no workspace: conteúdo de catálogo (agentes, categorias, souls, diretrizes, avatares, Temas, padrões de execução), código do bridge (rotas próprias, eventos de execução, veto antes de iniciar uma execução, Adapters) ou os dois. Conteúdo pode vir de qualquer arquivo de configuração; código só é ativado pela Configuração local desta máquina.
+_Avoid_: pacote, extensão (para a pasta), addon, módulo
+
+**Capacidade**:
+Permissão que um Plugin com código pede no manifesto e que a pessoa concede na Configuração local para usar um ponto de extensão sensível (mudar uma execução, registrar um Adapter, ver o conteúdo dos prompts).
+_Avoid_: capability, permissão (para o pedido)
 
 **Tema**:
 Paleta da interface e do mapa (cidade e escritório) oferecida por um Plugin e escolhida nas Configurações.

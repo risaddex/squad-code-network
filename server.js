@@ -95,10 +95,6 @@ function needStore() {
 const PERMISSION_MODES = ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'];
 // Effort lists shared with plugins.js and schemas/squad.schema.json (one source, checked by the tests).
 const { EFFORTS, CODEX_EFFORTS } = require('./plugins.js').CONSTANTS;
-// Codex reasoning levels (model_reasoning_effort); `max`/`ultra` only reach models that list them (models_cache.json).
-const ALL_EFFORTS = [...new Set([...EFFORTS, ...CODEX_EFFORTS])];
-const CLAUDE_MODELS = ['opus', 'sonnet', 'haiku'];
-const CODEX_MODELS = ['gpt-5.5'];
 const TOOL_RE = /^[A-Za-z][A-Za-z0-9_]*(\([^()\r\n"]{0,200}\))?$|^mcp__[A-Za-z0-9_-]+(__[A-Za-z0-9_*-]+)?$/;
 const MODEL_RE = /^[A-Za-z0-9._\-\[\]]{1,80}$/;
 const MAX_EVENTS = 5000;
@@ -164,16 +160,10 @@ function resolveBin(bin) {
   });
 }
 
+const cut4k = v => typeof v === 'string' && v.length > 4000 ? v.slice(0, 4000) + '…' : v;
+
 /** Expand Windows 8.3 short names (C:\USER~1) that Claude Code's path safety checks reject. */
 const longPath = p => { try { return fs.realpathSync.native(p); } catch { return p; } };
-
-/* Claude Code loads CLAUDE.md from every folder above the cwd: project runs skip this app's own instructions.
- * Absolute patterns plus a `**`-anchored variant (last two segments of ROOT), in case the drive letter does not match. */
-const APP_MEMORY_EXCLUDES = (() => {
-  const root = longPath(ROOT).replace(/\\/g, '/'), tail = root.split('/').filter(Boolean).slice(-2).join('/');
-  const files = ['CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', '.claude/CLAUDE.md', '.claude/rules/**'];
-  return [...files.map(f => `${root}/${f}`), ...files.map(f => `**/${tail}/${f}`)];
-})();
 
 /* Each project folder is its own git repository (git init before its first run, when git is installed). Otherwise Claude Code, which
  * takes the enclosing repository as the project (git status, .claude/settings.json outside Windows), and the agents' git commands
@@ -248,6 +238,20 @@ function killTree(child) {
   else { try { process.kill(-child.pid, 'SIGTERM'); } catch { child.kill('SIGTERM'); } }
 }
 
+/* ---------- Adapters (adapters/): everything that depends on the engine behind a Perfil is asked of the registry ---------- */
+// `host` is what the Adapters may use of the bridge. startRun and recordWindows are function declarations (hoisted).
+const registry = require('./adapters').createRegistry({ ROOT, HOME, HOST, PORT, TMP_DIR, DEFAULT_BIN, DEFAULT_CODEX_BIN, MODEL_RE, cut4k, resolveBin, startRun, saveWindows: recordWindows, warn: console.warn, fsp, longPath, EFFORTS, CODEX_EFFORTS });
+/** Every level some Adapter takes (a run option is checked against the Adapter of the Perfil it lands on, later). */
+const allEfforts = () => [...new Set(registry.kinds().flatMap(k => registry.get(k).efforts))];
+const missingAdapter = p => `O Adapter "${p.adapter}" do Perfil "${p.name}" não está disponível neste bridge (plugin desligado ou não instalado).`;
+/** Usage windows seen for a Perfil (`source`: event, session or refresh); the only way they reach the table. */
+let windowsWarned = 0;
+function recordWindows(profileId, windows, source) {
+  if (!store || !windows) return false;
+  try { store.saveWindows(profileId, windows); return true; }
+  catch (e) { if (windowsWarned++ < 3) console.warn(`Janelas de uso do Perfil ${profileId} (${source}) não gravadas: ${e.message}`); return false; }
+}
+
 /* ---------- Perfis (profiles) ---------- */
 // Before the database exists every run uses this one, the same as the "Claude (padrão)" the migration creates.
 const MEM_DEFAULT = { id: dbModule.DEFAULT_PROFILE_IDS.claude, name: 'Claude (padrão)', adapter: 'claude', bin: '', configDir: '', model: '', effort: '', concurrency: 2, fallbackId: '', threshold: 90, ignoreUserConfig: true, telemetry: { ...dbModule.TELEMETRY_OFF }, isDefault: true, source: '', sourceFile: '' };
@@ -255,8 +259,8 @@ const expandHome = p => p === '~' ? os.homedir() : /^~[\\/]/.test(p) ? path.join
 const listProfiles = () => store ? store.listProfiles() : [MEM_DEFAULT];
 const getProfile = id => store ? (id ? store.getProfile(id) : null) : (id === MEM_DEFAULT.id ? MEM_DEFAULT : null);
 const defaultProfile = () => (store && store.defaultProfile()) || MEM_DEFAULT;
-const profileBin = (p, claudePath) => p.bin || (p.adapter === 'codex' ? DEFAULT_CODEX_BIN : claudePath || DEFAULT_BIN);
-const codexHome = p => p?.configDir || process.env.CODEX_HOME || path.join(HOME, '.codex');
+// An Adapter missing from the registry has no default executable: '' (profileStatus/startRun report the missing Adapter before it is used).
+const profileBin = (p, claudePath) => p.bin || registry.get(p.adapter)?.defaultBin({ claudePath, claudePathSet: !!claudePath }) || '';
 const windowsOf = id => store ? store.windowsOf(id) : {};
 /** A window at or above the Perfil's threshold whose reset is still ahead. */
 function overLimit(p) {
@@ -280,6 +284,9 @@ function activeOf(profileId) { return [...runs.values()].filter(r => r.status ==
 function callsOf(profileId) { return [...runs.values()].filter(r => r.status === 'running' && r.parentRunId && r.profileId === profileId).length; }
 
 async function profileStatus(p) {
+  const impl = registry.get(p.adapter);
+  if (!impl) return { resolved: null, version: null, configDirOk: true, error: missingAdapter(p) };
+  if (impl.status) return impl.status(p);
   const info = await binVersion(profileBin(p));
   let configDirOk = true, error = info.error;
   if (p.configDir) {
@@ -296,39 +303,12 @@ async function profileView(p) {
     view.configFiles = (entry?.files || [p.sourceFile]).map(f => path.basename(f));
     view.configError = cfgProfiles.errors.get(p.id) || [];
   }
-  // Codex: the models and levels of this Perfil's own account folder (adapters.codex reads the default CODEX_HOME).
-  if (p.adapter === 'codex') view.modelEfforts = codexModels(codexHome(p)) || {};
+  const impl = registry.get(p.adapter);
+  if (impl?.profileExtras) Object.assign(view, impl.profileExtras(p));
   return view;
 }
 
-/** Models of the codex account (models_cache.json, written by codex itself), with the reasoning levels each one takes. */
-function codexModels(home) {
-  try {
-    const file = path.join(home, 'models_cache.json');
-    if (fs.lstatSync(file).size > 4 * 1024 * 1024) return null;
-    const list = JSON.parse(fs.readFileSync(file, 'utf8')).models;
-    const out = {};
-    for (const m of Array.isArray(list) ? list : []) {
-      if (typeof m?.slug !== 'string' || !MODEL_RE.test(m.slug) || m.visibility === 'hide') continue;
-      out[m.slug] = (m.supported_reasoning_levels || []).map(l => l?.effort).filter(e => CODEX_EFFORTS.includes(e));
-    }
-    return Object.keys(out).length ? out : null;
-  } catch { return null; }
-}
-function adaptersCatalog() {
-  const cached = codexModels(codexHome(null));
-  return {
-    claude: { models: CLAUDE_MODELS.map(id => ({ id, label: id[0].toUpperCase() + id.slice(1) })), efforts: EFFORTS },
-    codex: { models: (cached ? Object.keys(cached) : CODEX_MODELS).map(id => ({ id, label: id })), efforts: CODEX_EFFORTS, modelEfforts: cached || {} },
-  };
-}
-/** model_reasoning_effort for a codex run: `max`/`ultra` only when the model lists it, otherwise `xhigh`. */
-function codexEffort(effort, model, home) {
-  if (!effort) return '';
-  if (effort !== 'max' && effort !== 'ultra') return effort;
-  const levels = model ? codexModels(home)?.[model] : null;
-  return levels && levels.includes(effort) ? effort : 'xhigh';
-}
+function adaptersCatalog() { return Object.fromEntries(registry.kinds().map(k => [k, registry.get(k).catalog()])); }
 
 const PROFILE_FIELDS = require('./plugins.js').CONSTANTS.PROFILE_FIELDS;
 /** Checks a Perfil sent by the page (a PUT may send only some fields: the rest comes from `current`). */
@@ -339,9 +319,11 @@ async function validateProfile(body, current = null) {
   const p = { id: current?.id };
   p.name = typeof src.name === 'string' ? src.name.trim() : '';
   if (!p.name || p.name.length > 40) throw new Error('Nome do Perfil: de 1 a 40 caracteres.');
-  if (!dbModule.ADAPTERS.includes(src.adapter)) throw new Error('Adapter inválido. Use claude ou codex.');
+  const kinds = registry.kinds();
+  if (!registry.has(src.adapter)) throw new Error(`Adapter inválido. Use ${kinds.length > 1 ? `${kinds.slice(0, -1).join(', ')} ou ${kinds.at(-1)}` : kinds[0]}.`);
   // Same rule as a Perfil of the configuration (editConfigProfile): the reserves pointing at it are checked against its Adapter.
   if (current && src.adapter !== current.adapter) throw new Error('O Adapter de um Perfil não muda depois de criado.');
+  const impl = registry.get(src.adapter);
   p.adapter = src.adapter;
   p.configDir = typeof src.configDir === 'string' ? src.configDir.trim() : '';
   if (p.configDir) {
@@ -356,7 +338,7 @@ async function validateProfile(body, current = null) {
   p.model = typeof src.model === 'string' ? src.model.trim() : '';
   if (p.model && !MODEL_RE.test(p.model)) throw new Error('Modelo inválido.');
   p.effort = typeof src.effort === 'string' ? src.effort.trim() : '';
-  if (p.effort && !(p.adapter === 'codex' ? CODEX_EFFORTS : EFFORTS).includes(p.effort)) throw new Error('Nível de esforço inválido para esse Adapter.');
+  if (p.effort && !impl.efforts.includes(p.effort)) throw new Error('Nível de esforço inválido para esse Adapter.');
   p.concurrency = Number(src.concurrency);
   if (!Number.isInteger(p.concurrency) || p.concurrency < 1 || p.concurrency > 10) throw new Error('Teto de execuções do Perfil: de 1 a 10.');
   p.threshold = Number(src.threshold);
@@ -366,6 +348,7 @@ async function validateProfile(body, current = null) {
   p.ignoreUserConfig = src.ignoreUserConfig !== false;
   const t = src.telemetry && typeof src.telemetry === 'object' ? src.telemetry : {};
   p.telemetry = { enabled: t.enabled === true, native: t.native === true, content: t.content === true };
+  impl.validateProfile?.(src, p);
   return p;
 }
 
@@ -706,7 +689,7 @@ function sendTrace(run, exit) {
   const traceId = traceIdOf(run), end = Date.parse(run.endedAt), start = Date.parse(run.startedAt), u = exit.usage || {};
   const root = {
     traceId, spanId: spanIdOf(run.id), name: 'squad.run', kind: 1, startTimeUnixNano: nanos(start), endTimeUnixNano: nanos(end),
-    attributes: Object.entries({ ...squadAttrs(run), 'gen_ai.system': run.adapter === 'codex' ? 'openai' : 'anthropic', 'gen_ai.request.model': exit.model || run.model || '', 'gen_ai.usage.input_tokens': u.input ?? 0, 'gen_ai.usage.output_tokens': u.output ?? 0, 'gen_ai.usage.cache_read_input_tokens': u.cacheRead ?? 0, 'squad.status': run.status, ...(run.profile.telemetry.content ? { 'gen_ai.prompt': run.prompt.slice(0, 16000), 'gen_ai.completion': String(exit.result || '').slice(0, 16000) } : {}) }).map(([k, v]) => attr(k, v)),
+    attributes: Object.entries({ ...squadAttrs(run), 'gen_ai.system': run.impl?.genAiSystem || 'unknown', 'gen_ai.request.model': exit.model || run.model || '', 'gen_ai.usage.input_tokens': u.input ?? 0, 'gen_ai.usage.output_tokens': u.output ?? 0, 'gen_ai.usage.cache_read_input_tokens': u.cacheRead ?? 0, 'squad.status': run.status, ...(run.profile.telemetry.content ? { 'gen_ai.prompt': run.prompt.slice(0, 16000), 'gen_ai.completion': String(exit.result || '').slice(0, 16000) } : {}) }).map(([k, v]) => attr(k, v)),
     status: exit.isError ? { code: 2, message: String(exit.error || '').slice(0, 500) } : { code: 1 },
   };
   // A Chamado (call) hangs from the parent's tool span, in the parent's trace.
@@ -717,21 +700,11 @@ function sendTrace(run, exit) {
   fetch(otlpBase(cfg.endpoint) + '/v1/traces', { method: 'POST', headers: { 'content-type': 'application/json', ...telemetryHeaders(cfg) }, body: JSON.stringify(body), signal: AbortSignal.timeout(4000) })
     .catch(() => {}); // never logged with its headers
 }
-/** The CLIs' own telemetry (Perfil telemetry.native): Claude through env vars, Codex through -c otel.* (only without secret headers). */
-function nativeTelemetry(run, profile, env, args, warn) {
+/** The CLIs' own telemetry (Perfil telemetry.native): the Adapter decides how it reaches its CLI (env vars, -c flags...). */
+function nativeTelemetry(run, impl, profile, env, args, warn) {
   const cfg = telemetryConfig();
-  if (!profile.telemetry?.enabled || !profile.telemetry.native || !cfg.endpoint) return;
-  const base = otlpBase(cfg.endpoint), content = !!profile.telemetry.content;
-  if (profile.adapter === 'claude') {
-    Object.assign(env, { CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'otlp', OTEL_LOGS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_ENDPOINT: base, OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json', OTEL_SERVICE_NAME: cfg.serviceName,
-      OTEL_RESOURCE_ATTRIBUTES: Object.entries(squadAttrs(run)).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join(',') });
-    const h = telemetryHeaders(cfg);
-    if (Object.keys(h).length) env.OTEL_EXPORTER_OTLP_HEADERS = Object.entries(h).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join(',');
-    if (content) env.OTEL_LOG_USER_PROMPTS = '1';
-  } else {
-    if (Object.keys(cfg.headersEnv).length) return warn('Telemetria nativa do Codex desligada: os headers do OTLP levam segredos, que nunca vão para a linha de comando.');
-    args.push('-c', `otel.exporter={otlp-http={endpoint=${JSON.stringify(base + '/v1/logs')},protocol="json"}}`, '-c', `otel.trace_exporter={otlp-http={endpoint=${JSON.stringify(base + '/v1/traces')},protocol="json"}}`, '-c', `otel.log_user_prompt=${content}`);
-  }
+  if (!impl.nativeTelemetry || !profile.telemetry?.enabled || !profile.telemetry.native || !cfg.endpoint) return;
+  impl.nativeTelemetry(run, profile, { env, args, warn, base: otlpBase(cfg.endpoint), cfg, content: !!profile.telemetry.content, headers: telemetryHeaders(cfg), attrs: squadAttrs(run) });
 }
 
 /* ---------- runs ---------- */
@@ -746,7 +719,7 @@ function pushEvent(run, event) {
   observe(run, event);
 }
 
-/* What the bridge learns from the stream: tool spans (telemetry), the model, Claude's usage windows; a Chamado's text also goes to
+/* What the bridge learns from the stream: tool spans (telemetry), the model, the Adapter's usage windows; a Chamado's text also goes to
    the calling run, under the open tool call (as --forward-subagent-text does for Claude subagents). */
 function observe(run, event) {
   const content = Array.isArray(event.message?.content) ? event.message.content : null;
@@ -755,39 +728,15 @@ function observe(run, event) {
     if (event.type === 'user') for (const b of content) { const t = b?.type === 'tool_result' && run.toolSpans.get(b.tool_use_id); if (t) { t.end = Date.now(); t.error = !!b.is_error; } }
   }
   if (event.type === 'system' && event.subtype === 'init' && typeof event.model === 'string' && event.model) run.seenModel = event.model;
-  if (event.type === 'rate_limit_event' && store) {
-    const w = claudeWindows(event);
-    if (w) try { store.saveWindows(run.profileId, w); } catch {}
+  if (run.impl?.onEvent) {
+    // Hot path of every event: an Adapter that throws never breaks the stream (warned once per run).
+    try { const seen = run.impl.onEvent(run, event); if (seen?.windows) recordWindows(run.profileId, seen.windows, 'event'); }
+    catch (e) { if (!run.onEventWarned) { run.onEventWarned = true; console.warn(`Adapter ${run.adapter}: onEvent falhou (execução ${run.id}): ${e.message}`); } }
   }
   if (run.parent && event.type === 'assistant' && !event.parent_tool_use_id && run.parent.status === 'running') {
     pushEvent(run.parent, { ...event, parent_tool_use_id: run.toolUseId || run.parent.translator?.openCall() || null });
   }
 }
-/** rate_limit_event → {five_hour, seven_day}: utilization 0..1 and the reset instant (epoch seconds in the event). */
-function claudeWindows(evt) {
-  const info = evt.rate_limit_info || evt.rateLimitInfo;
-  if (!info || typeof info !== 'object') return null;
-  const out = {};
-  const put = (w, v) => {
-    if (!v || typeof v !== 'object') return;
-    let u = Number(v.utilization ?? v.used_percent);
-    if (!Number.isFinite(u)) return;
-    if (u > 1.5) u /= 100; // a percentage
-    const r = Number(v.resetsAt ?? v.resets_at);
-    out[w] = { utilization: u, resetsAt: Number.isFinite(r) && r > 0 ? new Date(r < 1e12 ? r * 1000 : r).toISOString() : null };
-  };
-  const uw = info.unifiedWindows || info.unified_windows;
-  if (uw && typeof uw === 'object') for (const w of dbModule.WINDOWS) put(w, uw[w]);
-  else if (dbModule.WINDOWS.includes(info.rateLimitType)) put(info.rateLimitType, info);
-  return Object.keys(out).length ? out : null;
-}
-function claudeUsage(r) {
-  const u = r?.usage;
-  if (!u || typeof u !== 'object') return null;
-  const n = v => Number.isFinite(v) ? v : 0;
-  return { input: n(u.input_tokens), cacheRead: n(u.cache_read_input_tokens), cacheWrite: n(u.cache_creation_input_tokens), output: n(u.output_tokens), reasoning: n(u.output_tokens_details?.thinking_tokens ?? u.reasoning_output_tokens) };
-}
-
 /* Run history (db.js): events go to the database in small batches. Partial text deltas are not kept (the console never shows
    them) and long tool outputs are cut; the exit event is always kept, past MAX_EVENTS too. */
 function persistEvent(run, event) {
@@ -805,7 +754,6 @@ function flushRun(run) {
   try { store.appendRunEvents(run.id, batch); }
   catch (e) { run.persist = false; console.warn(`Histórico da execução ${run.id} não gravado: ${e.message}`); }
 }
-const cut4k = v => typeof v === 'string' && v.length > 4000 ? v.slice(0, 4000) + '…' : v;
 function storedEvent(event) {
   if (event.type !== 'user' || !Array.isArray(event.message?.content)) return event;
   const block = b => b?.type !== 'tool_result' ? b : { ...b, content: Array.isArray(b.content) ? b.content.map(x => x?.type === 'text' ? { ...x, text: cut4k(x.text) } : x) : cut4k(b.content) };
@@ -829,7 +777,7 @@ function validateRunOptions(o = {}) {
   } else throw new Error('Execução sem pasta de projeto: informe a pasta da operação (opção "project", em projects/).');
   if (o.model) { if (!MODEL_RE.test(o.model)) throw new Error('Modelo inválido.'); out.model = o.model; }
   if (o.permissionMode) { if (!PERMISSION_MODES.includes(o.permissionMode)) throw new Error('Modo de permissão inválido.'); out.permissionMode = o.permissionMode; }
-  if (o.effort) { if (!ALL_EFFORTS.includes(o.effort)) throw new Error('Nível de esforço inválido.'); out.effort = o.effort; }
+  if (o.effort) { if (!allEfforts().includes(o.effort)) throw new Error('Nível de esforço inválido.'); out.effort = o.effort; }
   if (o.maxBudgetUsd !== undefined && o.maxBudgetUsd !== '' && o.maxBudgetUsd !== null) {
     const n = Number(o.maxBudgetUsd); if (!Number.isFinite(n) || n <= 0 || n > 1000) throw new Error('Orçamento máximo inválido.'); out.maxBudgetUsd = String(n);
   }
@@ -870,213 +818,12 @@ function validateAgents(value) {
       agent.tools = def.tools;
     }
     if (def.model) { if (!MODEL_RE.test(def.model)) throw new Error(`Modelo inválido do agente ${key}.`); agent.model = def.model; }
-    if (def.effort) { if (!ALL_EFFORTS.includes(def.effort)) throw new Error(`Esforço inválido do agente ${key}.`); agent.effort = def.effort; }
+    if (def.effort) { if (!allEfforts().includes(def.effort)) throw new Error(`Esforço inválido do agente ${key}.`); agent.effort = def.effort; }
     out[key] = agent;
     meta[key] = { profile: typeof def.profile === 'string' ? def.profile.trim().slice(0, 100) : '', agentId: typeof def.agentId === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(def.agentId) ? def.agentId : null };
   }
   if (JSON.stringify(out).length > 400000) throw new Error('Definição dos agentes muito grande.');
   return entries.length ? { agents: out, meta } : null;
-}
-
-const CODEX_WRITE_TOOLS = ['Edit', 'Write', 'Bash', 'MultiEdit', 'NotebookEdit'];
-const claudeLike = m => /^(opus|sonnet|haiku|fable|claude|inherit|default)/i.test(m || '');
-/** A folder inside a git repository (codex refuses others without --skip-git-repo-check). Project folders stop at PROJECTS_DIR. */
-function inGitRepo(dir, projectRun) {
-  for (let d = dir, i = 0; i < 64; i++) {
-    if (fs.existsSync(path.join(d, '.git'))) return true;
-    if (projectRun) return false;
-    const up = path.dirname(d); if (up === d) return false; d = up;
-  }
-  return false;
-}
-
-/** argv of `codex exec --json` (prompt on stdin). Secrets never go here: the MCP token is an env var of the child. */
-function codexArgs(run, opts, profile, model, effort, warn) {
-  const names = opts.tools === null ? null : [...opts.tools, ...opts.allowedTools.map(t => t.replace(/\(.*$/, ''))];
-  const write = opts.permissionMode !== 'plan' && (names === null || names.some(t => CODEX_WRITE_TOOLS.includes(t)));
-  const args = ['exec', '--json', '-C', opts.cwd, '--sandbox', write ? 'workspace-write' : 'read-only', '-c', 'approval_policy="never"'];
-  if (profile.ignoreUserConfig) {
-    // Without the person's config.toml, and without the skill/plugin/app catalogs and memories it would still load: an "ok" went
-    // from ~20k to ~13k input tokens on codex-cli 0.161 (the login in CODEX_HOME is kept).
-    args.push('--ignore-user-config', '-c', 'skills.include_instructions=false', '-c', 'skills.bundled.enabled=false', '-c', 'include_apps_instructions=false',
-      '-c', 'features.plugins=false', '-c', 'features.apps=false', '-c', 'features.memories=false');
-  }
-  if (!inGitRepo(opts.cwd, opts.projectRun)) args.push('--skip-git-repo-check');
-  if (model) args.push('-m', model);
-  if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
-  for (const d of opts.addDirs) args.push('--add-dir', d);
-  if (opts.agents) {
-    args.push('-c', `mcp_servers.squad.url="http://${HOST}:${PORT}/mcp"`, '-c', 'mcp_servers.squad.bearer_token_env_var="SQUAD_MCP_TOKEN"', '-c', `mcp_servers.squad.tool_timeout_sec=${opts.timeoutSec + 60}`,
-      // With approval_policy="never" codex refuses MCP calls that ask for approval: this one tool is pre-approved.
-      '-c', 'mcp_servers.squad.tools.chamar_colega.approval_mode="approve"');
-  }
-  if (opts.maxBudgetUsd) warn('O Codex não tem orçamento máximo por execução: o limite foi ignorado.');
-  return args;
-}
-
-/** Codex `exec --json` events → Claude stream-json (ADR 0001). feed() returns the events to emit; finish() the closing result. */
-function codexTranslator(run) {
-  const st = { threadId: null, last: '', turns: 0, failed: null, lastError: null, started: new Set(), calls: [], usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0 } };
-  const assistant = content => ({ type: 'assistant', message: { role: 'assistant', content } });
-  const isCall = it => it.type === 'mcp_tool_call' && it.server === 'squad' && it.tool === 'chamar_colega';
-  const toolUse = it => {
-    const base = { type: 'tool_use', id: String(it.id) };
-    if (it.type === 'command_execution') return { ...base, name: 'Bash', input: { command: String(it.command ?? '') } };
-    if (it.type === 'file_change') return { ...base, name: 'Edit', input: { changes: Array.isArray(it.changes) ? it.changes : [] } };
-    if (isCall(it)) { const a = it.arguments || {}, pedido = String(a.pedido ?? ''); return { ...base, name: 'Agent', input: { subagent_type: String(a.agente ?? ''), description: pedido.slice(0, 80), prompt: pedido } }; }
-    if (it.type === 'mcp_tool_call') return { ...base, name: `mcp__${it.server}__${it.tool}`, input: it.arguments ?? {} };
-    if (it.type === 'web_search') return { ...base, name: 'WebSearch', input: { query: String(it.query ?? '') } };
-    return null;
-  };
-  const toolResult = it => {
-    let text = '', isError = it.status === 'failed';
-    if (it.type === 'command_execution') { text = String(it.aggregated_output ?? ''); if (Number.isInteger(it.exit_code) && it.exit_code !== 0) isError = true; }
-    else if (it.type === 'file_change') text = (Array.isArray(it.changes) ? it.changes : []).map(c => `${c?.kind ?? 'update'} ${c?.path ?? ''}`).join('\n');
-    else if (it.type === 'mcp_tool_call') {
-      if (it.error) { isError = true; text = String(it.error.message ?? it.error); }
-      else text = (Array.isArray(it.result?.content) ? it.result.content : []).map(b => b?.type === 'text' ? b.text : '').filter(Boolean).join('\n');
-      if (it.result?.isError || it.result?.is_error) isError = true;
-    } else if (it.type === 'web_search') text = it.query ? `Busca: ${it.query}` : '';
-    return { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: String(it.id), content: cut4k(text), is_error: isError }] } };
-  };
-  function feed(evt) {
-    const it = evt.item && typeof evt.item === 'object' ? evt.item : null;
-    switch (evt.type) {
-      case 'thread.started': st.threadId = evt.thread_id || null; return [{ type: 'system', subtype: 'init', session_id: st.threadId, model: run.model || null, adapter: 'codex', cwd: run.cwd }];
-      case 'turn.completed': {
-        st.turns++;
-        const u = evt.usage || {}, n = v => Number.isFinite(v) ? v : 0;
-        st.usage.input += n(u.input_tokens); st.usage.cacheRead += n(u.cached_input_tokens); st.usage.cacheWrite += n(u.cache_write_input_tokens); st.usage.output += n(u.output_tokens); st.usage.reasoning += n(u.reasoning_output_tokens);
-        return [];
-      }
-      case 'turn.failed': st.failed = String(evt.error?.message || 'Falha no turno do Codex.'); return [];
-      case 'error': st.lastError = String(evt.message || 'Erro do Codex.'); st.failed = st.failed || st.lastError; return [{ type: 'bridge', subtype: 'warning', message: st.lastError.slice(0, 2000) }];
-      case 'item.started': {
-        if (!it) return [];
-        const use = toolUse(it);
-        if (!use) return [];
-        st.started.add(use.id); if (isCall(it)) st.calls.push({ id: use.id, agente: String(it.arguments?.agente ?? ''), pedido: String(it.arguments?.pedido ?? ''), claimed: false });
-        return [assistant([use])];
-      }
-      case 'item.completed': {
-        if (!it) return [];
-        if (it.type === 'agent_message') { st.last = String(it.text ?? ''); return st.last ? [assistant([{ type: 'text', text: st.last }])] : []; }
-        if (it.type === 'error') return [{ type: 'bridge', subtype: 'warning', message: String(it.message ?? '').slice(0, 2000) }];
-        const use = toolUse(it);
-        if (!use) return []; // reasoning, todo_list
-        const out = st.started.has(use.id) ? [] : [assistant([use])];
-        st.started.delete(use.id); st.calls = st.calls.filter(c => c.id !== use.id);
-        out.push(toolResult(it));
-        return out;
-      }
-      default: return []; // turn.started, item.updated
-    }
-  }
-  function finish(code, durationMs) {
-    const isError = !!st.failed || code !== 0 || (!st.turns && !!st.lastError);
-    return { type: 'result', subtype: isError ? 'error_during_execution' : 'success', is_error: isError, result: isError && !st.last ? (st.failed || st.lastError || '') : st.last, session_id: st.threadId, num_turns: st.turns, duration_ms: durationMs, total_cost_usd: null,
-      usage: { input_tokens: st.usage.input, cache_read_input_tokens: st.usage.cacheRead, cache_creation_input_tokens: st.usage.cacheWrite, output_tokens: st.usage.output, reasoning_output_tokens: st.usage.reasoning } };
-  }
-  /* The open call an MCP request answers: the unclaimed one with the same arguments, else the oldest unclaimed one; each id is used
-     once, so concurrent calls never share a card (or a parent span). openCall: the latest one, for text that arrives without one. */
-  function claimCall(a) {
-    const open = st.calls.filter(c => !c.claimed), agente = String(a?.agente ?? ''), pedido = String(a?.pedido ?? '');
-    const c = open.find(x => x.agente === agente && x.pedido === pedido) || open[0];
-    if (!c) return null;
-    c.claimed = true; return c.id;
-  }
-  return { feed, finish, openCall: () => st.calls.at(-1)?.id || null, claimCall, state: st };
-}
-
-/* Codex keeps each session in <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl, with the account's rate limits in its
-   token_count events. Read only, no symlinks, only the file's tail. */
-const SESSION_TAIL = 4 * 1024 * 1024;
-const pad2 = n => String(n).padStart(2, '0');
-/* Every component under CODEX_HOME (sessions/YYYY/MM/DD) must be a real directory, never a symlink. Node has no openat, so a
-   component could still be swapped between the check and the open: the file is opened with O_NOFOLLOW and, once open, the whole
-   chain is checked again (no symlink, each directory with the same device/inode as in the first pass) and the fd must be the file
-   the path names now. Any difference discards the read. The bridge only takes numbers from the file, never returns its text. */
-function realDir(dir) { try { return fs.lstatSync(dir).isDirectory(); } catch { return false; } }
-/** Device/inode of each directory of the chain, or null when one is missing or is not a real directory. */
-function realChain(home, parts) {
-  const ids = [];
-  let d = home;
-  for (const part of parts) {
-    d = path.join(d, part);
-    let st; try { st = fs.lstatSync(d); } catch { return null; }
-    if (!st.isDirectory()) return null;
-    ids.push(`${st.dev}:${st.ino}`);
-  }
-  return ids;
-}
-const sameIds = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
-/** ref = {home, chain, name, ids}: a file found by codexSessionFile/latestCodexSession. */
-function readTail(ref) {
-  const file = path.join(ref.home, ...ref.chain, ref.name);
-  const st = fs.lstatSync(file);
-  if (!st.isFile()) return '';
-  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-  try {
-    const fst = fs.fstatSync(fd);
-    if (!fst.isFile() || fst.ino !== st.ino || fst.dev !== st.dev) return '';
-    // After the open: the same real directories, and the path still names this very file.
-    if (!sameIds(realChain(ref.home, ref.chain), ref.ids)) return '';
-    const again = fs.lstatSync(file);
-    if (!again.isFile() || again.ino !== fst.ino || again.dev !== fst.dev) return '';
-    const size = fst.size, len = Math.min(size, SESSION_TAIL), buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, size - len);
-    return buf.toString('utf8');
-  } finally { fs.closeSync(fd); }
-}
-function codexSessionFile(home, threadId, dates) {
-  if (!/^[A-Za-z0-9-]{8,80}$/.test(threadId || '')) return null;
-  for (const d of dates) {
-    const local = [String(d.getFullYear()), pad2(d.getMonth() + 1), pad2(d.getDate())];
-    const utc = [String(d.getUTCFullYear()), pad2(d.getUTCMonth() + 1), pad2(d.getUTCDate())];
-    for (const parts of [local, utc]) {
-      const chain = ['sessions', ...parts], ids = realChain(home, chain);
-      if (!ids) continue;
-      const hit = fs.readdirSync(path.join(home, ...chain), { withFileTypes: true }).find(e => e.isFile() && e.name.endsWith(`${threadId}.jsonl`));
-      if (hit) return { home, chain, name: hit.name, ids };
-    }
-  }
-  return null;
-}
-function latestCodexSession(home) {
-  // readdir entries are not followed: a symlinked YYYY/MM/DD is neither a directory nor a file here.
-  const desc = parts => realChain(home, parts) ? fs.readdirSync(path.join(home, ...parts), { withFileTypes: true }).filter(e => e.isDirectory() && /^\d{2,4}$/.test(e.name)).map(e => e.name).sort().reverse() : [];
-  for (const y of desc(['sessions'])) for (const m of desc(['sessions', y])) for (const d of desc(['sessions', y, m])) {
-    const chain = ['sessions', y, m, d], ids = realChain(home, chain);
-    if (!ids) continue;
-    const dir = path.join(home, ...chain);
-    const files = fs.readdirSync(dir, { withFileTypes: true }).filter(e => e.isFile() && e.name.endsWith('.jsonl')).map(e => ({ name: e.name, mtime: fs.lstatSync(path.join(dir, e.name)).mtimeMs }));
-    if (files.length) return { home, chain, name: files.sort((a, b) => b.mtime - a.mtime)[0].name, ids };
-  }
-  return null;
-}
-/** Last rate limits (primary 300 min → five_hour, secondary 10080 min → seven_day) and the model of a codex session file. */
-function codexSessionInfo(ref) {
-  const out = { windows: null, model: null };
-  if (!ref) return out;
-  let text; try { text = readTail(ref); } catch { return out; }
-  const lines = text.split('\n');
-  for (let i = lines.length - 1; i >= 0 && (!out.windows || !out.model); i--) {
-    if (!lines[i].includes('rate_limits') && !lines[i].includes('turn_context')) continue;
-    let o; try { o = JSON.parse(lines[i]); } catch { continue; }
-    const p = o.payload || {};
-    if (!out.model && o.type === 'turn_context' && typeof p.model === 'string' && MODEL_RE.test(p.model)) out.model = p.model;
-    const rl = p.rate_limits;
-    if (!out.windows && rl && typeof rl === 'object') {
-      const w = {};
-      for (const slot of [rl.primary, rl.secondary]) {
-        if (!slot || !Number.isFinite(slot.used_percent)) continue;
-        const name = slot.window_minutes === 300 ? 'five_hour' : slot.window_minutes === 10080 ? 'seven_day' : null;
-        if (name) w[name] = { utilization: slot.used_percent / 100, resetsAt: Number.isFinite(slot.resets_at) ? new Date(slot.resets_at * 1000).toISOString() : null };
-      }
-      if (Object.keys(w).length) out.windows = w;
-    }
-  }
-  return out;
 }
 
 const mcpTokens = new Map(); // sha256(token) → run (Codex runs with squad colleagues)
@@ -1098,7 +845,8 @@ async function startRun(body, internal = {}) {
   await configProfilesReady();
   // internal.exact: that Perfil and no other (the usage probe of Configurações > Perfis).
   const { profile, fallbackFrom } = internal.exact ? { profile: getProfile(opts.profile) || defaultProfile(), fallbackFrom: null } : pickProfile(opts.profile);
-  const adapter = profile.adapter;
+  const impl = registry.get(profile.adapter);
+  if (!impl) throw new Error(missingAdapter(profile));
   let release = () => {};
   if (!parent) {
     if (activeCount() >= maxConcurrent) throw Object.assign(new Error(`Limite de ${maxConcurrent} execuções simultâneas atingido.`), { status: 429 });
@@ -1107,99 +855,58 @@ async function startRun(body, internal = {}) {
     admitBump(profile.id, 1);
     let held = true; release = () => { if (held) { held = false; admitBump(profile.id, -1); } };
   }
-  try { return await launchRun(body, internal, opts, profile, fallbackFrom, prompt, systemPrompt); }
+  try { return await launchRun(body, internal, opts, profile, impl, fallbackFrom, prompt, systemPrompt); }
   finally { release(); }
 }
 
-async function launchRun(body, internal, opts, profile, fallbackFrom, prompt, systemPrompt) {
+async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prompt, systemPrompt) {
   const parent = internal.parent || null;
   const adapter = profile.adapter;
   // claudePath (runtime) only counts when the Perfil has no executable of its own.
   const bin = profileBin(profile, opts.claudePath);
   const resolved = await resolveBin(bin);
-  if (!resolved) throw new Error(adapter === 'codex' ? `Codex não encontrado ("${bin}"). Ajuste o executável do Perfil "${profile.name}".` : `Claude Code não encontrado ("${bin}"). Ajuste o caminho nas configurações.`);
-  if (adapter === 'claude' && opts.effort && !EFFORTS.includes(opts.effort)) throw new Error('Nível de esforço inválido para o Claude.');
+  if (!resolved) throw new Error(impl.notFound(bin, profile));
+  impl.validateLaunch?.(opts, profile);
   if (opts.projectRun) await ensureProjectRepo(opts.cwd);
 
   const id = crypto.randomUUID();
   const warnings = [];
   const warn = message => warnings.push(message);
-  let model = opts.model || profile.model || '';
-  let effort = opts.effort || profile.effort || '';
+  const { model, effort } = impl.resolveModelEffort({ opts, profile, model: opts.model || profile.model || '', effort: opts.effort || profile.effort || '', warn });
   const env = { ...process.env, ...(opts.projectRun ? { GIT_CEILING_DIRECTORIES: gitCeiling() } : {}) };
   // Only what the Perfil decides reaches the child: inherited telemetry switches (OTEL_*, CLAUDE_CODE_ENABLE_TELEMETRY,
   // OTEL_LOG_USER_PROMPTS…) are dropped here and nativeTelemetry sets them again when the Perfil turns them on.
   for (const k of Object.keys(env)) if (INHERITED_TELEMETRY.test(k)) delete env[k];
-  let args, sysFile = null, settingsFile = null, agentsFile = null, stdin = prompt, mcpToken = null;
   const run = {
     id, status: 'running', startedAt: new Date().toISOString(), endedAt: null, label: String(body.label || '').slice(0, 200),
     cwd: opts.cwd, args: [], child: null, events: [], clients: new Set(), result: null, timer: null, cancelled: false,
     // History: who ran it and where (body.meta, whitelisted in db.js), saved events count and the batch waiting to be written.
     // Without a database yet (direct API use before the setup), the run still works but stays out of the history.
     meta: dbModule.runMeta(body.meta), project: typeof body.options?.project === 'string' ? body.options.project.slice(0, 80) : '', persist: !!store, saved: 0, pending: [], flushTimer: null,
-    profile, profileId: profile.id, profileName: profile.name, adapter, model: '', opts, prompt, parent, toolUseId: internal.toolUseId || null, rootRunId: parent ? parent.rootRunId : id,
-    parentRunId: parent ? parent.id : null, children: new Set(), toolSpans: profile.telemetry?.enabled ? new Map() : null, translator: null,
+    profile, impl, profileId: profile.id, profileName: profile.name, adapter, model, opts, prompt, parent, toolUseId: internal.toolUseId || null, rootRunId: parent ? parent.rootRunId : id,
+    parentRunId: parent ? parent.id : null, children: new Set(), toolSpans: profile.telemetry?.enabled ? new Map() : null, translator: null, files: [],
   };
   run.done = new Promise(resolve => { run.resolveDone = resolve; });
 
-  if (adapter === 'codex') {
-    if (claudeLike(model)) { if (opts.model) warn(`O modelo "${opts.model}" é do Claude: o Perfil Codex usa ${profile.model || 'o modelo padrão da conta'}.`); model = profile.model && !claudeLike(profile.model) ? profile.model : ''; }
-    effort = codexEffort(effort, model, codexHome(profile));
-    run.model = model;
-    args = codexArgs(run, opts, profile, model, effort, warn);
-    if (profile.configDir) env.CODEX_HOME = profile.configDir;
-    if (opts.agents) { mcpToken = crypto.randomBytes(32).toString('hex'); env.SQUAD_MCP_TOKEN = mcpToken; }
-    // The agent's instructions go in front of the task on stdin (codex has no system prompt file).
-    if (systemPrompt.trim()) stdin = `<instrucoes-do-agente>\n${systemPrompt}\n</instrucoes-do-agente>\n\n<tarefa>\n${prompt}\n</tarefa>`;
-    run.translator = codexTranslator(run);
-  } else {
-    run.model = model;
-    args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-prompts', 'none'];
-    // OS temp cleanup can remove the (usually empty) folder while the bridge keeps running.
-    if (systemPrompt.trim() || opts.projectRun || opts.agents) await fsp.mkdir(TMP_DIR, { recursive: true });
-    if (systemPrompt.trim()) {
-      sysFile = path.join(TMP_DIR, `${id}.system.md`);
-      await fsp.writeFile(sysFile, systemPrompt, 'utf8');
-      args.push('--append-system-prompt-file', sysFile);
-    }
-    if (opts.projectRun) {
-      settingsFile = path.join(TMP_DIR, `${id}.settings.json`);
-      // The file tools also refuse reads outside the project folder (and --add-dir), so agents never take this app or the
-      // person's other folders for the project.
-      await fsp.writeFile(settingsFile, JSON.stringify({ claudeMdExcludes: APP_MEMORY_EXCLUDES, permissions: { blockReadsOutsideWorkingDirectories: true } }), 'utf8');
-      args.push('--settings', settingsFile);
-    }
-    if (opts.agents) {
-      agentsFile = path.join(TMP_DIR, `${id}.agents.json`);
-      await fsp.writeFile(agentsFile, JSON.stringify(opts.agents), 'utf8');
-      args.push('--agents', agentsFile);
-    }
-    if (opts.forwardSubagents) args.push('--forward-subagent-text');
-    if (model) args.push('--model', model);
-    if (opts.permissionMode) args.push('--permission-mode', opts.permissionMode);
-    if (effort) args.push('--effort', effort);
-    if (opts.maxBudgetUsd) args.push('--max-budget-usd', opts.maxBudgetUsd);
-    if (opts.tools) args.push('--tools', opts.tools.length ? opts.tools.join(',') : '');
-    if (opts.allowedTools.length) args.push('--allowedTools', opts.allowedTools.join(','));
-    if (opts.disallowedTools.length) args.push('--disallowedTools', opts.disallowedTools.join(','));
-    for (const d of opts.addDirs) args.push('--add-dir', d);
-    if (opts.partial) args.push('--include-partial-messages');
-    env.CLAUDE_CODE_ENTRYPOINT = process.env.CLAUDE_CODE_ENTRYPOINT || 'squad-code-bridge';
-    // With squad colleagues, calls run in the foreground: the Agent tool result is the colleague's answer, not a launch notice.
-    if (opts.agents) env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
-    if (profile.configDir) env.CLAUDE_CONFIG_DIR = profile.configDir;
-  }
-  nativeTelemetry(run, profile, env, args, warn);
-  if (adapter === 'codex') args.push('-'); // the prompt comes on stdin
-
-  // A Chamado never outlives its caller: checked again here, with no await before the spawn and parent.children.add below.
-  if (parent && !parentAlive(parent)) {
-    for (const file of [sysFile, settingsFile, agentsFile]) if (file) fsp.rm(file, { force: true }).catch(() => {});
-    throw Object.assign(new Error('A execução que fez o Chamado já terminou ou foi cancelada.'), { status: 409 });
-  }
-  const child = spawnBin(resolved, args, { cwd: opts.cwd, windowsHide: true, detached: !IS_WIN, env, stdio: ['pipe', 'pipe', 'pipe'] });
-  Object.assign(run, { child, sysFile, settingsFile, agentsFile, args: args.map(a => a === sysFile ? '<system-prompt-file>' : a === settingsFile ? '<settings-file>' : a === agentsFile ? '<agents-file>' : a) });
-  if (mcpToken) { run.mcpKey = bearerHash(mcpToken); mcpTokens.set(run.mcpKey, run); }
+  // `files` is filled by the Adapter as it writes: whatever fails before the child owns them (prepare, telemetry, spawn, a dead
+  // caller) removes them here.
+  const files = [];
+  const dropFiles = () => { for (const f of files) fsp.rm(f.path, { force: true }).catch(() => {}); };
+  let prep, child;
+  try {
+    prep = await impl.prepare({ id, run, opts, profile, model, effort, prompt, systemPrompt, env, warn, tmpDir: TMP_DIR, files });
+    for (const f of prep.files || []) if (!files.includes(f)) files.push(f);
+    if (prep.model !== undefined) run.model = prep.model;
+    run.translator = prep.translator || null;
+    nativeTelemetry(run, impl, profile, env, prep.args, warn);
+    prep.args.push(...(prep.tail || [])); // after the telemetry flags (codex ends its argv with "-": the prompt comes on stdin)
+    // A Chamado never outlives its caller: checked again here, with no await before the spawn and parent.children.add below.
+    if (parent && !parentAlive(parent)) throw Object.assign(new Error('A execução que fez o Chamado já terminou ou foi cancelada.'), { status: 409 });
+    child = spawnBin(resolved, prep.args, { cwd: opts.cwd, windowsHide: true, detached: !IS_WIN, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch (e) { dropFiles(); throw e; }
+  const args = prep.args, stdin = prep.stdin;
+  Object.assign(run, { child, files, args: args.map(a => files.find(f => f.path === a)?.mask ?? a) });
+  if (prep.mcpToken) { run.mcpKey = bearerHash(prep.mcpToken); mcpTokens.set(run.mcpKey, run); }
   if (parent) parent.children.add(run);
   runs.set(id, run);
   if (run.persist) try { store.insertRun(run); } catch (e) { run.persist = false; console.warn(`Histórico da execução ${id} não gravado: ${e.message}`); }
@@ -1237,21 +944,12 @@ async function launchRun(body, internal, opts, profile, fallbackFrom, prompt, sy
     if (run.mcpKey) mcpTokens.delete(run.mcpKey); // revoked: the run's colleagues can no longer be called
     for (const c of run.children) if (c.status === 'running') { c.cancelled = true; killTree(c.child); }
     run.endedAt = new Date().toISOString();
-    let usage = null, model = run.seenModel || run.model || null;
-    if (run.translator) {
-      run.result = run.translator.finish(code, Date.parse(run.endedAt) - Date.parse(run.startedAt));
-      pushEvent(run, run.result);
-      const st = run.translator.state;
-      usage = { ...st.usage };
-      try {
-        const info = codexSessionInfo(codexSessionFile(codexHome(profile), st.threadId, [new Date(run.startedAt), new Date()]));
-        if (info.model) model = info.model;
-        if (info.windows && store) store.saveWindows(profile.id, info.windows);
-      } catch {}
-    } else {
-      usage = claudeUsage(run.result);
-      if (!run.seenModel && run.result?.modelUsage && typeof run.result.modelUsage === 'object') model = Object.keys(run.result.modelUsage)[0] || model;
-    }
+    let fin = {};
+    try { fin = impl.finish(run, { code, durationMs: Date.parse(run.endedAt) - Date.parse(run.startedAt) }) || {}; }
+    catch (e) { console.warn(`Adapter ${adapter}: finish falhou: ${e.message}`); pushEvent(run, { type: 'bridge', subtype: 'warning', message: `O Adapter ${adapter} falhou ao encerrar a execução: ${String(e.message).slice(0, 500)}` }); }
+    if (fin.result) { run.result = fin.result; pushEvent(run, run.result); }
+    recordWindows(profile.id, fin.windows, 'session');
+    const usage = fin.usage ?? null, model = fin.model || run.seenModel || run.model || null;
     const r = run.result || {};
     const isError = run.cancelled || run.timedOut || code !== 0 || !!r.is_error;
     run.status = run.cancelled ? 'cancelled' : run.timedOut ? 'timeout' : isError ? 'error' : 'done';
@@ -1268,7 +966,7 @@ async function launchRun(body, internal, opts, profile, fallbackFrom, prompt, sy
     try { sendTrace(run, exit); } catch {}
     for (const res of run.clients) res.end();
     run.clients.clear();
-    for (const file of [run.sysFile, run.settingsFile, run.agentsFile]) if (file) fsp.rm(file, { force: true }).catch(() => {});
+    for (const f of run.files) fsp.rm(f.path, { force: true }).catch(() => {});
     run.child = null;
     if (parent) parent.children.delete(run);
     run.usage = usage; run.model = model || run.model; // the effective ones, for /api/runs/:id while the run is in memory
@@ -1340,19 +1038,11 @@ async function handleMcp(req, res) {
   }
 }
 
-/** Claude: a minimal `claude -p` on haiku without tools (its rate_limit_event updates the windows). Codex: the newest session file. */
+/** The Adapter refreshes the usage windows its own way (Claude: a minimal run; Codex: its newest session file). */
 async function refreshWindows(p) {
-  if (p.adapter === 'codex') {
-    const info = codexSessionInfo(latestCodexSession(codexHome(p)));
-    if (info.windows && store) store.saveWindows(p.id, info.windows);
-    return { observed: !!info.windows };
-  }
-  const dir = path.join(TMP_DIR, 'probe');
-  await fsp.mkdir(dir, { recursive: true });
-  const run = await startRun({ prompt: 'Responda só: ok', label: 'Atualizar uso do Perfil', options: { cwd: dir, profile: p.id, model: 'haiku', tools: [], permissionMode: 'dontAsk', timeoutSec: 120 }, meta: { kind: 'probe' } }, { exact: true });
-  const exit = await run.done;
-  if (exit.isError) throw new Error(`Não foi possível atualizar o uso: ${exit.error}`);
-  return { observed: run.events.some(e => e.type === 'rate_limit_event') };
+  const impl = registry.get(p.adapter);
+  if (!impl) throw new Error(missingAdapter(p));
+  return impl.refreshWindows(p);
 }
 
 function runSummary(r) {
@@ -1367,8 +1057,10 @@ function settingsPath(scope, cwd, project, profileId) {
     if (profileId) {
       const p = getProfile(profileId);
       if (!p) throw new Error('Perfil não encontrado.');
-      if (p.adapter !== 'claude') throw new Error('O settings.json é do Claude: escolha um Perfil Claude.');
-      if (p.configDir) return path.join(p.configDir, 'settings.json');
+      const impl = registry.get(p.adapter);
+      if (!impl?.settingsFile) throw new Error('O settings.json é do Claude: escolha um Perfil Claude.');
+      const file = impl.settingsFile(p);
+      if (file) return file;
     }
     return path.join(HOME, '.claude', 'settings.json');
   }
@@ -1456,10 +1148,11 @@ async function handle(req, res) {
       let info = await binVersion(bin);
       // engines: whether some Perfil of each Adapter can run. claudeVersion (the page's live/demo switch) falls back to the version
       // of the first usable Perfil, so a machine with only Codex is not stuck in the demo; enginePath/engineAdapter say which.
-      const engines = { claude: false, codex: false };
+      const engines = Object.fromEntries(registry.kinds().map(k => [k, false]));
       let usable = null;
       for (const p of listProfiles()) {
-        const v = await binVersion(p.adapter === 'claude' && !p.bin ? bin : profileBin(p));
+        if (!registry.has(p.adapter)) continue; // its Adapter is not registered (plugin off): the Perfil cannot run
+        const v = await binVersion(profileBin(p, bin));
         if (v.version) { engines[p.adapter] = true; if (!usable) usable = { adapter: p.adapter, ...v }; }
       }
       if (info.version) engines.claude = true;

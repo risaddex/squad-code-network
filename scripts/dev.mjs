@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Dev runner: builds index.html, starts the bridge, rebuilds on src/ changes and restarts on server.js / db.js changes.
+// Dev runner: builds index.html, starts the bridge, rebuilds on src/ changes and restarts on server.js / db.js / adapters/ changes.
 //   npm run dev [-- --port 4317]
 import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, watch } from 'node:fs';
@@ -48,7 +48,8 @@ start();
 watch(SRC, (_event, file) => { if (file && /\.(js|css|html)$/.test(file)) rebuild(); });
 const restartSoon = debounce(restart, 200);
 for (const file of ['server.js', 'db.js']) watch(path.join(ROOT, file), restartSoon);
-say('observando src/, server.js e db.js. Ctrl+C para sair.');
+watch(path.join(ROOT, 'adapters'), { recursive: true }, restartSoon);
+say('observando src/, server.js, db.js e adapters/. Ctrl+C para sair.');
 
 const stop = () => { if (server) server.kill(); process.exit(0); };
 process.on('SIGINT', stop);
