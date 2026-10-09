@@ -15,7 +15,7 @@ upstream mais um carregador genérico; o conteúdo específico de uma empresa vi
 
 ## Configuração
 
-Ordem (o último vence campo a campo; `plugins.paths` é concatenado sem repetir; `plugins.disabled` vale o do último arquivo que o declara):
+Ordem (o último vence campo a campo; `plugins.paths` é concatenado sem repetir; `plugins.disabled` vale o do último arquivo que o declara; `profiles` são mesclados por `key`):
 1. `squad.config.json` (raiz do app, opcional; o upstream não tem)
 2. `squad.local.json` (raiz do app, git-ignored)
 3. `SQUAD_CONFIG=<arquivo>` (substitui o item 2; usado nos testes)
@@ -28,15 +28,65 @@ Ordem (o último vence campo a campo; `plugins.paths` é concatenado sem repetir
     "disabled": ["pessoal"]
   },
   "runtime": { "model": "sonnet", "concurrency": 3 },
-  "profiles": []
+  "profiles": [
+    { "key": "trabalho", "name": "Claude trabalho", "adapter": "claude", "configDir": "~/.claude-work", "model": "sonnet", "effort": "high" }
+  ],
+  "defaultProfile": "trabalho"
 }
 ```
 - Caminhos relativos resolvem contra a pasta do arquivo que os declarou; `~` expande para o home.
 - `runtime`: chaves permitidas = as de `DEFAULT_RUNTIME` do app (o bridge repassa só chaves de um whitelist:
   `permissionMode, model, effort, maxBudgetUsd, timeoutSec, concurrency, addDirs, restrictTools, extraAllowedTools`).
   Vale como **default** para workspaces novos e para campos vazios; nunca sobrescreve o que a pessoa salvou.
-- `profiles`: reservado para a branch de Perfis (ignorado aqui, mas preservado e devolvido em `config` de `/api/plugins`).
+- `profiles`: Perfis declarados (termos em `CONTEXT.md`; contrato dos Perfis em `docs/plans/perfis-adapters.md`). Detalhes em
+  **Perfis da configuração**, abaixo.
+- `defaultProfile`: o Perfil padrão: a `key` de um Perfil da configuração ou o id de um Perfil existente (o último arquivo
+  que declara vence).
 - JSON inválido: o bridge loga, segue sem aquele arquivo e reporta em `warnings`.
+
+## Perfis da configuração
+
+Cada item de `profiles` usa **os mesmos campos de `POST /api/profiles`** mais `key`:
+`key, name, adapter (claude|codex), bin, configDir, model, effort, concurrency, fallbackId, threshold, ignoreUserConfig,
+telemetry {enabled, native, content}`. Campo desconhecido: aviso e ignorado. Em `telemetry` só passam `enabled`, `native` e
+`content` booleanos (outra chave ou tipo: aviso e ignorada); headers de telemetria são configuração do bridge, nunca do Perfil. O diretório da conta é `configDir` (o mesmo nome da
+API; vira a coluna `config_dir` e chega ao processo como `CLAUDE_CONFIG_DIR` / `CODEX_HOME`).
+
+- `key`: `/^[a-z0-9][a-z0-9-]{0,40}$/`, única no arquivo. O Perfil fica no banco com o id estável `cfg-<key>`.
+- Caminhos (`plugins.js`): `configDir` e um `bin` com separador, `~` ou `.` resolvem contra a pasta do arquivo que declarou o
+  campo (`~` = home); um `bin` sem barra continua sendo um nome procurado no `PATH`.
+- Mescla entre `squad.config.json` e `squad.local.json` (ou `SQUAD_CONFIG`): por `key`, o arquivo posterior sobrescreve campo a
+  campo; `telemetry` é mesclado chave a chave. A origem mostrada é o último arquivo que declarou o Perfil.
+- Validação (`server.js`): a mesma `validateProfile` de `POST /api/profiles` (nome 1..40 e único, adapter, `configDir` existente,
+  `bin` resolvível, esforço do Adapter, teto 1..10, limiar 50..100). `fallbackId` aceita a `key` de outro Perfil da configuração
+  ou o id de qualquer Perfil (mesmo Adapter, diferente de si); reserva inválida = aviso e Perfil sem reserva.
+- Segredos: nunca valores. Os Perfis não têm campo de segredo; a telemetria guarda só nomes de variáveis de ambiente (ADR 0002).
+
+Sincronização (bridge): na abertura do banco e sempre que a assinatura da configuração muda (o carregador já tem cache por
+mtime; a checagem acontece onde a página lê os Perfis: carga da página, `GET /api/plugins`, `GET /api/profiles`, nunca em cada
+execução). Na abertura do banco a ordem é: "Codex (padrão)" (`ensureCodexDefault`), depois os Perfis da configuração, então um
+`defaultProfile: "codex-default"` funciona; `/api/setup` aguarda os dois, e toda execução (`startRun`) espera a sincronização em
+andamento antes de reservar a vaga. Numa transação: primeiro saem os Perfis de configuração que não estão mais no arquivo (assim
+trocar a `key` mantendo o `name` não esbarra no nome único), depois upsert de cada Perfil válido como `cfg-<key>` com
+`source = 'config'` e `source_file` (colunas novas, migração `user_version` 4), reservas e o padrão. A assinatura (`profiles`
+mesclados com `source`/`files`, `defaultProfile`, `defaultProfileFile`, `profilesError`) só é registrada quando a sincronização
+termina sem erro de gravação (ex.: nome já usado por um Perfil manual); senão a próxima leitura tenta de novo.
+- Perfil que sai da configuração: removido da tabela; reservas que apontavam para ele são limpas; agentes que o usavam caem no
+  Perfil padrão (regra existente). Se ele era o padrão, "Claude (padrão)" (ou o primeiro que sobrar) assume. `usage_daily` e as
+  Janelas de uso ficam pelo id: se a `key` voltar, o mesmo `cfg-<key>` religa o histórico (uma reserva manual apontada para ele
+  não volta).
+- Perfil declarado mas inválido: a linha fica como estava (ou não é criada) e vai um aviso.
+- Configuração inválida (arquivo ilegível, JSON inválido, `profiles` que não é lista, item sem `key` válida ou repetida): nada
+  muda nos Perfis de configuração (não apaga por erro) e vai um aviso.
+- `defaultProfile` desconhecido: aviso, o padrão atual fica.
+- Avisos: em `warnings` de `#squad-plugins` / `GET /api/plugins` e em `configWarnings` de `GET /api/profiles`, que também traz
+  `configDefault` (nome do arquivo quando o `defaultProfile` está valendo, senão `''`). Cada Perfil traz `source` e `sourceFile`.
+- Rotas: `PUT`/`DELETE /api/profiles/cfg-*` e `POST .../default` de um Perfil da configuração respondem 409 (mensagem cita o
+  arquivo); com `defaultProfile` valendo, `POST .../default` de qualquer Perfil também responde 409. `test` e `refresh` seguem.
+- UI (Configurações > Perfis): selo com o nome do arquivo de origem (caminho no `title`), sem Editar/Excluir/Tornar padrão, dica
+  "edite o arquivo e recarregue a página"; Testar e Atualizar uso continuam. Avisos da configuração aparecem acima da lista.
+- `GET /api/plugins.config` traz `profiles` já mesclados (`{key, ...campos, source, files}`), `defaultProfile`,
+  `defaultProfileFile` e `profilesError`.
 
 ## Formato do Plugin
 
@@ -137,7 +187,7 @@ Chaves desconhecidas são ignoradas.
 - Temas têm key `<id>/<key>`.
 - O bridge relê os plugins a cada `serveIndex` (cache por mtime dos arquivos lidos), então recarregar a página
   basta depois de editar um plugin. `GET /api/plugins` devolve o mesmo objeto sem os data URLs (`src` omitido) mais
-  `config: { files: [caminhos lidos], paths: [...], disabled: [...], profiles: [...] }`.
+  `config: { files: [caminhos lidos], paths: [...], disabled: [...], profiles: [...], defaultProfile, defaultProfileFile, profilesError }`.
 - `GET /api/health` ganha `plugins: <quantidade carregada>`.
 
 ## Consumo na página (app.js)
@@ -170,7 +220,7 @@ Conteúdo específico de uma empresa vive num plugin fora do repositório; o nú
 - Bridge (`plugins.js`): presets chegam com todas as chaves (`tools`/`conv` `null` quando ausentes); operador sem `category`
   vai para `outros`; `conventions.json` é lido se existir mesmo sem o campo no manifesto; avisos citam `[<id>] agents/X.md`.
   `runtime` validado nos tipos de `DEFAULT_RUNTIME` (`timeoutSec` 10..7200, `concurrency` 1..8). Na config, `runtime`
-  mescla campo a campo, `plugins.disabled` e `profiles` são do último arquivo que os declara. Limites extras: 20 temas,
+  mescla campo a campo, `plugins.disabled` é do último arquivo que o declara; `profiles` são mesclados por `key` (seção Perfis da configuração). Limites extras: 20 temas,
   30 categorias, 200 avatares por plugin, 200 variáveis por tema. Avatares conferidos pela assinatura do arquivo.
 - App: o tema é resolvido antes do boot (`squadThemeBoot`, chamado por `city.js`, que monta a cena antes do `app.js`
   terminar). A escolha de qual workspace carregar (banco, cópia do navegador ou nenhum) é uma função só, `bootChoice()`,

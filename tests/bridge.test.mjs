@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
+import { createRequire } from 'node:module';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = 4400 + Math.floor(Math.random() * 300);
@@ -626,7 +627,9 @@ test('plugins from the local config and SQUAD_PLUGINS are loaded, validated and 
   assert.ok(!JSON.stringify(listed).includes('base64'));
   assert.deepEqual(listed.config.files, [cfg]);
   assert.deepEqual(listed.config.disabled, ['off']);
-  assert.deepEqual(listed.config.profiles, [{ name: 'p1' }]);
+  assert.deepEqual(listed.config.profiles, []); // no key: refused with a warning, and the configured Perfis stay as they are
+  assert.equal(listed.config.profilesError, true);
+  assert.match(listed.warnings.join('\n'), /profiles\[0\]: "key" ausente ou inválida/);
   assert.ok(listed.config.paths.includes(path.join(root, 'good')) && listed.config.paths.includes(path.join(root, 'envplugin')));
   assert.equal((await (await b.api('/api/health')).json()).plugins, 5);
 
@@ -694,7 +697,7 @@ test('Perfis: the in-memory default before the database, the migration creates C
   await b.stop();
   const db = new Database(path.join(dir, 'squad.db'), { readonly: true });
   try {
-    assert.equal(db.pragma('user_version', { simple: true }), 3);
+    assert.equal(db.pragma('user_version', { simple: true }), 4);
     assert.ok(db.prepare('PRAGMA table_info(runs)').all().some(c => c.name === 'parent_run_id'));
   } finally { db.close(); }
   // A deleted Codex (padrão) is not created again at the next start.
@@ -1106,4 +1109,159 @@ test('codex session files: a symlink anywhere under CODEX_HOME/sessions is not f
   const ref = await (await b.api(`/api/profiles/${p.id}/refresh`, { method: 'POST' })).json();
   assert.equal(ref.observed, false);
   await b.stop();
+});
+
+test('Perfis da configuração: criados como cfg-<key>, só leitura na API, removidos ao sair, defaultProfile e reserva por key', async () => {
+  const root = tmp('squad-cfgpf-'); extraDirs.push(root);
+  const shared = path.join(root, 'shared'), local = path.join(root, 'local');
+  mkdirSync(path.join(shared, 'contas', 'work'), { recursive: true }); mkdirSync(path.join(local, 'pessoal'), { recursive: true });
+  // squad.config.json comes from the app root (the merge between files is the next test, on the loader); here SQUAD_CONFIG and its edits.
+  const cfg = path.join(local, 'squad.local.json');
+  const write = body => { writeFileSync(cfg, JSON.stringify(body)); };
+  write({
+    profiles: [
+      { key: 'trabalho', name: 'Claude trabalho', adapter: 'claude', configDir: '../shared/contas/work', model: 'sonnet', effort: 'high', concurrency: 3, telemetry: { enabled: true } },
+      { key: 'pessoal', name: 'Claude pessoal', adapter: 'claude', configDir: 'pessoal', fallbackId: 'trabalho' },
+      { key: 'codex-x', name: 'Codex X', adapter: 'codex', fallbackId: 'trabalho' },
+    ],
+    defaultProfile: 'trabalho',
+  });
+  const b = await setupBridge({ SQUAD_CONFIG: cfg });
+  const get = async () => (await (await b.api('/api/profiles')).json());
+  let body = await get();
+  let byId = Object.fromEntries(body.profiles.map(p => [p.id, p]));
+  const work = byId['cfg-trabalho'];
+  assert.ok(work, JSON.stringify(body));
+  assert.equal(work.source, 'config'); assert.equal(work.sourceFile, cfg);
+  assert.equal(work.configDir, realpathSync.native(path.join(shared, 'contas', 'work')));
+  assert.deepEqual([work.model, work.effort, work.concurrency, work.telemetry.enabled, work.isDefault], ['sonnet', 'high', 3, true, true]);
+  assert.equal(body.configDefault, 'squad.local.json');
+  assert.equal(byId['cfg-pessoal'].fallbackId, 'cfg-trabalho'); // reserve by key
+  assert.equal(byId['cfg-pessoal'].configDir, realpathSync.native(path.join(local, 'pessoal')));
+  assert.equal(byId['cfg-codex-x'].fallbackId, ''); // another Adapter: no reserve, with a warning
+  assert.match(body.configWarnings.join('\n'), /codex-x .*mesmo Adapter.*Ficou sem reserva/);
+  assert.equal(byId['claude-default'].isDefault, false);
+
+  // Read-only through the API (409); test and refresh still work; a manual Perfil may use a config key as its reserve.
+  for (const [p, m] of [['', 'PUT'], ['', 'DELETE'], ['/default', 'POST']]) {
+    const res = await b.api(`/api/profiles/cfg-pessoal${p}`, { method: m, body: m === 'PUT' ? JSON.stringify({ concurrency: 4 }) : undefined });
+    assert.equal(res.status, 409, `${m} ${p}`);
+    assert.match((await res.json()).error, /squad\.local\.json/);
+  }
+  assert.equal((await b.api('/api/profiles/claude-default/default', { method: 'POST' })).status, 409); // the file chose the default
+  assert.equal((await (await b.api('/api/profiles/cfg-trabalho/test', { method: 'POST' })).json()).ok, true);
+  const manual = await newProfile(b, { name: 'Manual', adapter: 'claude', fallbackId: 'trabalho' });
+  assert.equal(manual.fallbackId, 'cfg-trabalho');
+  // The page gets the same warnings in squad-plugins.
+  assert.match(pageTag(await page(b.base), 'squad-plugins').warnings.join('\n'), /codex-x/);
+
+  // Usage of a configured Perfil is kept by id.
+  const r = await runOn(b, { prompt: 'hi', options: { cwd: workdir, profile: 'cfg-pessoal' }, meta: { kind: 'step' } });
+  assert.equal(profileEvt(r.events).profileId, 'cfg-pessoal');
+
+  // An invalid configuration changes nothing (no removal on a parse error).
+  writeFileSync(cfg, '{ "profiles": [');
+  body = await get();
+  assert.deepEqual(body.profiles.filter(p => p.source === 'config').map(p => p.id).sort(), ['cfg-codex-x', 'cfg-pessoal', 'cfg-trabalho']);
+  assert.match(body.configWarnings.join('\n'), /não sincronizados/);
+  // An entry that fails validation keeps its row as it was; an invalid defaultProfile keeps the current default.
+  write({
+    profiles: [
+      { key: 'trabalho', name: 'Claude trabalho', adapter: 'claude', configDir: '../shared/contas/work', concurrency: 99 },
+      { key: 'pessoal', name: 'Claude pessoal 2', adapter: 'claude' },
+    ],
+    defaultProfile: 'nao-existe',
+  });
+  body = await get();
+  byId = Object.fromEntries(body.profiles.map(p => [p.id, p]));
+  assert.equal(byId['cfg-trabalho'].concurrency, 3);
+  assert.equal(byId['cfg-pessoal'].name, 'Claude pessoal 2');
+  assert.equal(byId['cfg-pessoal'].fallbackId, '');
+  assert.equal(byId['cfg-codex-x'], undefined); // left the configuration: removed
+  assert.equal(byId['cfg-trabalho'].isDefault, true);
+  assert.equal(body.configDefault, '');
+  const w = body.configWarnings.join('\n');
+  assert.match(w, /trabalho .*Teto de execuções.*Mantido como estava/);
+  assert.match(w, /defaultProfile.*nao-existe.*mantido/);
+
+  // Leaving the configuration: removed (the default falls back to Claude (padrão)); usage stays under the id; coming back relinks it.
+  write({ profiles: [] });
+  body = await get();
+  assert.deepEqual(body.profiles.filter(p => p.source === 'config'), []);
+  assert.equal(body.profiles.find(p => p.isDefault).id, 'claude-default');
+  assert.equal(body.profiles.find(p => p.id === manual.id).fallbackId, '');
+  const usage = await (await b.api('/api/usage?by=profile')).json();
+  assert.ok(usage.rows.some(x => x.key === 'cfg-pessoal'));
+  write({ profiles: [{ key: 'pessoal', name: 'Claude pessoal', adapter: 'claude' }] });
+  body = await get();
+  assert.equal(body.profiles.find(p => p.id === 'cfg-pessoal').name, 'Claude pessoal');
+
+  // A key renamed with the same name: the old row leaves before the new one takes the name.
+  write({ profiles: [{ key: 'pessoal-2', name: 'Claude pessoal', adapter: 'claude' }] });
+  body = await get();
+  assert.deepEqual(body.profiles.filter(p => p.source === 'config').map(p => [p.id, p.name]), [['cfg-pessoal-2', 'Claude pessoal']]);
+  assert.deepEqual(body.configWarnings, []);
+  // A name taken by a manual Perfil fails the sync, which is tried again on the next read (no edit to the file needed).
+  write({ profiles: [{ key: 'pessoal-2', name: 'Claude pessoal', adapter: 'claude' }, { key: 'xara', name: 'Manual', adapter: 'claude' }] });
+  body = await get();
+  assert.equal(body.profiles.find(p => p.id === 'cfg-xara'), undefined);
+  assert.match(body.configWarnings.join('\n'), /xara .*Já existe um Perfil com esse nome/);
+  assert.equal((await b.api(`/api/profiles/${manual.id}`, { method: 'DELETE' })).status, 200);
+  body = await get();
+  assert.equal(body.profiles.find(p => p.id === 'cfg-xara')?.name, 'Manual');
+  assert.deepEqual(body.configWarnings, []);
+  await b.stop();
+});
+
+test('Perfis da configuração: squad.config.json + squad.local.json mesclados por key, campo a campo, caminhos pelo arquivo que declarou', () => {
+  const { createPluginLoader } = createRequire(import.meta.url)('../plugins.js');
+  const root = tmp('squad-cfgmerge-'); extraDirs.push(root);
+  writeFileSync(path.join(root, 'squad.config.json'), JSON.stringify({
+    profiles: [
+      { key: 'trabalho', name: 'Claude trabalho', adapter: 'claude', configDir: 'contas/work', model: 'sonnet', telemetry: { enabled: true, native: true, headers: { Authorization: 'OTEL_TOKEN' }, content: 'sim' } },
+      { key: 'so-shared', name: 'Shared', adapter: 'codex', bin: './bin/codex' },
+    ],
+    defaultProfile: 'so-shared',
+  }));
+  mkdirSync(path.join(root, 'local'));
+  const local = path.join(root, 'local', 'mine.json');
+  writeFileSync(local, JSON.stringify({ profiles: [{ key: 'trabalho', configDir: '~/.claude-work', effort: 'high', telemetry: { native: false }, segredo: 'x' }], defaultProfile: 'trabalho' }));
+  const home = path.join(root, 'home');
+  const out = createPluginLoader({ root, home, env: { SQUAD_CONFIG: local }, cwd: root }).load().api;
+  const byKey = Object.fromEntries(out.config.profiles.map(p => [p.key, p]));
+  assert.deepEqual(byKey.trabalho, {
+    key: 'trabalho', name: 'Claude trabalho', adapter: 'claude', configDir: path.join(home, '.claude-work'), model: 'sonnet', effort: 'high',
+    telemetry: { enabled: true, native: false }, source: local, files: [path.join(root, 'squad.config.json'), local],
+  });
+  assert.equal(byKey['so-shared'].bin, path.join(root, 'bin', 'codex'));
+  assert.equal(byKey['so-shared'].source, path.join(root, 'squad.config.json'));
+  assert.equal(out.config.defaultProfile, 'trabalho');
+  assert.equal(out.config.defaultProfileFile, local);
+  assert.equal(out.config.profilesError, false);
+  const warned = out.warnings.join('\n');
+  assert.match(warned, /campo "segredo" desconhecido/);
+  assert.match(warned, /campo "telemetry\.headers" desconhecido/);
+  assert.match(warned, /"telemetry\.content" deve ser true ou false/);
+  assert.ok(!JSON.stringify(out.config).includes('OTEL_TOKEN'));
+});
+
+test('Perfis da configuração: prontos antes da primeira execução (setup e reinício) e defaultProfile "codex-default"', async () => {
+  const root = tmp('squad-cfgboot-'); extraDirs.push(root);
+  const cfg = path.join(root, 'squad.local.json');
+  writeFileSync(cfg, JSON.stringify({ profiles: [{ key: 'trabalho', name: 'Claude trabalho', adapter: 'claude' }], defaultProfile: 'codex-default' }));
+  const b = await setupBridge({ SQUAD_CONFIG: cfg });
+  // No GET /api/profiles first: the run itself finds cfg-trabalho.
+  let r = await runOn(b, { prompt: 'hi', options: { cwd: workdir, profile: 'cfg-trabalho' } });
+  assert.equal(profileEvt(r.events).profileId, 'cfg-trabalho');
+  let list = await profilesOf(b);
+  assert.equal(list.find(p => p.isDefault).id, 'codex-default');
+  await b.stop();
+  // Restart with a new Perfil in the file: a run sent right after the start waits for the sync.
+  writeFileSync(cfg, JSON.stringify({ profiles: [{ key: 'trabalho', name: 'Claude trabalho', adapter: 'claude' }, { key: 'novo', name: 'Claude novo', adapter: 'claude' }], defaultProfile: 'novo' }));
+  const b2 = await startBridge(b.dir, undefined, { SQUAD_CONFIG: cfg });
+  r = await runOn(b2, { prompt: 'hi', options: { cwd: workdir } });
+  assert.equal(profileEvt(r.events).profileId, 'cfg-novo'); // the new default, applied before the run
+  list = await profilesOf(b2);
+  assert.ok(list.some(p => p.id === 'cfg-trabalho'));
+  await b2.stop();
 });

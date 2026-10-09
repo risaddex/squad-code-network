@@ -27,3 +27,17 @@ _Avoid_: fallback, backup
 **Perfil padrão**:
 Perfil usado por agentes que não escolheram um; pode ser forçado para todas as execuções nas Configurações.
 _Avoid_: perfil global, default
+
+## Extensão
+
+**Plugin**:
+Pasta fora do repositório com `squad-plugin.json` que estende o catálogo (agentes, categorias, souls, diretrizes, avatares, Temas, padrões de execução) sem alterar o que já está salvo no workspace.
+_Avoid_: pacote, extensão (para a pasta), módulo
+
+**Tema**:
+Paleta da interface e do mapa (cidade e escritório) oferecida por um Plugin e escolhida nas Configurações.
+_Avoid_: skin, estilo
+
+**Configuração local**:
+Os arquivos `squad.config.json` (compartilhável) e `squad.local.json` (desta máquina, fora do git) que apontam os Plugins (`plugins.paths` / `plugins.disabled`) e declaram Perfis; o local vence o compartilhado.
+_Avoid_: settings, preferências

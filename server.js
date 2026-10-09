@@ -56,16 +56,22 @@ if (nodeMajor < 22) console.warn(`SQUAD/CODE pede o Node 22 ou mais novo (este �
 const pluginLoader = require('./plugins.js').createPluginLoader({ root: ROOT, home: HOME });
 function loadPlugins() {
   try { return pluginLoader.load(); }
-  catch (e) { const warnings = [`Plugins não carregados: ${e.message}`]; return { page: { plugins: [], runtime: {}, warnings }, api: { plugins: [], runtime: {}, warnings, config: { files: [], paths: [], disabled: [], profiles: [] } }, count: 0 }; }
+  catch (e) { const warnings = [`Plugins não carregados: ${e.message}`]; return { page: { plugins: [], runtime: {}, warnings }, api: { plugins: [], runtime: {}, warnings, config: { files: [], paths: [], disabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: true } }, count: 0 }; }
 }
 let store = null;
 /* After the database opens: "Codex (padrão)" when codex is on the PATH (once per database). */
 async function afterOpen() {
-  try { if (store && await resolveBin(DEFAULT_CODEX_BIN)) { const made = store.ensureCodexDefault(); if (made) console.log(`Perfil criado: ${made.name}`); } }
-  catch (e) { console.warn(`Perfil do Codex não criado: ${e.message}`); }
+  // Runs wait on cfgProfiles.run (configProfilesReady): first "Codex (padrão)", then the configured Perfis, so a defaultProfile
+  // "codex-default" already exists when the configuration is applied.
+  const codex = (async () => {
+    try { if (store && await resolveBin(DEFAULT_CODEX_BIN)) { const made = store.ensureCodexDefault(); if (made) console.log(`Perfil criado: ${made.name}`); } }
+    catch (e) { console.warn(`Perfil do Codex não criado: ${e.message}`); }
+  })();
+  await syncConfigProfiles(codex);
 }
 function openDb() {
   store = dbModule.openStore(DATA_DIR);
+  cfgProfiles.sig = null;
   if (store.migration?.imported) console.log(`Workspace migrado de data/workspace.json para ${store.file} (${store.migration.versions} versões antigas). Os arquivos JSON foram para ${path.join(DATA_DIR, 'legacy-json')}.`);
   if (store.migration?.warning) console.warn(store.migration.warning);
   if (store.migration?.error) console.warn(store.migration.error);
@@ -221,7 +227,7 @@ function killTree(child) {
 
 /* ---------- Perfis (profiles) ---------- */
 // Before the database exists every run uses this one, the same as the "Claude (padrão)" the migration creates.
-const MEM_DEFAULT = { id: dbModule.DEFAULT_PROFILE_IDS.claude, name: 'Claude (padrão)', adapter: 'claude', bin: '', configDir: '', model: '', effort: '', concurrency: 2, fallbackId: '', threshold: 90, ignoreUserConfig: true, telemetry: { ...dbModule.TELEMETRY_OFF }, isDefault: true };
+const MEM_DEFAULT = { id: dbModule.DEFAULT_PROFILE_IDS.claude, name: 'Claude (padrão)', adapter: 'claude', bin: '', configDir: '', model: '', effort: '', concurrency: 2, fallbackId: '', threshold: 90, ignoreUserConfig: true, telemetry: { ...dbModule.TELEMETRY_OFF }, isDefault: true, source: '', sourceFile: '' };
 const expandHome = p => p === '~' ? os.homedir() : /^~[\\/]/.test(p) ? path.join(os.homedir(), p.slice(2)) : p;
 const listProfiles = () => store ? store.listProfiles() : [MEM_DEFAULT];
 const getProfile = id => store ? (id ? store.getProfile(id) : null) : (id === MEM_DEFAULT.id ? MEM_DEFAULT : null);
@@ -325,16 +331,94 @@ async function validateProfile(body, current = null) {
   p.threshold = Number(src.threshold);
   if (!Number.isInteger(p.threshold) || p.threshold < 50 || p.threshold > 100) throw new Error('Limiar da Janela de uso: de 50 a 100.');
   p.fallbackId = typeof src.fallbackId === 'string' ? src.fallbackId.trim() : '';
-  if (p.fallbackId) {
-    const reserve = store?.getProfile(p.fallbackId);
-    if (!reserve) throw new Error('Perfil reserva não encontrado.');
-    if (reserve.id === p.id) throw new Error('Um Perfil não pode ser a própria reserva.');
-    if (reserve.adapter !== p.adapter) throw new Error('O Perfil reserva precisa ser do mesmo Adapter.');
-  }
+  if (p.fallbackId) p.fallbackId = checkReserve(p, p.fallbackId);
   p.ignoreUserConfig = src.ignoreUserConfig !== false;
   const t = src.telemetry && typeof src.telemetry === 'object' ? src.telemetry : {};
   p.telemetry = { enabled: t.enabled === true, native: t.native === true, content: t.content === true };
   return p;
+}
+
+/** The reserve of `p`: an id or the key of a configured Perfil (`cfg-<key>`). Returns the id; throws when it cannot be the reserve. */
+function checkReserve(p, ref) {
+  let reserve = store?.getProfile(ref);
+  if (!reserve) { const cfg = store?.getProfile(`cfg-${ref}`); if (cfg?.source === 'config') reserve = cfg; }
+  if (!reserve) throw new Error('Perfil reserva não encontrado.');
+  if (reserve.id === p.id) throw new Error('Um Perfil não pode ser a própria reserva.');
+  if (reserve.adapter !== p.adapter) throw new Error('O Perfil reserva precisa ser do mesmo Adapter.');
+  return reserve.id;
+}
+
+/* ---------- Perfis declared in the configuration (docs/plans/plugins-conteudo.md: `profiles`, `defaultProfile`) ----------
+   plugins.js reads and merges them by key; here they are validated like POST /api/profiles and upserted as `cfg-<key>` (source
+   'config'). It runs when the database opens and whenever the configuration's signature changes (the loader keeps its mtime cache,
+   checked only where the page reads the Perfis: page load, /api/plugins, GET /api/profiles). Removed from the file: removed from the
+   table. A file that could not be read or a malformed list: nothing changes. defaultFile: the configuration chose the default. */
+// sig: signature of the last configuration applied without errors; pending: the one being applied (run = its promise, which runs
+// await before they take a slot). A failed sync leaves sig as it was, so the next read tries again.
+const cfgProfiles = { sig: null, pending: null, warnings: [], defaultFile: '', run: Promise.resolve() };
+// `before`: a promise the sync waits for, chained synchronously so runs already wait on it (afterOpen: "Codex (padrão)").
+function syncConfigProfiles(before = null) {
+  if (before) cfgProfiles.run = cfgProfiles.run.then(() => before);
+  if (!store) return cfgProfiles.run;
+  const cfg = loadPlugins().api.config;
+  const sig = JSON.stringify([cfg.profilesError, cfg.profiles, cfg.defaultProfile, cfg.defaultProfileFile]);
+  if (sig === cfgProfiles.sig || sig === cfgProfiles.pending) return cfgProfiles.run;
+  cfgProfiles.pending = sig;
+  cfgProfiles.run = cfgProfiles.run.then(() => applyConfigProfiles(cfg)).then(ok => { if (ok) cfgProfiles.sig = sig; }, e => { cfgProfiles.warnings = [`Perfis da configuração não sincronizados: ${e.message}`]; console.warn(cfgProfiles.warnings[0]); })
+    .finally(() => { if (cfgProfiles.pending === sig) cfgProfiles.pending = null; });
+  return cfgProfiles.run;
+}
+/** Waits until no sync of the configured Perfis is running (one may chain another while it waits). */
+async function configProfilesReady() {
+  for (let r = cfgProfiles.run; ; r = cfgProfiles.run) { await r; if (r === cfgProfiles.run) return; }
+}
+async function applyConfigProfiles(cfg) {
+  const warnings = [], file = f => path.basename(f || '') || 'configuração';
+  if (cfg.profilesError) {
+    if (cfg.profiles.length || store.listProfiles().some(p => p.source === 'config')) warnings.push('Perfis da configuração não sincronizados: a configuração tem erros (veja os avisos); os Perfis declarados ficam como estavam.');
+    cfgProfiles.warnings = warnings;
+    return true;
+  }
+  const declared = new Set(cfg.profiles.map(e => `cfg-${e.key}`)), valid = [];
+  for (const e of cfg.profiles) {
+    const { key, source, files, fallbackId, ...fields } = e, id = `cfg-${key}`;
+    try {
+      if (fallbackId !== undefined && typeof fallbackId !== 'string') throw new Error('"fallbackId" deve ser texto (id ou key de um Perfil).');
+      const p = await validateProfile({ ...fields, fallbackId: '' });
+      valid.push({ ...p, id, key, source, fallbackRef: (fallbackId || '').trim() });
+    } catch (err) { warnings.push(`Perfil ${key} (${file(source)}): ${err.message} ${store?.getProfile(id) ? 'Mantido como estava.' : 'Não criado.'}`); }
+  }
+  if (!store) return false;
+  let defaultFile = '', failed = false;
+  store.transaction(() => {
+    // Removed first: a key renamed with the same name frees the name before the new row takes it (usage and windows stay by id).
+    for (const p of store.listProfiles()) if (p.source === 'config' && !declared.has(p.id)) store.removeConfigProfile(p.id);
+    const ok = [];
+    for (const p of valid) {
+      try { store.upsertConfigProfile(p, p.source); ok.push(p); }
+      catch (err) { failed = true; warnings.push(`Perfil ${p.key} (${file(p.source)}): ${err.message}`); }
+    }
+    for (const p of ok) if (p.fallbackRef) {
+      try { store.setProfileFallback(p.id, checkReserve(p, p.fallbackRef)); }
+      catch (err) { warnings.push(`Perfil ${p.key} (${file(p.source)}): ${err.message} Ficou sem reserva.`); }
+    }
+    if (cfg.defaultProfile) {
+      const ref = cfg.defaultProfile, target = (declared.has(`cfg-${ref}`) && store.getProfile(`cfg-${ref}`)) || store.getProfile(ref);
+      if (!target) warnings.push(`"defaultProfile": "${ref}" (${file(cfg.defaultProfileFile)}) não é um Perfil conhecido; o Perfil padrão atual foi mantido.`);
+      else { if (!target.isDefault) store.setDefaultProfile(target.id); defaultFile = cfg.defaultProfileFile; }
+    }
+  });
+  cfgProfiles.defaultFile = defaultFile;
+  cfgProfiles.warnings = warnings;
+  if (warnings.length) console.warn(`Perfis da configuração: ${warnings.join(' | ')}`);
+  return !failed;
+}
+/** Plugins + configuration as the page/API get them, with the warnings of the configured Perfis appended. */
+async function pluginsWithProfiles() {
+  await syncConfigProfiles();
+  const plugins = loadPlugins();
+  if (!cfgProfiles.warnings.length) return plugins;
+  return { ...plugins, page: { ...plugins.page, warnings: [...plugins.page.warnings, ...cfgProfiles.warnings] }, api: { ...plugins.api, warnings: [...plugins.api.warnings, ...cfgProfiles.warnings] } };
 }
 
 /* ---------- telemetry (OTLP/HTTP JSON, one trace per run) ---------- */
@@ -770,6 +854,9 @@ async function startRun(body, internal = {}) {
   const systemPrompt = typeof body.systemPrompt === 'string' ? body.systemPrompt.slice(0, 100000) : '';
   const opts = validateRunOptions(body.options);
   const parent = internal.parent || null;
+  // A sync of the configured Perfis still running (database just opened, configuration changed) finishes first; awaited before the
+  // slot below is taken, which stays synchronous.
+  await configProfilesReady();
   // internal.exact: that Perfil and no other (the usage probe of Configurações > Perfis).
   const { profile, fallbackFrom } = internal.exact ? { profile: getProfile(opts.profile) || defaultProfile(), fallbackFrom: null } : pickProfile(opts.profile);
   const adapter = profile.adapter;
@@ -1106,7 +1193,7 @@ async function serveIndex(res) {
     return res.end('<!doctype html><meta charset="utf-8"><title>SQUAD/CODE</title><body style="font:15px/1.7 system-ui,sans-serif;background:#05080a;color:#d8e1e5;padding:48px;max-width:640px">'
       + '<h1 style="font-weight:500">index.html não encontrado</h1><p>A interface é gerada a partir de <code>src/</code>. Na pasta do SQUAD/CODE, rode <code>npm run dev</code> (gera e inicia o bridge) ou <code>python build.py</code> e recarregue esta página.</p></body>');
   }
-  const tags = workspaceTag() + '\n' + memoryTag() + '\n' + jsonTag('squad-plugins', loadPlugins().page); // a function replacement: the data may contain `$&` and similar patterns
+  const tags = workspaceTag() + '\n' + memoryTag() + '\n' + jsonTag('squad-plugins', (await pluginsWithProfiles()).page); // a function replacement: the data may contain `$&` and similar patterns
   html = html.replace('<head>', () => `<head>\n<meta name="squad-bridge-token" content="${TOKEN}">\n${tags}`);
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
   res.end(html);
@@ -1142,7 +1229,7 @@ async function handle(req, res) {
       return json(res, 200, { ok: true, bridge: 'squad-code', claudeVersion: info.version, claudePath: info.resolved, claudeError: info.error, engines, engineAdapter: live?.adapter || null, enginePath: live?.resolved || null, defaultCwd: process.cwd(), projectsDir: longPath(PROJECTS_DIR), home: HOME, platform: process.platform, activeRuns: activeCount(), maxConcurrent, dbReady: !setupNeeded(), dbPath: store?.file || DB_FILE, profiles: listProfiles().length, plugins: loadPlugins().count });
     }
     // Plugins as injected in the page, without the avatars' data URLs, plus the configuration they came from.
-    if (req.method === 'GET' && url.pathname === '/api/plugins') return json(res, 200, { ok: true, ...loadPlugins().api });
+    if (req.method === 'GET' && url.pathname === '/api/plugins') return json(res, 200, { ok: true, ...(await pluginsWithProfiles()).api });
     // First start: the page creates the database with the workspace the person chose (from scratch, the example, a backup or the
     // browser's copy). Validated before anything is written; refused once a workspace exists.
     if (req.method === 'POST' && url.pathname === '/api/setup') {
@@ -1231,7 +1318,8 @@ async function handle(req, res) {
       if (req.method === 'DELETE') return json(res, 200, needStore().deleteChat(parts[2], key));
     }
     if (url.pathname === '/api/profiles' && req.method === 'GET') {
-      return json(res, 200, { ok: true, profiles: await Promise.all(listProfiles().map(profileView)), adapters: adaptersCatalog() });
+      await syncConfigProfiles();
+      return json(res, 200, { ok: true, profiles: await Promise.all(listProfiles().map(profileView)), adapters: adaptersCatalog(), configDefault: cfgProfiles.defaultFile ? path.basename(cfgProfiles.defaultFile) : '', configWarnings: cfgProfiles.warnings });
     }
     if (url.pathname === '/api/profiles' && req.method === 'POST') {
       needStore();
@@ -1242,6 +1330,13 @@ async function handle(req, res) {
       const pid = decodeURIComponent(parts[2]);
       const current = getProfile(pid);
       if (!current) return fail(res, 404, 'Perfil não encontrado.');
+      // A Perfil of the configuration is changed in its file: only reading, testing and refreshing its windows go through here.
+      const fromFile = current.source === 'config' ? path.basename(current.sourceFile) || 'configuração' : '';
+      if (fromFile && !parts[3] && (req.method === 'PUT' || req.method === 'DELETE')) return fail(res, 409, `O Perfil "${current.name}" vem de ${fromFile}: edite o arquivo e recarregue a página.`);
+      if (parts[3] === 'default' && req.method === 'POST') {
+        if (cfgProfiles.defaultFile) return fail(res, 409, `O Perfil padrão vem de "defaultProfile" em ${path.basename(cfgProfiles.defaultFile)}: edite o arquivo e recarregue a página.`);
+        if (fromFile) return fail(res, 409, `O Perfil "${current.name}" vem de ${fromFile}: para torná-lo padrão use "defaultProfile" no arquivo e recarregue a página.`);
+      }
       if (!parts[3] && req.method === 'PUT') {
         needStore();
         const p = await validateProfile(await readBody(req), current);

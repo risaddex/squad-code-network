@@ -114,6 +114,15 @@ calls the hoisted `squadThemeBoot()`, which resolves the theme with `bootChoice(
 and sets CSS variables + `window.SQUAD_THEME`; `setTheme` reloads only once the change is persisted. Configurações > Plugins
 lists plugins, warnings and the theme picker. Without the tag (demo, upstream) the app behaves exactly as without plugins.
 
+**Perfis and Adapters (contract in `docs/plans/perfis-adapters.md`, ADRs in `docs/adr/`, glossary in `CONTEXT.md`).** Every run
+goes through a Perfil (row in `profiles`, outside the workspace): an instance of an Adapter (`claude`, or `codex` via `codex exec
+--json`, whose events the bridge translates to Claude's stream-json) with its own executable and account folder (`CLAUDE_CONFIG_DIR`
+/ `CODEX_HOME`), model/effort defaults, concurrency cap and Perfil reserva. Agents keep only `profileId`; `settings.runtime.
+forceProfileId` overrides them. Codex colleagues are called through the bridge's own MCP endpoint (`/mcp`, per-run token). Usage
+(tokens per run, `usage_daily`, 5h/7d windows) feeds Configurações > Perfis and the Painel. Perfis can also be declared in the
+local config (`profiles`/`defaultProfile`): synced as read-only `cfg-<key>` rows (removed when they leave the file, usage kept by
+id), and runs wait for a pending sync before picking a Perfil.
+
 **`src/app.js` (state, UI, orchestration).**
 - One persisted `state` object (localStorage key `squad-code.network.v2`, export/import as JSON). Served by the bridge, the database
   copy is the truth (`diskSync`): the boot block takes `#squad-disk` unless the browser copy has pending saves on that same rev

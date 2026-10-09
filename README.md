@@ -355,6 +355,22 @@ acme/
 └── conventions.json    # diretrizes extras (opcional)
 ```
 
+Os mesmos arquivos podem declarar **Perfis** (mesmos campos da aba Configurações > Perfis, mais uma `key`) e o Perfil
+padrão. Segredos nunca entram aqui: só nomes de variáveis de ambiente.
+
+```json
+{
+  "profiles": [
+    { "key": "trabalho", "name": "Claude trabalho", "adapter": "claude", "configDir": "~/.claude-work", "model": "sonnet", "effort": "high" },
+    { "key": "codex", "name": "Codex pessoal", "adapter": "codex", "configDir": "~/.codex", "fallbackId": "" }
+  ],
+  "defaultProfile": "trabalho"
+}
+```
+
+Eles viram os Perfis `cfg-<key>` no banco, somente leitura no app (edite o arquivo e recarregue a página); entre
+`squad.config.json` e `squad.local.json` a mescla é por `key`, campo a campo. Perfil que sai do arquivo sai do banco.
+
 Depois de editar um plugin, basta recarregar a página. Os plugins carregados e os avisos (arquivo recusado, valor
 inválido) aparecem no log do bridge, em Configurações > Plugins e em `GET /api/plugins`. Formato completo e regras:
 [docs/plans/plugins-conteudo.md](docs/plans/plugins-conteudo.md).

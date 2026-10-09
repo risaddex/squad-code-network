@@ -1640,6 +1640,8 @@ body:not(.reduce-motion) .at-tile.leaving,.at-tile.leaving{animation:at-leave .4
 .prof-card{border:1px solid #ffffff15;border-left:2px solid #e39a6f88;background:#ffffff04;padding:12px 14px}
 .prof-card.codex{border-left-color:#6fd3a888}
 .prof-card-head,.prof-usage-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.prof-card .tag svg{width:11px;height:11px;margin-right:4px;vertical-align:-1px}
+.prof-card.from-config .hint code{font-size:inherit}
 .prof-card-head strong,.prof-usage-head strong{font-size:12px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .prof-meta{font-size:10px;color:#7e97a5;line-height:1.7;margin:6px 0 8px;word-break:break-word}
 .prof-status{display:inline-flex;align-items:center;gap:5px;font:9px var(--mono);color:#7c8e97;max-width:100%}

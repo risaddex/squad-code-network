@@ -168,6 +168,13 @@ INSERT INTO usage_daily SELECT substr(started_at, 1, 10), coalesce(profile_id, '
   FROM runs WHERE coalesce(kind, '') != 'probe' AND status != 'running' GROUP BY 1, 2, 3, 4;
 `);
   },
+  // 4: Perfis declared in the local configuration (squad.config.json / squad.local.json): source 'config' + the declaring file.
+  db => {
+    db.exec(`
+ALTER TABLE profiles ADD COLUMN source TEXT NOT NULL DEFAULT '';
+ALTER TABLE profiles ADD COLUMN source_file TEXT NOT NULL DEFAULT '';
+`);
+  },
 ];
 const TELEMETRY_OFF = { enabled: false, native: false, content: false };
 
@@ -222,6 +229,9 @@ function openStore(dataDir) {
     profInsert: db.prepare('INSERT INTO profiles (id, name, adapter, bin, config_dir, model, effort, concurrency, fallback_id, threshold, ignore_user_config, telemetry, is_default, created_at, updated_at) VALUES (@id, @name, @adapter, @bin, @configDir, @model, @effort, @concurrency, @fallbackId, @threshold, @ignoreUserConfig, @telemetry, 0, @at, @at)'),
     profUpdate: db.prepare('UPDATE profiles SET name = @name, adapter = @adapter, bin = @bin, config_dir = @configDir, model = @model, effort = @effort, concurrency = @concurrency, fallback_id = @fallbackId, threshold = @threshold, ignore_user_config = @ignoreUserConfig, telemetry = @telemetry, updated_at = @at WHERE id = @id'),
     profDelete: db.prepare('DELETE FROM profiles WHERE id = ?'),
+    profUpsertCfg: db.prepare(`INSERT INTO profiles (id, name, adapter, bin, config_dir, model, effort, concurrency, fallback_id, threshold, ignore_user_config, telemetry, is_default, created_at, updated_at, source, source_file) VALUES (@id, @name, @adapter, @bin, @configDir, @model, @effort, @concurrency, NULL, @threshold, @ignoreUserConfig, @telemetry, 0, @at, @at, 'config', @sourceFile)
+      ON CONFLICT (id) DO UPDATE SET name = excluded.name, adapter = excluded.adapter, bin = excluded.bin, config_dir = excluded.config_dir, model = excluded.model, effort = excluded.effort, concurrency = excluded.concurrency, fallback_id = NULL, threshold = excluded.threshold, ignore_user_config = excluded.ignore_user_config, telemetry = excluded.telemetry, updated_at = excluded.updated_at, source = 'config', source_file = excluded.source_file`),
+    profSetFallback: db.prepare('UPDATE profiles SET fallback_id = ? WHERE id = ?'),
     profUnfallback: db.prepare('UPDATE profiles SET fallback_id = NULL WHERE fallback_id = ?'),
     profClearDefault: db.prepare('UPDATE profiles SET is_default = 0 WHERE is_default = 1'),
     profSetDefault: db.prepare('UPDATE profiles SET is_default = 1 WHERE id = ?'),
@@ -480,7 +490,7 @@ function openStore(dataDir) {
   const profileOut = r => {
     if (!r) return null;
     let telemetry = TELEMETRY_OFF; try { telemetry = { ...TELEMETRY_OFF, ...JSON.parse(r.telemetry || '{}') }; } catch {}
-    return { id: r.id, name: r.name, adapter: r.adapter, bin: r.bin || '', configDir: r.config_dir || '', model: r.model || '', effort: r.effort || '', concurrency: r.concurrency, fallbackId: r.fallback_id || '', threshold: r.threshold, ignoreUserConfig: !!r.ignore_user_config, telemetry, isDefault: !!r.is_default };
+    return { id: r.id, name: r.name, adapter: r.adapter, bin: r.bin || '', configDir: r.config_dir || '', model: r.model || '', effort: r.effort || '', concurrency: r.concurrency, fallbackId: r.fallback_id || '', threshold: r.threshold, ignoreUserConfig: !!r.ignore_user_config, telemetry, isDefault: !!r.is_default, source: r.source || '', sourceFile: r.source_file || '' };
   };
   const profileRow = (p, at = nowISO()) => ({ id: p.id, name: p.name, adapter: p.adapter, bin: p.bin || '', configDir: p.configDir || '', model: p.model || '', effort: p.effort || '', concurrency: p.concurrency, fallbackId: p.fallbackId || null, threshold: p.threshold, ignoreUserConfig: p.ignoreUserConfig ? 1 : 0, telemetry: JSON.stringify({ ...TELEMETRY_OFF, ...p.telemetry }), at });
   const listProfiles = () => q.profAll.all().map(profileOut);
@@ -509,6 +519,24 @@ function openStore(dataDir) {
     if (!getProfile(id)) throw bad('Perfil não encontrado.', 404);
     db.transaction(() => { q.profClearDefault.run(); q.profSetDefault.run(id); })();
     return getProfile(id);
+  }
+  /* Perfis of the configuration (server.js applyConfigProfiles): id `cfg-<key>`, upserted with every field from the file and the
+     reserve cleared (set again by setProfileFallback once all of them exist); one that leaves the configuration is removed, its
+     windows and usage_daily rows stay under the same id, so it relinks if it comes back. */
+  function upsertConfigProfile(p, sourceFile) {
+    try { q.profUpsertCfg.run({ ...profileRow(p), sourceFile: String(sourceFile || '') }); } catch (e) { throw nameTaken(e); }
+    return getProfile(p.id);
+  }
+  const setProfileFallback = (id, fallbackId) => q.profSetFallback.run(fallbackId || null, id);
+  /** Removes a configured Perfil; when it was the default, "Claude (padrão)" (or the first one left) becomes the default. */
+  function removeConfigProfile(id) {
+    const p = getProfile(id);
+    if (!p || p.source !== 'config') return false;
+    db.transaction(() => {
+      q.profUnfallback.run(id); q.profDelete.run(id);
+      if (p.isDefault) { const next = getProfile(DEFAULT_PROFILE_IDS.claude) || listProfiles()[0]; if (next) q.profSetDefault.run(next.id); }
+    })();
+    return true;
   }
   /** Creates "Codex (padrão)" once per database (the bridge calls it when codex is on the PATH); a deleted one stays deleted. */
   function ensureCodexDefault() {
@@ -549,6 +577,7 @@ function openStore(dataDir) {
     saveRoom, loadRooms, saveChat, deleteChat, loadChats, sweep,
     insertRun, appendRunEvents, finishRun, listRuns, getRun, runEvents, usage,
     listProfiles, getProfile, defaultProfile, createProfile, updateProfile, deleteProfile, setDefaultProfile, ensureCodexDefault, saveWindows, windowsOf,
+    upsertConfigProfile, setProfileFallback, removeConfigProfile, transaction: fn => db.transaction(fn)(),
     getSetting, setSetting,
     close: () => db.close(),
   };

@@ -43,6 +43,12 @@ const THEME_KEYS = {
   run: ['work', 'plan', 'wait', 'call', 'baton', 'done'],
 };
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp'];
+// Perfis declared in the configuration (`profiles`): the same fields POST /api/profiles takes (server.js PROFILE_FIELDS) plus `key`.
+// The bridge validates them with validateProfile; here only the shape, the key and the paths (resolved against the declaring file).
+const PROFILE_KEY_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
+const PROFILE_FIELDS = ['name', 'adapter', 'bin', 'configDir', 'model', 'effort', 'concurrency', 'fallbackId', 'threshold', 'ignoreUserConfig', 'telemetry'];
+const MAX_CONFIG_PROFILES = 50;
+const TELEMETRY_KEYS = ['enabled', 'native', 'content'];
 
 /* ---------- frontmatter: a strict YAML subset ---------- */
 // `chave: valor` (string, number, true/false; quotes optional), inline lists `[a, "b, c"]`, block lists `- item`, one level of nested
@@ -347,6 +353,43 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
   };
   const rel = p => { const r = path.relative(root, p); return r && !r.startsWith('..') && !path.isAbsolute(r) ? r : p; };
 
+  // `profiles` of one configuration file, merged into profMap by key. Paths: `~` and relative ones resolve against the declaring
+  // file's folder (a bare executable name stays a PATH lookup). A malformed list or entry sets profilesError.
+  function readProfiles(list, file, base, profMap, config, warn) {
+    const where = rel(file);
+    if (!Array.isArray(list)) { warn(`${where}: "profiles" deve ser uma lista`); config.profilesError = true; return; }
+    const seen = new Set();
+    for (const [i, raw] of list.entries()) {
+      if (!isObj(raw)) { warn(`${where}: profiles[${i}] deve ser um objeto`); config.profilesError = true; continue; }
+      const key = typeof raw.key === 'string' ? raw.key.trim() : '';
+      if (!PROFILE_KEY_RE.test(key)) { warn(`${where}: profiles[${i}]: "key" ausente ou inválida (${String(raw.key ?? '').slice(0, 40) || 'vazia'}; use a-z, 0-9 e hífen)`); config.profilesError = true; continue; }
+      if (seen.has(key)) { warn(`${where}: Perfil ${key} repetido no mesmo arquivo`); config.profilesError = true; continue; }
+      seen.add(key);
+      if (!profMap.has(key) && profMap.size >= MAX_CONFIG_PROFILES) { warn(`${where}: mais de ${MAX_CONFIG_PROFILES} Perfis: ${key} ignorado`); config.profilesError = true; continue; }
+      const entry = profMap.get(key) || { key, fields: {}, source: '', files: [] };
+      for (const [k, v] of Object.entries(raw)) {
+        if (k === 'key') continue;
+        if (!PROFILE_FIELDS.includes(k)) { warn(`${where}: Perfil ${key}: campo "${k}" desconhecido, ignorado`); continue; }
+        if ((k === 'configDir' || (k === 'bin' && /[\\/]|^~|^\./.test(v))) && typeof v === 'string' && v.trim()) entry.fields[k] = expand(v, base);
+        else if (k === 'telemetry') {
+          // Only the switches validateProfile takes (secrets never live in a Perfil: headers are bridge settings, by variable name).
+          if (!isObj(v)) { warn(`${where}: Perfil ${key}: "telemetry" deve ser um objeto {enabled, native, content}, ignorado`); continue; }
+          const t = {};
+          for (const [tk, tv] of Object.entries(v)) {
+            if (!TELEMETRY_KEYS.includes(tk)) warn(`${where}: Perfil ${key}: campo "telemetry.${tk}" desconhecido, ignorado`);
+            else if (typeof tv !== 'boolean') warn(`${where}: Perfil ${key}: "telemetry.${tk}" deve ser true ou false, ignorado`);
+            else t[tk] = tv;
+          }
+          entry.fields.telemetry = { ...(entry.fields.telemetry || {}), ...t };
+        }
+        else entry.fields[k] = v;
+      }
+      entry.source = file;
+      if (!entry.files.includes(file)) entry.files.push(file);
+      profMap.set(key, entry);
+    }
+  }
+
   function load() {
     if (cache && [...cache.sigs].every(([p, s]) => statSig(p) === s)) return cache.result;
     const sigs = new Map();
@@ -356,17 +399,20 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
 
     /* configuration: squad.config.json, then squad.local.json (or SQUAD_CONFIG), then SQUAD_PLUGINS */
     const cfgFiles = [path.join(root, 'squad.config.json'), env.SQUAD_CONFIG ? path.resolve(cwd, env.SQUAD_CONFIG) : path.join(root, 'squad.local.json')];
-    const config = { files: [], paths: [], disabled: [], profiles: [] };
+    // profiles: merged by key across the files (a later file overrides field by field); profilesError: some file or entry could not be
+    // read, so the bridge leaves the configured Perfis as they are instead of removing what it no longer sees.
+    const config = { files: [], paths: [], disabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: false };
+    const profMap = new Map();
     let cfgRuntime = {};
     const addPlugin = p => { if (!config.paths.includes(p)) config.paths.push(p); };
     for (const [idx, file] of cfgFiles.entries()) {
       track(file);
       let text;
       try { text = fs.readFileSync(file, 'utf8'); }
-      catch (e) { if (e.code !== 'ENOENT' || (idx === 1 && env.SQUAD_CONFIG)) warn(`${rel(file)}: não foi possível ler (${e.code || e.message})`); continue; }
+      catch (e) { if (e.code !== 'ENOENT' || (idx === 1 && env.SQUAD_CONFIG)) { warn(`${rel(file)}: não foi possível ler (${e.code || e.message})`); config.profilesError = true; } continue; }
       let data;
-      try { data = JSON.parse(text.replace(/^﻿/, '')); } catch (e) { warn(`${rel(file)}: JSON inválido, arquivo ignorado (${e.message})`); continue; }
-      if (!isObj(data)) { warn(`${rel(file)}: deve ser um objeto JSON, arquivo ignorado`); continue; }
+      try { data = JSON.parse(text.replace(/^﻿/, '')); } catch (e) { warn(`${rel(file)}: JSON inválido, arquivo ignorado (${e.message})`); config.profilesError = true; continue; }
+      if (!isObj(data)) { warn(`${rel(file)}: deve ser um objeto JSON, arquivo ignorado`); config.profilesError = true; continue; }
       config.files.push(file);
       const base = path.dirname(file);
       if (data.plugins !== undefined) {
@@ -383,9 +429,15 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
           }
         }
       }
-      if (data.profiles !== undefined) Array.isArray(data.profiles) ? config.profiles = data.profiles : warn(`${rel(file)}: "profiles" deve ser uma lista`);
+      if (data.profiles !== undefined) readProfiles(data.profiles, file, base, profMap, config, warn);
+      if (data.defaultProfile !== undefined) {
+        const d = typeof data.defaultProfile === 'string' ? data.defaultProfile.trim() : '';
+        if (d && d.length <= 100) { config.defaultProfile = d; config.defaultProfileFile = file; }
+        else warn(`${rel(file)}: "defaultProfile" deve ser a key de um Perfil da configuração ou o id de um Perfil`);
+      }
       cfgRuntime = { ...cfgRuntime, ...validateRuntime(data.runtime, rel(file), warn) };
     }
+    config.profiles = [...profMap.values()].map(e => ({ key: e.key, ...e.fields, source: e.source, files: e.files }));
     for (const p of String(env.SQUAD_PLUGINS || '').split(path.delimiter).map(s => s.trim()).filter(Boolean)) addPlugin(expand(p, cwd));
 
     /* plugins */
