@@ -8384,6 +8384,11 @@ const MapNetwork = (() => {
   const canvas = document.getElementById('cityCanvas');
   const SQ3 = Math.sqrt(3), GRID = 10, TILE_H = .14, PLAZA_H = .34, FOV = 32;
   const C = { bg: 0x070a0b, tile: 0x182226, rim: 0x2b3d46, build: 0x34444b, cyan: 0x30c5e8, purple: 0xad85dd, plaza: 0x0e2229, green: 0x7fcf9d, amber: 0xe0a84a };
+  // Theme of a plugin (docs/plans/plugins-conteudo.md): squadThemeBoot (app.js, same script, hoisted) resolves the saved one before the scene is
+  // built and leaves it in window.SQUAD_THEME; colours arrive as numbers. Only known keys are taken; no theme = the look below.
+  const THEME = (typeof squadThemeBoot === 'function' ? squadThemeBoot() : window.SQUAD_THEME) || {};
+  const themed = (base, over) => { if (over && typeof over === 'object') for (const k of Object.keys(base)) if (typeof over[k] === 'number' && Number.isFinite(over[k])) base[k] = over[k]; return base; };
+  themed(C, THEME.office);
 
   /* ---------- hex math (axial, pointy-top) ---------- */
   const hexToWorld = (q, r) => ({ x: SQ3 * (q + r / 2), z: 1.5 * r });
@@ -8506,7 +8511,7 @@ const MapNetwork = (() => {
     const markDirty = () => { geoDirty = true; };
     // The city is a dark monochrome island (.inspo/city.jpg): charcoal buildings, light-grey street lines, black water. Cyan stays
     // for what belongs to the agents (plazas, rims, selection, links). The office keeps C and its own exposure.
-    const CITY = { bg: 0x0a0b0c, build: 0x2d3135, tree: 0x222a25, water: 0x07090a, wall: 0x131619, exposure: 1.06 };
+    const CITY = themed({ bg: 0x0a0b0c, build: 0x2d3135, tree: 0x222a25, water: 0x07090a, wall: 0x131619, exposure: 1.06 }, THEME.city);
     const s = new T.Scene(); s.fog = new T.Fog(CITY.bg, 14, 46);
     const camera = new T.PerspectiveCamera(FOV, 16 / 9, .1, 400);
     const hemi = new T.HemisphereLight(0xd9e1e5, 0x0b0c0e, .62); s.add(hemi);
@@ -8855,7 +8860,7 @@ vFcT = position.y + 0.5;
     const plazas = new Map();
     /* Agents' slots, vivid against the charcoal city: an electric blue body that lights itself, a rim above the bloom threshold
        (HDR colour, so it glows like neon), an outer line and a soft pool of light on the ground. Handoffs keep the purple rims. */
-    const AGENT_BLUE = 0x29c8ff, hdr = (hex, k) => new T.Color(hex).multiplyScalar(k);
+    const AGENT_BLUE = themed({ blue: 0x29c8ff }, THEME.agent).blue, hdr = (hex, k) => new T.Color(hex).multiplyScalar(k);
     const rimColor = () => hdr(linkMode ? C.purple : AGENT_BLUE, 2.6);
     const rimMat = () => new T.LineBasicMaterial({ color: rimColor(), transparent: true, opacity: 1 });
     const poolTex = (() => { const cv = document.createElement('canvas'); cv.width = cv.height = 128; const g = cv.getContext('2d'), grd = g.createRadialGradient(64, 64, 18, 64, 64, 64); grd.addColorStop(0, 'rgba(255,255,255,.75)'); grd.addColorStop(.55, 'rgba(255,255,255,.3)'); grd.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = grd; g.fillRect(0, 0, 128, 128); return new T.CanvasTexture(cv); })();
@@ -8955,7 +8960,7 @@ vFcT = position.y + 0.5;
     /* ----- the run in the city (ops data from the app): every agent at work glows in the tone of what it does (breathing plaza,
        two rings going out, a light column); a call is a two-way link between caller and callee (runLinks, in rebuildLinks); every
        errand (briefing, baton, delivery for review) sends a comet along the arc from the sender to the receiver, which pulses. ----- */
-    const RUN_TONE = { work: 0x30c5e8, plan: 0xff5a66, wait: 0xe0a84a, call: 0x8fc6ff, baton: 0xad85dd, done: 0x7fcf9d };
+    const RUN_TONE = themed({ work: 0x30c5e8, plan: 0xff5a66, wait: 0xe0a84a, call: 0x8fc6ff, baton: 0xad85dd, done: 0x7fcf9d }, THEME.run);
     const beamTex = (() => { const cv = document.createElement('canvas'); cv.width = 4; cv.height = 128; const g = cv.getContext('2d'), grd = g.createLinearGradient(0, 128, 0, 0); grd.addColorStop(0, 'rgba(255,255,255,.95)'); grd.addColorStop(.25, 'rgba(255,255,255,.45)'); grd.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = grd; g.fillRect(0, 0, 4, 128); return new T.CanvasTexture(cv); })();
     const beamGeo = new T.CylinderGeometry(.42, .62, 3.4, 6, 10, true).translate(0, 1.7, 0);
     const runFx = new Map(), runGroup = new T.Group(); s.add(runGroup);
@@ -10468,6 +10473,157 @@ const TEMPLATE_AVATARS={
 };
 // Earlier preset photos: agents still showing one of them follow the current identity photo.
 const TEMPLATE_AVATARS_V1={ZERO:['avatar-greyman'],'ABELHA-RAINHA':['avatar-mother-protocol','avatar-queen-bee'],VAULT:['avatar-databird'],ECHO:['avatar-phasma'],ATOMIC:['avatar-delta']};
+/* Plugins (docs/plans/plugins-conteudo.md): the bridge injects #squad-plugins with presets, categories, souls, avatars, themes, DIRETRIZES and
+   runtime defaults from folders outside the repository. Everything here is a function declaration that touches no const of app.js:
+   city.js (same script, earlier) calls squadThemeBoot() while building its scene, before app.js runs. Without the tag (demo, file://)
+   nothing changes. Plugin text is escaped (E) wherever it is rendered, like the built-in catalog. */
+// Limits and ids shared with plugins.js (docs/plans/plugins-conteudo.md, "Limites efetivos"): text over a limit refuses the item with a
+// warning, never cut. They follow what normalizeWorkspace keeps of an agent (specialty 40, description 1200, soul 1200, 8 greetings
+// of 300, prompt 20000), so nothing a plugin gives is lost on reload.
+function pluginLimits(){return pluginLimits.v||(pluginLimits.v={key:/^[a-z0-9][a-z0-9_-]{0,40}$/,convId:/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/,name:/^[A-Z0-9][A-Z0-9-]{1,23}$/,tool:/^[A-Za-z][A-Za-z0-9_]*$/,cssVar:/^--[a-z0-9-]{1,40}$/,reserved:['__proto__','constructor','prototype'],
+ plugin:{name:80,version:40,description:1000,path:4096},category:{label:60,icon:40,description:500,before:41},avatar:{label:60},theme:{label:60,vars:200},
+ preset:{slot:20,category:41,role:40,specialty:40,icon:40,model:80,effort:10,avatar:81,description:1000,style:16000,soul:1200,hello:300,hellos:8,tools:30,template:80,subsets:20},
+ conv:{name:60,label:60,icon:40,group:81,tags:300,desc:300,summary:300,content:20000}});}
+function readPlugins(){
+ if(readPlugins.v)return readPlugins.v;
+ let raw=null;try{const el=document.getElementById('squad-plugins');raw=el?JSON.parse(el.textContent):null;}catch{raw=null;}
+ const L=pluginLimits(),warns=[],warn=m=>{warns.push(m);try{console.warn('[SQUAD/CODE plugins] '+m);}catch{}};
+ const obj=v=>!!v&&typeof v==='object'&&!Array.isArray(v),arr=v=>Array.isArray(v)?v:[];
+ // Text field: '' when absent, the trimmed text when within max; over max (or not text) throws, so the item is refused.
+ const T=(v,max,what)=>{if(v===undefined||v===null||v==='')return'';if(typeof v!=='string')throw Error(`${what}: esperado texto`);if(v.length>max)throw Error(`${what} maior que ${max} caracteres`);return v.trim();};
+ const IMG=/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/,colors=(o,keys)=>{const out={};if(obj(o))for(const k of keys){const c=pluginColor(o[k]);if(c!==null)out[k]=c;}return out;};
+ const COLOR=/^(#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})|rgba?\(\s*\d{1,3}(\.\d+)?%?\s*,\s*\d{1,3}(\.\d+)?%?\s*,\s*\d{1,3}(\.\d+)?%?\s*(,\s*(0|1|0?\.\d+|1\.0+|\d{1,3}%)\s*)?\))$/i;
+ const out={present:!!raw,plugins:[],runtime:obj(raw?.runtime)?raw.runtime:{},warnings:arr(raw?.warnings).filter(w=>typeof w==='string').map(w=>w.slice(0,600)).slice(0,200),appWarnings:warns};
+ const each=(list,where,fn)=>{const r=[];for(const x of list){try{if(!obj(x))throw Error('esperado um objeto');r.push(fn(x));}catch(e){warn(`${where} ignorado: ${e.message}.`);}}return r;};
+ for(const p of arr(raw?.plugins).slice(0,20)){
+  if(!obj(p)||typeof p.id!=='string'||!/^[a-z0-9][a-z0-9-]{1,40}$/.test(p.id)||out.plugins.some(x=>x.id===p.id))continue;
+  // Like the bridge: an invalid name/version/description keeps the plugin under its id, with a warning.
+  const pk={id:p.id,name:p.id,version:'',description:'',path:''};
+  try{Object.assign(pk,{name:T(p.name,L.plugin.name,'nome')||p.id,version:T(p.version,L.plugin.version,'versão'),description:T(p.description,L.plugin.description,'descrição')});}catch(e){warn(`Plugin ${p.id}: ${e.message}.`);}
+  try{pk.path=T(p.path,L.plugin.path,'caminho');}catch{pk.path='';}
+  const W=`Plugin ${pk.name}`;
+  pk.categories=each(arr(p.categories).slice(0,30),`${W}: categoria`,c=>{const key=T(c.key,41,'key');if(!L.key.test(key))throw Error(`key inválida (${key})`);const before=T(c.before,L.category.before,'before');if(before&&!L.key.test(before))throw Error('"before" inválido');
+   return{key,label:T(c.label,L.category.label,'label'),icon:T(c.icon,L.category.icon,'ícone'),description:T(c.description,L.category.description,'descrição'),before};});
+  pk.declared=arr(p.presets).length; // for Plugins: agents refused here count as ignored
+  pk.presets=each(arr(p.presets).slice(0,200),`${W}: agente`,x=>{const P=L.preset,name=T(x.name,24,'nome');
+   const tools=Array.isArray(x.tools)?x.tools:null;if(tools&&(tools.length>P.tools||!tools.every(t=>typeof t==='string'&&L.tool.test(t))))throw Error(`${name}: tools deve ter até ${P.tools} nomes de ferramenta`);
+   const hellos=arr(x.hellos);if(hellos.length>P.hellos)throw Error(`${name}: até ${P.hellos} saudações`);
+   const conv=obj(x.conv)?{template:T(x.conv.template,P.template,'conventions.template'),subsets:arr(x.conv.subsets)}:null;
+   if(conv&&(conv.subsets.length>P.subsets||!conv.subsets.every(s=>typeof s==='string'&&L.convId.test(s))))throw Error(`${name}: conventions.subsets deve ter até ${P.subsets} ids`);
+   return{slot:T(x.slot,P.slot,'slot'),category:T(x.category,P.category,'category'),name,role:T(x.role,P.role,'role'),specialty:T(x.specialty,P.specialty,`${name}: specialty`),icon:T(x.icon,P.icon,'icon'),model:T(x.model,P.model,'model'),effort:T(x.effort,P.effort,'effort'),
+    tools:tools?[...tools]:null,avatar:T(x.avatar,P.avatar,'avatar'),description:T(x.description,P.description,`${name}: description`),style:T(x.style,P.style,`${name}: corpo (style)`),soul:T(x.soul,P.soul,`${name}: soul`),
+    hellos:hellos.map(h=>T(h,P.hello,`${name}: saudação`)).filter(Boolean),conv,plugin:p.id};});
+  pk.avatars=each(arr(p.avatars).slice(0,200),`${W}: avatar`,a=>{if(typeof a.key!=='string'||!a.key.startsWith('plugin:'+p.id+'/')||!L.key.test(a.key.slice(p.id.length+6)))throw Error('key inválida');if(typeof a.src!=='string'||!IMG.test(a.src))throw Error(`${a.key}: imagem inválida`);
+   return{key:a.key,label:T(a.label,L.avatar.label,'label')||a.key.slice(a.key.lastIndexOf('/')+1).toUpperCase(),src:a.src};});
+  pk.themes=each(arr(p.themes).slice(0,20),`${W}: tema`,t=>{if(typeof t.key!=='string'||!t.key.startsWith(p.id+'/')||!L.key.test(t.key.slice(p.id.length+1)))throw Error('key inválida');
+   const ui={};if(obj(t.ui))for(const [k,v] of Object.entries(t.ui).slice(0,L.theme.vars))if(L.cssVar.test(k)&&typeof v==='string'&&COLOR.test(v.trim()))ui[k]=v.trim();else warn(`${W}: tema ${t.key}: variável ${String(k).slice(0,50)} ignorada (nome ou cor inválidos).`);
+   const city=colors(t.city,['bg','build','tree','water','wall']),ex=t.city?.exposure;if(typeof ex==='number'&&ex>=.5&&ex<=2)city.exposure=ex;
+   return{key:t.key,label:T(t.label,L.theme.label,'label')||t.key,ui,city,office:colors(t.office,['bg','tile','rim','build','cyan','purple','plaza','green','amber']),agent:colors(t.agent,['blue']),run:colors(t.run,['work','plan','wait','call','baton','done'])};});
+  pk.conventions=obj(p.conventions)?{families:obj(p.conventions.families)?p.conventions.families:{},subsets:arr(p.conventions.subsets),groups:arr(p.conventions.groups)}:null;
+  pk.runtime=obj(p.runtime)?p.runtime:{};
+  out.plugins.push(pk);
+ }
+ readPlugins.v=out;return out;
+}
+// Theme colors: 0xRRGGBB numbers or '#rgb' / '#rrggbb' strings, always handed to city.js as numbers (it uses Color.setHex).
+function pluginColor(v){
+ if(typeof v==='number')return Number.isInteger(v)&&v>=0&&v<=0xffffff?v:null;
+ if(typeof v!=='string')return null;const s=v.trim();
+ if(/^#[0-9a-f]{6}$/i.test(s))return parseInt(s.slice(1),16);
+ if(/^#[0-9a-f]{3}$/i.test(s))return parseInt(s.slice(1).split('').map(c=>c+c).join(''),16);
+ if(/^0x[0-9a-f]{6}$/i.test(s))return parseInt(s.slice(2),16);
+ return null;
+}
+function pluginWarn(msg){readPlugins().appWarnings.push(msg);try{console.warn('[SQUAD/CODE plugins] '+msg);}catch{}}
+function pluginThemes(){return readPlugins().plugins.flatMap(p=>p.themes);}
+// The boot copies of #squad-disk and of the browser copy are read once (the boot block takes them from here) so the theme can be
+// known before city.js builds its scene. The literal must stay equal to STORE.
+function bootDiskTag(){if(!('v' in bootDiskTag)){let t=null;try{const el=document.getElementById('squad-disk');t=el?JSON.parse(el.textContent):null;}catch{t=null;}bootDiskTag.v=t;}return bootDiskTag.v;}
+function bootLocal(){
+ if(bootLocal.v)return bootLocal.v;const key='squad-code.network.v2';let saved=null,meta=null,local=null,failed=false;
+ try{saved=localStorage.getItem(key);meta=JSON.parse(localStorage.getItem(key+'.disk')||'null');}catch{failed=true;}if(saved)try{local=JSON.parse(saved);}catch{local=null;}
+ return bootLocal.v={saved,meta,local,failed};
+}
+/* Which saved workspace the boot loads (database copy, browser copy or none), decided once and shared by the boot block and the
+   theme (bootThemeKey), which city.js needs before app.js runs. The database copy wins unless this browser has pending saves on that
+   same rev; when both changed, the one with the latest activity (wsActivity) wins and the other becomes a saved version. */
+function bootChoice(){
+ if(bootChoice.v)return bootChoice.v;
+ const tag=bootDiskTag(),{saved,meta,local}=bootLocal(),disk=tag?.workspace&&typeof tag.workspace==='object'?tag.workspace:null;
+ const c={tag,disk,saved,meta,local,raw:local,force:false,backup:null,notice:''};
+ if(tag?.setup)c.raw=null;
+ else if(tag){
+  if(!disk||!local)c.raw=disk||local;
+  else if(JSON.stringify(disk)===saved||meta&&!meta.pending)c.raw=disk;
+  else if(!(meta?.pending&&meta.rev===String(tag.rev||''))){
+   if(wsActivity(local)>wsActivity(disk)){c.force=true;c.notice='O workspace deste navegador era mais recente que o salvo no banco local e o substituiu. A versão anterior ficou em Versões salvas (Configurações > Workspace).';}
+   else{c.raw=disk;c.backup=saved;c.notice='Este navegador tinha outra versão do workspace. Carreguei a salva no banco local; a do navegador ficou em Versões salvas (Configurações > Workspace).';}
+  }
+ }
+ return bootChoice.v=c;
+}
+function bootThemeKey(){const t=bootChoice().raw?.settings?.theme;return typeof t==='string'?t.slice(0,100):'';}
+// Applies a theme (null = the default look): CSS variables on :root and window.SQUAD_THEME for city.js. Returns what city.js reads.
+function applyTheme(t){
+ const root=document.documentElement;for(const k of applyTheme.vars||[])root.style.removeProperty(k);applyTheme.vars=[];
+ if(t)for(const [k,v] of Object.entries(t.ui)){root.style.setProperty(k,v);applyTheme.vars.push(k);}
+ root.dataset.squadTheme=t?t.key:'';
+ window.SQUAD_THEME=t?{key:t.key,city:{...t.city},office:{...t.office},agent:{...t.agent},run:{...t.run}}:null;
+ return window.SQUAD_THEME;
+}
+// Called by city.js while it builds the scene (and again by the boot, harmlessly): theme from the saved workspace; an unknown key
+// falls back to the default look without touching the saved value.
+function squadThemeBoot(){
+ if('v' in squadThemeBoot)return squadThemeBoot.v;
+ const key=bootThemeKey(),t=key?pluginThemes().find(x=>x.key===key)||null:null;
+ squadThemeBoot.key=key;squadThemeBoot.v=applyTheme(t);return squadThemeBoot.v;
+}
+// Names that belong to the built-in catalog (template photos, souls, each specialty's default agent), taken before any plugin merge.
+function builtinPresetNames(){if(!builtinPresetNames.v)builtinPresetNames.v=new Set([...Object.keys(TEMPLATE_AVATARS),...Object.keys(AGENT_SOULS),...Object.values(ROLES).map(r=>r.name)]);return builtinPresetNames.v;}
+/* Accepted plugin presets (validated once): a valid unique codename, a role of ROLES, a slot whose seat fits the role. */
+function pluginPresets(){
+ if(pluginPresets.v)return pluginPresets.v;const list=[],names=new Set(builtinPresetNames()),SLOT_ROLE={commander:'commander',adr:'architect',prd:'po'};
+ for(const pk of readPlugins().plugins)for(const p of pk.presets){
+  const where=`Plugin ${pk.name}: agente ${p.name||'(sem nome)'}`;
+  if(!/^[A-Z0-9][A-Z0-9-]{1,23}$/.test(p.name)){pluginWarn(`${where} ignorado: nome inválido (use letras maiúsculas, números e hífen).`);continue;}
+  if(names.has(p.name)){pluginWarn(`${where} ignorado: já existe um agente do catálogo ou de outro plugin com esse nome.`);continue;}
+  if(!Object.hasOwn(ROLES,p.role)){pluginWarn(`${where} ignorado: especialidade (role) "${p.role}" desconhecida.`);continue;}
+  if(!['commander','adr','prd','operator'].includes(p.slot)){pluginWarn(`${where} ignorado: posição (slot) "${p.slot}" inválida.`);continue;}
+  if(SLOT_ROLE[p.slot]&&SLOT_ROLE[p.slot]!==p.role){pluginWarn(`${where} ignorado: a posição ${p.slot} pede o role ${SLOT_ROLE[p.slot]}.`);continue;}
+  if(p.slot==='operator'&&p.role==='commander'){pluginWarn(`${where} ignorado: um comandante não pode ser operador.`);continue;}
+  names.add(p.name);list.push(p);
+ }
+ return pluginPresets.v=list;
+}
+// Souls, photos and DIRETRIZES of the plugins: merged before the seed/normalize (they are read at load). Never overwrites built-ins.
+function mergePluginCatalog(){
+ const P=readPlugins();if(!P.plugins.length)return;
+ for(const pk of P.plugins)for(const a of pk.avatars){if(Object.hasOwn(PORTRAITS,a.key))continue;PORTRAITS[a.key]=a.src;AVATARS.push({key:a.key,label:a.label});}
+ for(const p of pluginPresets()){
+  if(p.soul)AGENT_SOULS[p.name]={soul:p.soul,hellos:p.hellos.length?[...p.hellos]:genericHellos(p.role,p.specialty)};
+  if(p.avatar){const k=['plugin:'+p.plugin+'/'+p.avatar,'avatar-'+p.avatar,p.avatar].find(x=>Object.hasOwn(PORTRAITS,x));if(k)TEMPLATE_AVATARS[p.name]=k;else pluginWarn(`Agente ${p.name}: avatar "${p.avatar}" não encontrado; usa a foto da especialidade.`);}
+ }
+ // DIRETRIZES: ids as in plugins.js (convId, never a reserved name), own families only (Object.hasOwn: a plugin naming "constructor"
+ // must not reach Object's prototype), text within the shared limits or the item is refused; existing ids are never overwritten.
+ const L=pluginLimits(),C=L.conv,id=k=>typeof k==='string'&&L.convId.test(k)&&!L.reserved.includes(k);
+ const text=(v,max,what)=>{if(v===undefined||v===null||v==='')return'';if(typeof v!=='string')throw Error(`${what}: esperado texto`);if(v.length>max)throw Error(`${what} maior que ${max} caracteres`);return v.trim();};
+ const item=(where,fn)=>{try{fn();}catch(e){pluginWarn(`${where} ignorado: ${e.message}.`);}};
+ for(const pk of P.plugins){
+  const c=pk.conventions;if(!c)continue;const tag=`Plugin ${pk.name}, diretrizes`;
+  for(const g of c.groups)item(`${tag}: grupo`,()=>{if(!g||!id(g.key))throw Error('key inválida');if(CONVENTION_GROUPS.some(x=>x.key===g.key))throw Error(`"${g.key}" já existe; mantido o original`);
+   const label=text(g.label,C.label,'label'),icon=text(g.icon,C.icon,'icon');CONVENTION_GROUPS.push({key:g.key,label:label||g.key,icon:icon||'book'});});
+  for(const s of c.subsets)item(`${tag}: subset ${String(s?.key||'').slice(0,80)}`,()=>{if(!s||!id(s.key)||typeof s.content!=='string')throw Error('sem key válida ou conteúdo');if(CONVENTION_SUBSETS.some(x=>x.key===s.key))throw Error('já existe; mantido o original');
+   const v={key:s.key,name:text(s.name,C.name,'name')||s.key,group:text(s.group,C.group,'group'),icon:text(s.icon,C.icon,'icon')||'book',tags:text(s.tags,C.tags,'tags'),desc:text(s.desc,C.desc,'desc'),content:text(s.content,C.content,'content')};CONVENTION_SUBSETS.push(v);});
+  for(const [family,f] of Object.entries(c.families)){
+   if(!Object.hasOwn(CONVENTION_FAMILIES,family)||L.reserved.includes(family)){pluginWarn(`${tag}: família "${family.slice(0,80)}" desconhecida; templates ignorados.`);continue;}
+   const fam=CONVENTION_FAMILIES[family];
+   for(const t of Array.isArray(f?.templates)?f.templates:[])item(`${tag}: template ${String(t?.key||'').slice(0,80)} (${family})`,()=>{if(!t||!id(t.key)||typeof t.content!=='string')throw Error('sem key válida ou conteúdo');
+    if(Object.values(CONVENTION_FAMILIES).some(x=>x.templates.some(y=>y.key===t.key)))throw Error('já existe; mantido o original');
+    fam.templates.push({key:t.key,name:text(t.name,C.name,'name')||t.key,summary:text(t.summary,C.summary,'summary'),content:text(t.content,C.content,'content')});});
+  }
+ }
+}
+mergePluginCatalog();
 const templateAvatarKey=a=>{const n=retiredPresetName(a?.name)||a?.name;return TEMPLATE_AVATARS[a?.template]?a.template:TEMPLATE_AVATARS[n]?n:'';};
 const templatePortrait=a=>PORTRAITS[TEMPLATE_AVATARS[templateAvatarKey(a)]]||'';
 // Agents created from scratch take the photo of their specialty's default agent (FORGE, PRISM, MOTHER WOLF…).
@@ -10581,7 +10737,7 @@ Object.assign(ICONS,{
  kafka:'<circle cx="12" cy="12" r="2.3"/><circle cx="12" cy="4.3" r="1.8"/><circle cx="12" cy="19.7" r="1.8"/><circle cx="18.6" cy="8.4" r="1.8"/><circle cx="18.6" cy="15.6" r="1.8"/><path d="M12 6.1v3.6M12 14.3v3.6M14 10.9l3-1.7M14 13.1l3 1.7"/>'
 });
 const AGENT_ICONS=['crown','file','layers','code','screen','shield','calendar','palette','phone','server','lock','database','book','sparkle','terminal','cpu','lightning','target','flow','radio','flag','eye','search','link','bug','rocket','cog','cloud','branch','key','wrench','hammer','compass','globe','brain','robot','paw','bird','anchor','star','flame','atom','puzzle','flask','satellite','package','braces','chart','chat','fingerprint','wheel','guard','question','heart','js','node','java','html','css','angular','react','vue','csharp','typescript','rust','spring','screwdriver','home','skull','tower','king','queen','jack','bee','zero','python','go','php','ruby','kotlin','swift','flutter','cpp','docker','kubernetes','aws','azure','gcloud','git','github','linux','postgres','mysql','mongodb','redis','graphql','nextjs','svelte','tailwind','terraform','firebase','supabase','sqlite','figma','kafka'];
-const ICON_LABELS={crown:'Coroa',file:'Documento',layers:'Camadas',code:'Código',screen:'Tela',shield:'Escudo',calendar:'Calendário',palette:'Paleta',phone:'Celular',server:'Servidor',lock:'Cadeado',database:'Banco de dados',book:'Livro',sparkle:'Brilho',terminal:'Terminal',cpu:'Processador',lightning:'Raio',target:'Alvo',flow:'Fluxo',radio:'Sinal',flag:'Bandeira',eye:'Olho',search:'Busca',link:'Conexão',bug:'Bug',rocket:'Foguete',cog:'Engrenagem',cloud:'Nuvem',branch:'Branch Git',key:'Chave',wrench:'Chave inglesa',hammer:'Martelo',compass:'Bússola',globe:'Globo',brain:'Cérebro',robot:'Robô',paw:'Pata',bird:'Pássaro',anchor:'Âncora',star:'Estrela',flame:'Chama',atom:'Átomo',puzzle:'Quebra-cabeça',flask:'Frasco',satellite:'Satélite',package:'Pacote',braces:'Chaves {}',chart:'Gráfico',chat:'Conversa',fingerprint:'Digital',wheel:'Volante',guard:'Cão de guarda',question:'Dúvida',heart:'Coração',js:'JavaScript',node:'Node.js',java:'Java',html:'HTML',css:'CSS',angular:'Angular',react:'React',vue:'Vue',csharp:'C#',typescript:'TypeScript',rust:'Rust',spring:'Spring',screwdriver:'Chave de fenda',home:'Casa',skull:'Caveira',tower:'Torre',king:'Rei (carta)',queen:'Rainha (carta)',jack:'Valete (carta)',bee:'Abelha',zero:'Zero cortado',python:'Python',go:'Go',php:'PHP',ruby:'Ruby',kotlin:'Kotlin',swift:'Swift',flutter:'Flutter / Dart',cpp:'C / C++',docker:'Docker',kubernetes:'Kubernetes',aws:'AWS',azure:'Azure',gcloud:'Google Cloud',git:'Git',github:'GitHub',linux:'Linux',postgres:'PostgreSQL',mysql:'MySQL',mongodb:'MongoDB',redis:'Redis',graphql:'GraphQL',nextjs:'Next.js',svelte:'Svelte',tailwind:'Tailwind CSS',terraform:'Terraform',firebase:'Firebase',supabase:'Supabase',sqlite:'SQLite',figma:'Figma',kafka:'Kafka'};
+const ICON_LABELS={crown:'Coroa',file:'Documento',layers:'Camadas',code:'Código',screen:'Tela',shield:'Escudo',calendar:'Calendário',palette:'Paleta',phone:'Celular',server:'Servidor',lock:'Cadeado',database:'Banco de dados',book:'Livro',sparkle:'Brilho',terminal:'Terminal',cpu:'Processador',lightning:'Raio',target:'Alvo',flow:'Fluxo',radio:'Sinal',flag:'Bandeira',eye:'Olho',search:'Busca',link:'Conexão',bug:'Bug',rocket:'Foguete',cog:'Engrenagem',cloud:'Nuvem',branch:'Branch Git',key:'Chave',wrench:'Chave inglesa',hammer:'Martelo',compass:'Bússola',globe:'Globo',brain:'Cérebro',robot:'Robô',paw:'Pata',bird:'Pássaro',anchor:'Âncora',star:'Estrela',flame:'Chama',atom:'Átomo',puzzle:'Quebra-cabeça',flask:'Frasco',satellite:'Satélite',package:'Plugin',braces:'Chaves {}',chart:'Gráfico',chat:'Conversa',fingerprint:'Digital',wheel:'Volante',guard:'Cão de guarda',question:'Dúvida',heart:'Coração',js:'JavaScript',node:'Node.js',java:'Java',html:'HTML',css:'CSS',angular:'Angular',react:'React',vue:'Vue',csharp:'C#',typescript:'TypeScript',rust:'Rust',spring:'Spring',screwdriver:'Chave de fenda',home:'Casa',skull:'Caveira',tower:'Torre',king:'Rei (carta)',queen:'Rainha (carta)',jack:'Valete (carta)',bee:'Abelha',zero:'Zero cortado',python:'Python',go:'Go',php:'PHP',ruby:'Ruby',kotlin:'Kotlin',swift:'Swift',flutter:'Flutter / Dart',cpp:'C / C++',docker:'Docker',kubernetes:'Kubernetes',aws:'AWS',azure:'Azure',gcloud:'Google Cloud',git:'Git',github:'GitHub',linux:'Linux',postgres:'PostgreSQL',mysql:'MySQL',mongodb:'MongoDB',redis:'Redis',graphql:'GraphQL',nextjs:'Next.js',svelte:'Svelte',tailwind:'Tailwind CSS',terraform:'Terraform',firebase:'Firebase',supabase:'Supabase',sqlite:'SQLite',figma:'Figma',kafka:'Kafka'};
 const TECH_ICONS=new Set(['js','typescript','node','java','csharp','html','css','angular','react','vue','rust','spring','database','python','go','php','ruby','kotlin','swift','flutter','cpp','docker','kubernetes','aws','azure','gcloud','git','github','linux','postgres','mysql','mongodb','redis','graphql','nextjs','svelte','tailwind','terraform','firebase','supabase','sqlite','figma','kafka']);
 const agentIcon=a=>(a?.icon&&AGENT_ICONS.includes(a.icon))?a.icon:roleOf(a).icon;
 // Agent appearance: photo + icon cards; each opens its own gallery over the studio.
@@ -10595,7 +10751,7 @@ function lookPickerHTML(kind){
  const photo=kind==='photo',title=photo?'ESCOLHER FOTO':'ESCOLHER ÍCONE';let grid;
  if(photo){
   const img=ui.draft.agent.image,auto=draftAutoPortrait();
-  grid=`<div class="portrait-grid look-grid"><button type="button" class="portrait-choice ${img?'':'selected'}" data-action="portrait-pick" data-preset="" title="Automático (foto do template ou da especialidade)"><img src="${auto}" alt="Automático"><span>AUTO</span></button>${portraitChoices().map(({key,label,short,src})=>`<button type="button" class="portrait-choice ${img===src?'selected':''}" data-action="portrait-pick" data-preset="${key}" title="${E(label)}"><img src="${src}" alt="Retrato ${E(label)}"><span>${short}</span></button>`).join('')}</div>`;
+  grid=`<div class="portrait-grid look-grid"><button type="button" class="portrait-choice ${img?'':'selected'}" data-action="portrait-pick" data-preset="" title="Automático (foto do template ou da especialidade)"><img src="${auto}" alt="Automático"><span>AUTO</span></button>${portraitChoices().map(({key,label,short,src})=>`<button type="button" class="portrait-choice ${img===src?'selected':''}" data-action="portrait-pick" data-preset="${E(key)}" title="${E(label)}"><img src="${src}" alt="Retrato ${E(label)}"><span>${E(short)}</span></button>`).join('')}</div>`;
  }else{
   const current=$('#agentIcon')?.value||'',auto=ROLES[draftRole()]?.icon||'target';
   const iconBtn=k=>`<button type="button" class="icon-choice ${k===current?'selected':''}" data-action="icon-pick" data-icon-key="${k}" title="${E(ICON_LABELS[k])}" aria-label="${E(ICON_LABELS[k])}">${icon(k)}</button>`;
@@ -10687,11 +10843,20 @@ function modelDefaultEffort(m){return /^(opus(\[1m\])?|claude-opus-5-5)$/.test(S
 function agentEffort(a,r=runtime()){const model=r.model||(a?.model&&a.model!=='inherit'?a.model:'');if(!modelEffortSupport(model||a?.model))return{model,effort:'',source:'none'};if(r.effort)return{model,effort:r.effort,source:'global'};return{model,effort:a?.effort||'',source:a?.effort?'agent':'default'};}
 const ADR_STATUS=['Proposto','Aceito','Rejeitado','Depreciado','Substituído'];
 const DEFAULT_RUNTIME={mode:'claude',claudePath:'',permissionMode:'acceptEdits',model:'',effort:'',maxBudgetUsd:'',timeoutSec:900,concurrency:2,addDirs:'',restrictTools:true,extraAllowedTools:''};
+// Plugins: runtime defaults of squad.config/squad.local and the plugins (whitelisted by the bridge and again here) for new workspaces;
+// a saved workspace only takes the keys it does not have (pluginRuntime in normalizeWorkspace), never over what the person saved.
+function pluginRuntime(){
+ if(pluginRuntime.v)return pluginRuntime.v;const P=readPlugins(),src=Object.keys(P.runtime).length?P.runtime:Object.assign({},...P.plugins.map(p=>p.runtime));
+ const keys=['permissionMode','model','effort','maxBudgetUsd','timeoutSec','concurrency','addDirs','restrictTools','extraAllowedTools'].filter(k=>src[k]!==undefined&&src[k]!==null),n=normalizeRuntime(src),out={};
+ for(const k of keys)out[k]=n[k];return pluginRuntime.v=out;
+}
+Object.assign(DEFAULT_RUNTIME,pluginRuntime());
 const STORE='squad-code.network.v2';
 // catalogVersion: one-time catalog migrations already applied to this workspace (migrateCatalogAgents). New workspaces start current.
 // teamsChat: width of the Agent Teams chat panel in px (0 = default). opsChat: width of the docked operation chat (0 = default).
 // mapQuality: graphics of the hex city ('high': shadows, ambient occlusion and bloom; 'low': plain render).
-const DEFAULT_SETTINGS={motion:true,stepMs:1800,squadView:'city',cityShape:'flat',mapQuality:'high',catalogVersion:2,teamsChat:0,opsChat:0,runtime:{...DEFAULT_RUNTIME}};
+// theme: key of a plugin theme ('<plugin>/<theme>', '' = default look); an unknown key shows the default and stays saved.
+const DEFAULT_SETTINGS={motion:true,stepMs:1800,squadView:'city',cityShape:'flat',mapQuality:'high',catalogVersion:2,teamsChat:0,opsChat:0,theme:'',runtime:{...DEFAULT_RUNTIME}};
 function normalizeRuntime(r={}){const str=(v,max)=>typeof v==='string'?v.slice(0,max).trim():'';const n=Number(r.timeoutSec),c=Number(r.concurrency),b=Number(r.maxBudgetUsd);return{mode:r.mode==='demo'?'demo':'claude',claudePath:str(r.claudePath,400),permissionMode:Object.hasOwn(PERMISSION_MODES,r.permissionMode)?r.permissionMode:'acceptEdits',model:/^[A-Za-z0-9._\-\[\]]{0,80}$/.test(r.model||'')?(r.model||''):'',effort:EFFORTS.includes(r.effort)?r.effort:'',maxBudgetUsd:Number.isFinite(b)&&b>0&&b<=1000?String(b):'',timeoutSec:Number.isFinite(n)&&n>=10&&n<=7200?Math.round(n):900,concurrency:Number.isInteger(c)&&c>=1&&c<=8?c:2,addDirs:str(r.addDirs,2000),restrictTools:r.restrictTools!==false,extraAllowedTools:str(r.extraAllowedTools,2000)};}
 const AGENT_STAGES={discovery:{label:'Descoberta',short:'IDEIA'},identity:{label:'Identidade',short:'IDENTIDADE'},prompt:{label:'Prompt & Tools',short:'PROMPT'},validation:{label:'Validação',short:'VALIDAÇÃO'},ready:{label:'Pronto',short:'PRONTO'}};
 const STAGE_ORDER=['discovery','identity','prompt','validation','ready'];
@@ -10797,7 +10962,7 @@ function normalizeWorkspace(raw){
  const projectId=projects.some(p=>p.id===raw.projectId)?raw.projectId:projects[0].id;
  const rawLib=raw.conventionLibrary&&typeof raw.conventionLibrary==='object'?raw.conventionLibrary:{};
  const conventionLibrary={templates:arr(rawLib.templates,60).filter(t=>t&&typeof t==='object'&&typeof t.content==='string').map(t=>({id:ref(t.id)||id('ctpl'),name:str(t.name,60).trim()||'Template',family:Object.hasOwn(CONVENTION_FAMILIES,t.family)?t.family:'general',content:str(t.content,20000),createdAt:date(t.createdAt)})),subsets:arr(rawLib.subsets,60).filter(t=>t&&typeof t==='object'&&typeof t.content==='string').map(t=>({id:ref(t.id)||id('csub'),name:str(t.name,60).trim()||'Subset',content:str(t.content,8000),createdAt:date(t.createdAt)}))};
- return{version:2,agents,conventionLibrary,squads,projects,projectId,settings:{motion:raw.settings?.motion!==false,stepMs:[600,1000,1800,3200].includes(raw.settings?.stepMs)?raw.settings.stepMs:1800,squadView:raw.settings?.squadView==='office'?'office':'city',cityShape:raw.settings?.cityShape==='planet'?'planet':'flat',mapQuality:raw.settings?.mapQuality==='low'?'low':'high',squadNodes:raw.settings?.squadNodes==='photo'?'photo':'icon',catalogVersion:Number.isInteger(raw.settings?.catalogVersion)&&raw.settings.catalogVersion>0?raw.settings.catalogVersion:1,teamsChat:Number.isInteger(raw.settings?.teamsChat)&&raw.settings.teamsChat>=280&&raw.settings.teamsChat<=1600?raw.settings.teamsChat:0,opsChat:Number.isInteger(raw.settings?.opsChat)&&raw.settings.opsChat>=280&&raw.settings.opsChat<=1600?raw.settings.opsChat:0,runtime:normalizeRuntime(raw.settings?.runtime)}};
+ return{version:2,agents,conventionLibrary,squads,projects,projectId,settings:{motion:raw.settings?.motion!==false,stepMs:[600,1000,1800,3200].includes(raw.settings?.stepMs)?raw.settings.stepMs:1800,squadView:raw.settings?.squadView==='office'?'office':'city',cityShape:raw.settings?.cityShape==='planet'?'planet':'flat',mapQuality:raw.settings?.mapQuality==='low'?'low':'high',squadNodes:raw.settings?.squadNodes==='photo'?'photo':'icon',catalogVersion:Number.isInteger(raw.settings?.catalogVersion)&&raw.settings.catalogVersion>0?raw.settings.catalogVersion:1,teamsChat:Number.isInteger(raw.settings?.teamsChat)&&raw.settings.teamsChat>=280&&raw.settings.teamsChat<=1600?raw.settings.teamsChat:0,opsChat:Number.isInteger(raw.settings?.opsChat)&&raw.settings.opsChat>=280&&raw.settings.opsChat<=1600?raw.settings.opsChat:0,theme:typeof raw.settings?.theme==='string'&&/^[A-Za-z0-9_.\/-]{0,100}$/.test(raw.settings.theme)?raw.settings.theme:'',runtime:normalizeRuntime({...pluginRuntime(),...(raw.settings?.runtime&&typeof raw.settings.runtime==='object'?raw.settings.runtime:{})})}};
 }
 /* Saved copy. Served by the bridge, the page gets the workspace from its SQLite database (data/squad.db) in #squad-disk and every
    save() also goes there (diskFlush,
@@ -10810,21 +10975,14 @@ const diskSync={on:false,rev:'',path:'',savedAt:'',status:'',error:'',last:'',js
 function wsActivity(w){let t=0;const at=v=>{const n=Date.parse(v);if(n>t)t=n;};for(const p of Array.isArray(w?.projects)?w.projects:[]){at(p?.createdAt);(Array.isArray(p?.logs)?p.logs:[]).forEach(l=>at(l?.at));(Array.isArray(p?.features)?p.features:[]).forEach(f=>(Array.isArray(f?.outputs)?f.outputs:[]).forEach(o=>at(o?.at)));}(Array.isArray(w?.squads)?w.squads:[]).forEach(q=>at(q?.createdAt));return t;}
 let state,storageAvailable=true,loadNotice='';
 {
- const el=document.getElementById('squad-disk');let tag=null;try{tag=el?JSON.parse(el.textContent):null;}catch{}el?.remove();
- let saved=null,meta=null,local=null;try{saved=localStorage.getItem(STORE);meta=JSON.parse(localStorage.getItem(STORE_DISK)||'null');}catch{}if(saved)try{local=JSON.parse(saved);}catch{}
- const disk=tag?.workspace&&typeof tag.workspace==='object'?tag.workspace:null;let raw=local;
+ const el=document.getElementById('squad-disk');const B=bootChoice(),{tag,disk,local}=B;el?.remove();let raw=B.raw;
  // No database yet (first start on this machine): nothing loads or saves until the person picks how to start (openDbSetup); the
  // example only fills the screen behind the dialog, and this browser's copy, if any, is offered there and kept untouched.
- if(tag?.setup){Object.assign(diskSync,{setup:true,path:String(tag.path||''),localCopy:local});raw=null;}
+ if(tag?.setup)Object.assign(diskSync,{setup:true,path:String(tag.path||''),localCopy:local});
  else if(tag){
   Object.assign(diskSync,{on:true,rev:String(tag.rev||''),path:String(tag.path||''),savedAt:String(tag.savedAt||'')});
   if(tag.error)loadNotice=`Não foi possível ler o workspace salvo no banco local. ${tag.error}`;
-  if(!disk||!local)raw=disk||local;
-  else if(JSON.stringify(disk)===saved||meta&&!meta.pending)raw=disk;
-  else if(!(meta?.pending&&meta.rev===diskSync.rev)){
-   if(wsActivity(local)>wsActivity(disk)){diskSync.force=true;diskSync.notice='O workspace deste navegador era mais recente que o salvo no banco local e o substituiu. A versão anterior ficou em Versões salvas (Configurações > Workspace).';}
-   else{raw=disk;diskSync.backup=saved;diskSync.notice='Este navegador tinha outra versão do workspace. Carreguei a salva no banco local; a do navegador ficou em Versões salvas (Configurações > Workspace).';}
-  }
+  if(B.force)diskSync.force=true;if(B.backup!==null)diskSync.backup=B.backup;if(B.notice)diskSync.notice=B.notice; // bootChoice: the pick
  }
  for(const w of diskSync.setup?[]:[raw,raw===local?disk:local])if(w&&!state)try{state=normalizeWorkspace(w);raw=w;}catch(error){if(w===disk)Object.assign(diskSync,{force:true,backup:null,notice:''});else if(!tag)storageAvailable=false;loadNotice=`Não foi possível restaurar o workspace salvo ${w===disk?'no banco local':'neste navegador'} (${error.message}). Use Exportar para guardar seus dados.`;}
  if(!state){state=seedWorkspace();raw=null;}
@@ -10833,6 +10991,9 @@ let state,storageAvailable=true,loadNotice='';
  diskSync.migrated=diskSync.fromDisk&&!disk.projects.every(p=>Array.isArray(p?.features)&&p.features.some(f=>f?.setup===true));
  if(raw?.projects?.some?.(p=>p?.features?.some?.(f=>f?.status==='running')))loadNotice=loadNotice||'A simulação anterior foi interrompida. As features voltaram para Prontas.';
 }
+// Theme: city.js already took the one bootThemeKey() predicted; if the loaded workspace says otherwise (a copy that failed to load,
+// for instance), the CSS follows now and the map on the next load.
+{squadThemeBoot();const t=state.settings.theme;if(t!==squadThemeBoot.key){squadThemeBoot.key=t;applyTheme(t?pluginThemes().find(x=>x.key===t)||null:null);}}
 // Operation rooms and chats saved by the bridge (#squad-memory): rooms hydrate lazily in roomOf, chats fill ui right below.
 let bootMemory=null;{const el=document.getElementById('squad-memory');try{bootMemory=el?JSON.parse(el.textContent):null;}catch{}el?.remove();}
 // Template agents keep no copy of their identity photo: a stored copy of the current or an earlier preset photo becomes "Automático" (it follows TEMPLATE_AVATARS).
@@ -11048,7 +11209,7 @@ function refreshConvTemplates(){
  const sel=$('#convTemplateSelect');if(!sel)return;
  const fam=$('#convFamily')?.value||'general',key=$('#convTemplate')?.value||'',base=$('#convBase')?.value??'',f=CONVENTION_FAMILIES[fam]||CONVENTION_FAMILIES.general,lib=state.conventionLibrary.templates.filter(t=>t.family===fam);
  const content=convTemplateContent(fam,key),edited=content===undefined||content!==base;
- sel.innerHTML=`${edited?`<option value="__custom" selected>${base.trim()?'Personalizado (editado)':'Sem guia base'}</option>`:''}<optgroup label="${E(f.label)}">${f.templates.map(t=>`<option value="${t.key}" ${!edited&&t.key===key?'selected':''}>${E(t.name)}</option>`).join('')}</optgroup>${lib.length?`<optgroup label="Minha biblioteca">${lib.map(t=>`<option value="lib:${E(t.id)}" ${!edited&&'lib:'+t.id===key?'selected':''}>${E(t.name)}</option>`).join('')}</optgroup>`:''}`;
+ sel.innerHTML=`${edited?`<option value="__custom" selected>${base.trim()?'Personalizado (editado)':'Sem guia base'}</option>`:''}<optgroup label="${E(f.label)}">${f.templates.map(t=>`<option value="${E(t.key)}" ${!edited&&t.key===key?'selected':''}>${E(t.name)}</option>`).join('')}</optgroup>${lib.length?`<optgroup label="Minha biblioteca">${lib.map(t=>`<option value="lib:${E(t.id)}" ${!edited&&'lib:'+t.id===key?'selected':''}>${E(t.name)}</option>`).join('')}</optgroup>`:''}`;
  const sum=$('#convTplSummary');if(sum)sum.textContent=edited?(content!==undefined?`Baseado em "${sel.querySelector(`option[value="${CSS.escape(key)}"]`)?.textContent||''}" com alterações suas.`:'Guia escrito por você.'):convTemplateSummary(fam,key);
  const del=$('#convLibDel');if(del){const libSel=!edited&&key.startsWith('lib:');del.hidden=!libSel;del.dataset.id=libSel?key.slice(4):'';}
  const lbl=$('#convFamilyLabel');if(lbl)lbl.textContent=(f.label||'').toUpperCase();
@@ -11074,7 +11235,7 @@ let convTheme='',convCursor=0,convFlat=[];
 const convNorm=t=>String(t||'').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'');
 function convPickerHTML(){
  const lib=state.conventionLibrary.subsets.length;
- return`<div class="conv-search"><span class="conv-search-field">${icon('search')}<input id="convSearch" type="search" autocomplete="off" spellcheck="false" placeholder="Pesquise por tema: testes, segurança, git, acessibilidade..." aria-label="Pesquisar subsets por tema" aria-controls="convResults"></span><div class="conv-themes" role="group" aria-label="Temas">${CONVENTION_GROUPS.map(g=>`<button type="button" class="conv-theme" data-action="conv-theme" data-group="${g.key}" aria-pressed="false">${icon(g.icon)}${E(g.label)}</button>`).join('')}${lib?`<button type="button" class="conv-theme" data-action="conv-theme" data-group="lib" aria-pressed="false">${icon('star')}Minha biblioteca</button>`:''}</div><div class="conv-results" id="convResults" role="listbox" aria-label="Subsets"></div></div>`;
+ return`<div class="conv-search"><span class="conv-search-field">${icon('search')}<input id="convSearch" type="search" autocomplete="off" spellcheck="false" placeholder="Pesquise por tema: testes, segurança, git, acessibilidade..." aria-label="Pesquisar subsets por tema" aria-controls="convResults"></span><div class="conv-themes" role="group" aria-label="Temas">${CONVENTION_GROUPS.map(g=>`<button type="button" class="conv-theme" data-action="conv-theme" data-group="${E(g.key)}" aria-pressed="false">${icon(g.icon)}${E(g.label)}</button>`).join('')}${lib?`<button type="button" class="conv-theme" data-action="conv-theme" data-group="lib" aria-pressed="false">${icon('star')}Minha biblioteca</button>`:''}</div><div class="conv-results" id="convResults" role="listbox" aria-label="Subsets"></div></div>`;
 }
 function convSearchSections(){
  const fam=$('#convFamily')?.value||'general',suggest=CONVENTION_FAMILIES[fam]?.suggest||[],q=convNorm($('#convSearch')?.value||'').trim(),words=q.split(/\s+/).filter(Boolean);
@@ -12893,18 +13054,49 @@ function openLogs(){
  showModal('REGISTRO DE <span class="word-tag">TRANSMISSÕES</span>',project().code+' / HISTÓRICO LOCAL',`<div class="modal-toolbar"><div class="flex wrap">${[['all','Todos'],['agent','Agentes'],['plan','Plano'],['handoff','Handoffs'],['review','Revisões']].map(([key,label])=>`<button class="btn sm ${ui.logFilter===key?'white':'ghost'}" data-action="log-filter" data-filter="${key}">${label}</button>`).join('')}</div><div class="flex wrap"><button class="btn ghost sm" data-action="console">${icon('terminal')}Console</button><button class="btn ghost sm" data-action="logs-export">${icon('download')}Exportar log</button></div></div><div id="logRows">${logsHTML()}</div>`,'','','logs');
 }
 function openSettings(tab=ui.settingsTab){
- ui.settingsTab=['workspace','claude','settingsjson'].includes(tab)?tab:'workspace';const r=runtime(),b=ui.bridge,locked=runner?'disabled':'';
- const tabs=[['workspace','WORKSPACE'],['claude','CLAUDE CODE'],['settingsjson','SETTINGS.JSON']].map(([key,title])=>`<button type="button" class="editor-tab ${key===ui.settingsTab?'active':''}" data-action="settings-tab" data-tab="${key}">${title}</button>`).join('');
+ ui.settingsTab=['workspace','claude','settingsjson','plugins'].includes(tab)?tab:'workspace';const r=runtime(),b=ui.bridge,locked=runner?'disabled':'';
+ const tabs=[['workspace','WORKSPACE'],['claude','CLAUDE CODE'],['settingsjson','SETTINGS.JSON'],['plugins','PLUGINS']].map(([key,title])=>`<button type="button" class="editor-tab ${key===ui.settingsTab?'active':''}" data-action="settings-tab" data-tab="${key}">${title}</button>`).join('');
  const bridgeState=b.online?`<div class="notice" style="margin-top:0">${icon('check')}<span>Bridge conectado ao <strong>Claude Code ${E(b.version)}</strong><br><small>${E(b.path||'')} / ${E(b.platform||'')} / pasta dos projetos: ${E(b.projectsDir||'')}</small></span></div>`:`<div class="notice warning" style="margin-top:0">${icon('info')}<span>${BRIDGE_TOKEN?'O bridge respondeu, mas o Claude Code não foi encontrado: '+E(b.error||''):'Esta página não foi servida pelo bridge. Para executar agentes reais, rode <code>node server.js</code> na pasta do projeto e abra <code>http://127.0.0.1:4317</code>. Até lá, a operação usa a simulação local.'}</span></div>`;
  const workspace=`<div class="settings-row"><div><h3>Movimento e transmissões</h3><p>Animações de interface, marcadores ativos e pacotes nas rotas. Respeita a preferência de movimento reduzido do sistema.</p></div><button class="toggle" role="switch" aria-label="Ativar movimento" aria-checked="${state.settings.motion}" data-action="setting-toggle" data-setting="motion"></button></div><div class="settings-row"><div><h3>Gráficos da cidade em alta qualidade</h3><p>Sombras suaves, oclusão de ambiente e brilho na cidade hexagonal. Desligue em computadores mais lentos; em quadros lentos a qualidade também cai sozinha.</p></div><button class="toggle" role="switch" aria-label="Gráficos da cidade em alta qualidade" aria-checked="${state.settings.mapQuality!=='low'}" data-action="setting-toggle" data-setting="mapQuality"></button></div><div class="settings-row"><div><h3>Cidade em modo planeta</h3><p>A cidade hexagonal vira um planeta 3D, no estilo Mario Galaxy: arraste para girar o planeta e ver os agentes do outro lado. Precisa de WebGL.</p></div><button class="toggle" role="switch" aria-label="Cidade em modo planeta" aria-checked="${state.settings.cityShape==='planet'}" data-action="setting-toggle" data-setting="cityShape"></button></div><div class="settings-row"><div><h3>Intervalo entre etapas</h3><p>Pausa entre as etapas dos agentes. No modo demo, é a duração de cada etapa simulada.</p></div><select id="demoSpeed" aria-label="Intervalo entre etapas">${[[600,'Rápida / 0,6 s'],[1000,'Ágil / 1 s'],[1800,'Normal / 1,8 s'],[3200,'Lenta / 3,2 s']].map(([value,label])=>`<option value="${value}" ${state.settings.stepMs===value?'selected':''}>${label}</option>`).join('')}</select></div><div class="settings-row"><div><h3>Exportar workspace</h3><p>Backup JSON com agentes, retratos, prompts, projetos, features, histórico e configurações do runtime.</p></div><button class="btn" data-action="export">${icon('download')}Exportar</button></div><div class="settings-row"><div><h3>Importar backup</h3><p>Restaura um backup JSON (exportado ou de <code>data/legacy-json</code>) após confirmação. Substitui os dados atuais${diskSync.on?', que ficam nas versões salvas':''}.</p></div><button class="btn" data-action="import" ${locked}>${icon('upload')}Importar</button></div><div class="settings-row"><div><h3>Reiniciar workspace</h3><p>Remove alterações deste workspace e restaura o projeto Atlas Commerce.</p></div><button class="btn danger" data-action="reset" ${locked}>${icon('trash')}Reiniciar</button></div>${diskSync.on?`<div class="settings-row ws-versions-row"><div><h3>Versões salvas</h3><p>O banco guarda uma versão do workspace antes da primeira alteração de cada início do bridge, antes de importar ou restaurar e quando outra aba salva por cima. Ficam as 30 mais recentes.</p><div id="wsVersions" class="ws-versions"><span class="hint">Carregando…</span></div></div></div>`:''}<div class="notice" style="margin-bottom:0">${icon('lock')}<span>${diskSync.on?`O workspace, a sala da operação, as conversas e o histórico de execuções ficam no banco SQLite local <code>${E(diskSync.path||'data/squad.db')}</code>${diskSync.status==='error'?` (agora indisponível: ${E(diskSync.error==='token'?'recarregue a página':diskSync.error)}; as alterações ficam neste navegador até lá)`:diskSync.savedAt?` (último salvamento às ${clock(diskSync.savedAt)})`:''}, e o workspace também neste navegador. Nenhum dos dois é um cofre de segredos`:'Os dados ficam só no navegador deste dispositivo. Abra a página pelo bridge (<code>npm start</code>, <code>http://127.0.0.1:4317</code>) para salvá-los no banco local. O armazenamento local não é um cofre de segredos'}: não coloque credenciais nos prompts ou no briefing.</span></div>`;
  const claude=`${bridgeState}<form id="runtimeForm" novalidate><div class="form-grid"><div class="field"><label for="rtMode">EXECUÇÃO DOS AGENTES</label><select id="rtMode" name="mode"><option value="claude" ${r.mode==='claude'?'selected':''}>Claude Code real (claude -p)</option><option value="demo" ${r.mode==='demo'?'selected':''}>Simulação local (demo)</option></select></div><div class="field"><label for="rtPath">EXECUTÁVEL DO CLAUDE</label><input id="rtPath" name="claudePath" value="${E(r.claudePath)}" maxlength="400" placeholder="claude (padrão do bridge)" autocomplete="off"><span class="hint">Nome no PATH ou caminho completo. Vazio = padrão do bridge.</span></div><div class="field full"><span class="label">PASTA DOS PROJETOS</span><div class="hint" style="margin-top:10px;word-break:break-all">Cada operação trabalha na sua própria pasta dentro de <code>${E(b.projectsDir||'projects/')}</code>, criada na primeira execução. É lá que os agentes leem e escrevem os arquivos. Esta operação: <code>${E(projectDirLabel())}</code>.</div></div><div class="field"><label for="rtPerm">MODO DE PERMISSÃO</label><select id="rtPerm" name="permissionMode">${Object.entries(PERMISSION_MODES).map(([k,label])=>`<option value="${k}" ${r.permissionMode===k?'selected':''}>${E(label)}</option>`).join('')}</select></div><div class="field"><label for="rtModel">MODELO (SOBRESCREVE O DO AGENTE)</label><input id="rtModel" name="model" value="${E(r.model)}" maxlength="80" placeholder="vazio = modelo de cada agente" list="rtModels" autocomplete="off"><datalist id="rtModels">${CLAUDE_MODELS.flatMap(([,items])=>items.map(([id])=>id)).filter(id=>id!=='inherit').map(m=>`<option value="${m}">`).join('')}</datalist></div><div class="field"><label for="rtEffort">ESFORÇO (SOBRESCREVE O DO AGENTE)</label><select id="rtEffort" name="effort">${EFFORTS.map(e=>`<option value="${e}" ${r.effort===e?'selected':''}>${e?e.toUpperCase():'Vazio = esforço de cada agente'}</option>`).join('')}</select></div><div class="field"><label for="rtBudget">ORÇAMENTO MÁXIMO POR ETAPA (USD)</label><input id="rtBudget" name="maxBudgetUsd" type="number" min="0.01" max="1000" step="0.01" value="${E(r.maxBudgetUsd)}" placeholder="sem limite"></div><div class="field"><label for="rtTimeout">TEMPO LIMITE POR ETAPA (S)</label><input id="rtTimeout" name="timeoutSec" type="number" min="10" max="7200" step="10" value="${E(r.timeoutSec)}"></div><div class="field"><label for="rtConc">EXECUÇÕES SIMULTÂNEAS NO BRIDGE</label><input id="rtConc" name="concurrency" type="number" min="1" max="8" step="1" value="${E(r.concurrency)}"></div><div class="field full"><label for="rtAllowed">REGRAS EXTRAS DE ALLOWEDTOOLS</label><input id="rtAllowed" name="extraAllowedTools" value="${E(r.extraAllowedTools)}" maxlength="2000" placeholder='Ex.: Bash(npm test), Bash(git status)' autocomplete="off"><span class="hint">Separadas por vírgula. Somadas às ferramentas de cada agente em --allowedTools.</span></div><div class="field full"><label for="rtDirs">DIRETÓRIOS ADICIONAIS (--add-dir)</label><input id="rtDirs" name="addDirs" value="${E(r.addDirs)}" maxlength="2000" placeholder="Separados por vírgula" autocomplete="off"></div><label class="check-card full"><input type="checkbox" name="restrictTools" ${r.restrictTools?'checked':''}><span><strong>Restringir às ferramentas do agente</strong><small>Passa --tools com a seleção do estúdio. Desmarcado, o agente recebe as ferramentas padrão do Claude Code.</small></span></label></div>${r.permissionMode==='bypassPermissions'?`<div class="notice warning">${icon('lock')}bypassPermissions desativa todas as verificações. Os agentes podem executar qualquer comando nesta máquina.</div>`:''}<div class="notice">${icon('info')}<span>Cada etapa roda <code>claude -p --output-format stream-json</code> com o prompt do agente anexado ao system prompt. O Claude Code usa a sua autenticação local e as execuções são cobradas na sua conta.</span></div>${commandPreviewHTML()}</form>`;
  const sj=`<div class="notice" style="margin-top:0">${icon('file')}<span>Edita os arquivos reais de configuração do Claude Code. Um backup <code>.bak</code> é criado antes de salvar. Os escopos de projeto e local usam a pasta da operação atual, <code>projects/${E(project().folder)}/.claude/</code>.</span></div><div class="form-grid"><div class="field"><label for="sjScope">ESCOPO</label><select id="sjScope">${[['user','Usuário / ~/.claude/settings.json'],['project','Projeto / .claude/settings.json'],['local','Local / .claude/settings.local.json']].map(([k,l])=>`<option value="${k}" ${ui.settingsScope===k?'selected':''}>${l}</option>`).join('')}</select></div><div class="field"><span class="label">ARQUIVO</span><div class="hint" id="sjPath" style="margin-top:10px;word-break:break-all">${E(ui.settingsFile?.path||'Carregue para ver o caminho.')}</div></div><div class="field full"><label for="sjText">CONTEÚDO JSON</label><textarea id="sjText" class="code" spellcheck="false" style="min-height:320px">${E(ui.settingsFile?.text??'')}</textarea><span class="hint" id="sjStatus">${ui.settingsFile?(ui.settingsFile.exists?'Arquivo carregado.':'Arquivo ainda não existe; salvar vai criá-lo.'):''}</span></div></div><div class="flex wrap" style="gap:8px;margin-top:6px"><button class="btn ghost" data-action="settings-load" ${b.online||BRIDGE_TOKEN?'':'disabled'}>${icon('download')}Carregar</button><button class="btn ghost" data-action="settings-validate">${icon('check')}Validar JSON</button><button class="btn primary" data-action="settings-save" ${BRIDGE_TOKEN?'':'disabled'}>${icon('upload')}Salvar arquivo</button></div>`;
- const body=`<nav class="editor-nav" aria-label="Seções das configurações">${tabs}</nav><div class="editor-pane ${ui.settingsTab==='workspace'?'':'hidden'}" data-pane="workspace">${workspace}</div><div class="editor-pane ${ui.settingsTab==='claude'?'':'hidden'}" data-pane="claude">${claude}</div><div class="editor-pane ${ui.settingsTab==='settingsjson'?'':'hidden'}" data-pane="settingsjson">${sj}</div>`;
+ const body=`<nav class="editor-nav" aria-label="Seções das configurações">${tabs}</nav><div class="editor-pane ${ui.settingsTab==='workspace'?'':'hidden'}" data-pane="workspace">${workspace}</div><div class="editor-pane ${ui.settingsTab==='claude'?'':'hidden'}" data-pane="claude">${claude}</div><div class="editor-pane ${ui.settingsTab==='settingsjson'?'':'hidden'}" data-pane="settingsjson">${sj}</div><div class="editor-pane ${ui.settingsTab==='plugins'?'':'hidden'}" data-pane="extensions">${pluginsHTML()}</div>`;
  const footer=ui.settingsTab==='claude'?`<button class="btn ghost" data-action="bridge-test">${icon('radio')}Testar conexão</button><span class="grow"></span>${cancelButton}<button class="btn primary" type="submit" form="runtimeForm" ${locked}>${icon('check')}Salvar configurações</button>`:'';
  showModal('CONFIGURAÇÕES DO <span class="word-tag">WORKSPACE</span>',liveMode()?'CLAUDE CODE CONECTADO / '+E(b.version||''):'LOCAL-FIRST / RUNTIME DESCONECTADO',body,footer,'','settings');
  if(ui.settingsTab==='settingsjson'&&!ui.settingsFile&&BRIDGE_TOKEN)loadClaudeSettings();
  if(ui.settingsTab==='workspace'&&diskSync.on)loadVersions();
  if(ui.settingsTab==='claude')refreshCommandPreview();
+}
+/* Configurações > Plugins: plugins loaded by the bridge (#squad-plugins), their warnings and the app's, the theme picker and how to
+   install. A theme change saves and reloads (city.js builds its scene once, at load). */
+function pluginsHTML(){
+ const P=readPlugins(),themes=pluginThemes(),cur=state.settings.theme||'',warn=[...P.warnings,...P.appWarnings];
+ const install=`<div class="notice" style="margin-bottom:0">${icon('info')}<span><strong>Como instalar um plugin.</strong> Crie <code>squad.local.json</code> na pasta do app (ao lado de <code>server.js</code>) com <code>{"plugins": {"paths": ["caminho/do/plugin"]}}</code> e recarregue a página. Caminhos relativos valem a partir do arquivo e <code>~</code> é a sua pasta pessoal. Um plugin nunca altera agentes já criados: os agentes, categorias, diretrizes, avatares e temas dele aparecem no catálogo.</span></div>`;
+ if(!BRIDGE_TOKEN)return`<div class="notice" style="margin-top:0">${icon('lock')}<span><strong>Disponível com o bridge.</strong> Plugins e temas são lidos pelo bridge local. Rode <code>npm start</code> na pasta do app e abra <code>http://127.0.0.1:4317</code>.</span></div>${install}`;
+ const count=(n,one,many)=>`${n} ${n===1?one:many}`;
+ const plugins=P.plugins.length?P.plugins.map(pk=>{const c=pk.conventions,diret=c?c.subsets.length+c.groups.length+Object.values(c.families).reduce((n,f)=>n+(Array.isArray(f?.templates)?f.templates.length:0),0):0,ok=pluginPresets().filter(p=>p.plugin===pk.id).length,all=Math.max(pk.declared||0,pk.presets.length);
+  return`<div class="settings-row"><div><h3>${E(pk.name)}${pk.version?` <small>v${E(pk.version)}</small>`:''}</h3>${pk.description?`<p>${E(pk.description)}</p>`:''}<p class="hint" style="word-break:break-all">ID <code>${E(pk.id)}</code>${pk.path?` / <code>${E(pk.path)}</code>`:''}</p><p class="hint">${[count(ok,'agente','agentes')+(ok<all?` (${all-ok} ignorado${all-ok>1?'s':''})`:''),count(pk.categories.length,'categoria','categorias'),count(pk.avatars.length,'avatar','avatares'),count(pk.themes.length,'tema','temas'),count(diret,'diretriz','diretrizes')].join(' / ')}</p></div></div>`;}).join('')
+  :`<div class="settings-row"><div><h3>Nenhum plugin carregado</h3><p>${P.present?'O bridge não encontrou plugins na configuração local.':'Esta página não recebeu a lista de plugins do bridge (versão antiga do bridge?).'}</p></div></div>`;
+ const known=!cur||themes.some(t=>t.key===cur),pluginOf=k=>P.plugins.find(pk=>k.startsWith(pk.id+'/'))?.name||'';
+ const theme=`<div class="settings-row"><div><h3>Tema</h3><p>Cores da interface, da cidade e do escritório oferecidas pelos plugins. Trocar o tema salva o workspace e recarrega a página.</p>${known?'':`<p class="hint">O tema salvo (<code>${E(cur)}</code>) não está em nenhum plugin carregado; a página usa o tema padrão e mantém a escolha.</p>`}</div><select id="themeSelect" aria-label="Tema" ${runner||diskSync.setup?'disabled':''}><option value="" ${cur?'':'selected'}>Padrão</option>${known?'':`<option value="${E(cur)}" selected>${E(cur)} (não encontrado)</option>`}${themes.map(t=>`<option value="${E(t.key)}" ${t.key===cur?'selected':''}>${E(t.label)}${pluginOf(t.key)?' / '+E(pluginOf(t.key)):''}</option>`).join('')}</select></div>`;
+ const warnings=warn.length?`<div class="notice warning">${icon('info')}<span><strong>Avisos dos plugins</strong><br>${warn.map(w=>E(w)).join('<br>')}</span></div>`:'';
+ return`${plugins}${theme}${warnings}${install}`;
+}
+// Theme change: saves and reloads only once the current workspace is safe, written to the database (no pending write on its rev)
+// or to this browser's copy (which then wins at the next boot, see bootChoice). The whole wait is capped at 5 s; without either,
+// the page stays open with the previous theme, the picker comes back and an error says why.
+async function setTheme(key){
+ if(runner){toast('Encerre a operação antes de trocar o tema: a página é recarregada.','error');openSettings('plugins');return;}
+ const prev=state.settings.theme||'';if(diskSync.setup||key===prev)return;
+ state.settings.theme=key;save();$('#themeSelect')?.setAttribute('disabled','');toast('Salvando o tema…');
+ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+ if(diskSync.on)await Promise.race([(async()=>{await diskFlush();while(diskSync.busy||diskSync.timer&&diskSync.status!=='error')await sleep(100);})(),sleep(5000)]);
+ const json=JSON.stringify(state);let local=false;try{local=localStorage.getItem(STORE)===json;}catch{local=false;}
+ const disk=diskSync.on&&diskSync.status!=='error'&&!diskSync.busy&&!diskSync.timer&&diskSync.last===json;
+ if(disk||local){location.reload();return;}
+ state.settings.theme=prev;save();
+ toast(`Não foi possível salvar o tema (${diskSync.on?(diskSync.status==='error'?(diskSync.error==='token'?'o bridge foi reiniciado, recarregue a página':diskSync.error):'o banco local não respondeu a tempo')+' e ':''}o armazenamento do navegador está indisponível). A página não foi recarregada; exporte o workspace antes de tentar de novo.`,'error');
+ if(ui.modal==='settings')openSettings('plugins');
 }
 function saveRuntime(form){
  if(!guardMutation())return;const d=new FormData(form),raw=Object.fromEntries(d.entries());raw.restrictTools=d.has('restrictTools');
@@ -13210,6 +13402,30 @@ const OP_CATEGORIES=[
   {name:'GUIDE',role:'docs',specialty:'Tutoriais / Onboarding',icon:'compass',description:'Tutoriais passo a passo e guias de onboarding do projeto.'}]},
  {key:'outros',label:'Outros',icon:'sparkle',roles:['architect','po','pm','custom'],description:'Outros agentes do workspace que também podem operar.',presets:[]}
 ];
+/* Plugins: presets go into their seat (commander/adr/prd) or operator category (plugin categories go before `before`, 'outros' by
+   default, or at the end). pluginPresets already refused names of the catalog; checked again against the real lists here. */
+function mergePluginPresets(){
+ const P=readPlugins();if(!P.plugins.length)return;
+ for(const pk of P.plugins)for(const c of pk.categories){
+  if(OP_CATEGORIES.some(x=>x.key===c.key))continue; // an existing category (built-in or of another plugin) just receives the agents
+  const at=OP_CATEGORIES.findIndex(x=>x.key===(c.before||'outros'));
+  OP_CATEGORIES.splice(at<0?OP_CATEGORIES.length:at,0,{key:c.key,label:c.label||c.key,icon:c.icon||'sparkle',roles:[],description:c.description,presets:[],plugin:pk.id});
+ }
+ const taken=new Set([...AGENT_PRESETS.commander,...AGENT_PRESETS.adr,...AGENT_PRESETS.prd,...OP_CATEGORIES.flatMap(c=>c.presets)].map(x=>x.name));
+ for(const p of pluginPresets()){
+  if(taken.has(p.name)){pluginWarn(`Agente ${p.name} do plugin ignorado: já existe no catálogo.`);continue;}taken.add(p.name);
+  const preset={name:p.name,role:p.role,icon:AGENT_ICONS.includes(p.icon)?p.icon:'',plugin:p.plugin};
+  if(p.specialty)preset.specialty=p.specialty;if(p.description)preset.description=p.description;if(p.style)preset.style=p.style;
+  if(/^[A-Za-z0-9._\-\[\]]{1,80}$/.test(p.model))preset.model=p.model;if(p.effort&&EFFORTS.includes(p.effort))preset.effort=p.effort;if(p.tools)preset.tools=[...p.tools];
+  if(p.conv)preset.conv={...(p.conv.template?{template:p.conv.template}:{}),subsets:[...p.conv.subsets]};
+  if(presetPrompt(preset).length>20000){pluginWarn(`Agente ${p.name} ignorado: instruções (especialidade + corpo) maiores que 20000 caracteres.`);continue;}
+  if(p.slot!=='operator'){AGENT_PRESETS[p.slot].push(preset);continue;}
+  let cat=p.category&&OP_CATEGORIES.find(c=>c.key===p.category);
+  if(!cat){if(p.category)pluginWarn(`Agente ${p.name}: categoria "${p.category}" não existe; entrou na categoria da especialidade.`);cat=OP_CATEGORIES.find(c=>c.roles.includes(p.role))||OP_CATEGORIES.find(c=>c.key==='outros')||OP_CATEGORIES.at(-1);}
+  cat.presets.push(preset);
+ }
+}
+mergePluginPresets();
 AGENT_PRESETS.op=OP_CATEGORIES.flatMap(c=>c.presets);
 const opCategoryOf=role=>OP_CATEGORIES.find(c=>c.roles.includes(role))?.key||'outros';
 // Declared (hoisted): migrateCatalogAgents uses it right after the catalog. The coding style lives in the DIRETRIZES (style-* subsets), never here.
@@ -13235,7 +13451,7 @@ function presetByName(n){
 }
 function agentTemplateOf(a){return presetByName(a?.template)||presetByName(a?.name);}
 function presetDefaults(p){
- const r=ROLES[p.role],d={name:p.name,role:p.role,specialty:p.specialty||'',icon:p.icon||'',model:p.model||r.model,effort:p.effort||'',description:p.description||r.description,prompt:presetPrompt(p),tools:['Read','Glob','Grep',...(['commander','architect','po','qa'].includes(p.role)?[]:['Edit','Write'])],image:'',template:p.name,...defaultSoul({name:p.name})};
+ const r=ROLES[p.role],d={name:p.name,role:p.role,specialty:p.specialty||'',icon:p.icon||'',model:p.model||r.model,effort:p.effort||'',description:p.description||r.description,prompt:presetPrompt(p),tools:p.tools?[...p.tools]:['Read','Glob','Grep',...(['commander','architect','po','qa'].includes(p.role)?[]:['Edit','Write'])],image:'',template:p.name,...defaultSoul({name:p.name})};
  d.conventions=defaultConventions(d,p.conv);return d;
 }
 // "Restaurar default": refills the studio form with the template values; saving applies them, cancelling discards them.
@@ -13567,6 +13783,7 @@ document.addEventListener('input',event=>{
 document.addEventListener('change',event=>{
  if(event.target.id==='importInput')importWorkspace(event.target.files?.[0]);
  if(event.target.id==='dbSetupImport'){const file=event.target.files?.[0];event.target.value='';dbSetupImport(file);}
+ if(event.target.id==='themeSelect')setTheme(event.target.value);
  if(event.target.id==='demoSpeed'){const n=Number(event.target.value);if([600,1000,1800,3200].includes(n)){state.settings.stepMs=n;save();}}
  if(event.target.id==='agentRole'&&ui.draft?.kind==='agent'){
   const old=ROLES[ui.draft.roleShown||ui.draft.agent.role],role=ROLES[event.target.value];

@@ -26,3 +26,6 @@ Thumbs.db
 
 # Workspace salvo pelo bridge (data/workspace.json, backups)
 data/
+
+# Configuração local dos Plugins (docs/plans/plugins-conteudo.md)
+squad.local.json

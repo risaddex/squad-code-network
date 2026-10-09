@@ -3,7 +3,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,14 +21,18 @@ const tempRoot = tmp('squad-tmp-');
 const projectsRoot = tmp('squad-projects-');
 // The SQLite database (squad.db) goes here instead of ./data in the repo.
 const dataRoot = tmp('squad-data-');
-const extraDirs = [], bridges = [];
+// Plugins configuration: an empty file instead of the clone's own squad.local.json.
+const configRoot = tmp('squad-config-');
+const emptyConfig = path.join(configRoot, 'empty.json');
+writeFileSync(emptyConfig, '{}');
+const extraDirs = [configRoot], bridges = [];
 let server, token, nextPort = PORT + 1;
 
 /** Starts a bridge on its own port with `dataDir` as the database folder; several starts on one folder test restarts. */
-async function startBridge(dataDir, port = nextPort++) {
+async function startBridge(dataDir, port = nextPort++, env = {}) {
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js'), '--port', String(port)], {
     cwd: workdir,
-    env: { ...process.env, TEMP: tempRoot, TMP: tempRoot, TMPDIR: tempRoot, SQUAD_HOME: home, SQUAD_PROJECTS_DIR: projectsRoot, SQUAD_DATA_DIR: dataDir, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_PRINT_TOKEN: '1' },
+    env: { ...process.env, TEMP: tempRoot, TMP: tempRoot, TMPDIR: tempRoot, SQUAD_HOME: home, SQUAD_PROJECTS_DIR: projectsRoot, SQUAD_DATA_DIR: dataDir, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: emptyConfig, SQUAD_PLUGINS: '', ...env },
   });
   let out = '';
   const tok = await new Promise((resolve, reject) => {
@@ -41,8 +45,8 @@ async function startBridge(dataDir, port = nextPort++) {
   const b = {
     proc, token: tok, base, out: () => out,
     api: (p, init = {}) => fetch(base + p, { ...init, headers: { 'content-type': 'application/json', 'x-squad-token': tok, ...(init.headers || {}) } }),
-    // Windows: a hard kill (no shutdown), like closing the terminal.
-    stop: async () => { if (proc.exitCode === null) { const exited = new Promise(r => proc.once('exit', r)); proc.kill(); await exited; } },
+    // Windows: a hard kill (no shutdown), like closing the terminal. Elsewhere SIGTERM shuts down cleanly; 'SIGKILL' is the dead bridge.
+    stop: async signal => { if (proc.exitCode === null) { const exited = new Promise(r => proc.once('exit', r)); proc.kill(signal); await exited; } },
   };
   bridges.push(b);
   return b;
@@ -448,7 +452,7 @@ test('run history survives a restart; a run cut by a dead bridge comes back inte
   res = await b.api('/api/runs', { method: 'POST', body: JSON.stringify({ prompt: 'SLEEP', options: { cwd: workdir }, meta: { projectId: 'p1', kind: 'chat' } }) });
   const cut = (await res.json()).runId;
   await new Promise(r => setTimeout(r, 700)); // the first events reach the database
-  await b.stop();
+  await b.stop('SIGKILL');
 
   b = await startBridge(dir);
   const list = (await (await b.api('/api/runs?projectId=p1')).json()).runs;
@@ -518,4 +522,115 @@ test('chats are saved per kind, capped and swept when their feature is gone', as
   assert.equal((await api('/api/chats/agent/a1', { method: 'DELETE' })).status, 200);
   chats = pageTag(await page(), 'squad-memory').chats;
   assert.equal(chats.agent.a1, undefined);
+});
+
+/* ---------- Plugins (plugins.js, docs/plans/plugins-conteudo.md) ---------- */
+// 1x1 PNG.
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+const writeTree = (dir, files) => { for (const [rel, data] of Object.entries(files)) { const f = path.join(dir, rel); mkdirSync(path.dirname(f), { recursive: true }); writeFileSync(f, typeof data === 'string' || Buffer.isBuffer(data) ? data : JSON.stringify(data)); } };
+
+test('without plugins the page gets an empty squad-plugins tag', async () => {
+  assert.deepEqual(pageTag(await page(), 'squad-plugins'), { plugins: [], runtime: {}, warnings: [] });
+  assert.equal((await (await api('/api/health')).json()).plugins, 0);
+  assert.equal((await fetch(BASE + '/api/plugins')).status, 401);
+});
+
+test('plugins from the local config and SQUAD_PLUGINS are loaded, validated and injected; changes are reread', async () => {
+  const root = tmp('squad-plugins-'); extraDirs.push(root);
+  writeTree(path.join(root, 'good'), {
+    'squad-plugin.json': {
+      id: 'acme', name: 'Acme', version: '1.2.0', description: 'Plugin de teste',
+      categories: [{ key: 'acme-cat', label: 'Acme', icon: 'flow', description: 'x', before: 'outros' }, { key: 'Bad Key' }],
+      avatars: [{ key: 'triagem', label: 'TRIAGEM', file: 'avatars/triagem.png' }, { key: 'vec', file: 'avatars/vec.svg' }, { key: 'fake', file: 'avatars/fake.png' }],
+      themes: [{ key: 'noite', label: 'Noite', ui: { '--bg': '#05070a', '--line': 'rgba(1, 2, 3, 0.5)', '--Bad': '#fff', '--x': 'url(evil)' }, city: { bg: '#ff0000', build: 0x00ff00, exposure: 3, other: 1 }, agent: { blue: 'blue' }, run: { work: '0x112233' } }],
+      runtime: { model: 'opus', concurrency: 3, foo: 1 },
+    },
+    'avatars/triagem.png': PNG,
+    'avatars/vec.svg': '<svg/>',
+    'avatars/fake.png': 'not an image',
+    'conventions.json': { families: { backend: { templates: [{ key: 'acme-java', name: 'Acme Java', content: '# Regras' }, { key: 'no-content' }] }, constructor: { templates: [{ key: 'proto-tpl', content: 'x' }] } },
+      subsets: [{ key: 'acme-sub', name: 'S', content: 'c', group: 'style' }, { key: 'huge-sub', content: 'x'.repeat(20001) }, { key: 'prototype', content: 'x' }], groups: [] },
+    'agents/PROTO.md': '---\nname: PROTO\nslot: prd\nrole: po\n__proto__: x\n---\n',
+    'agents/LONG.md': '---\nname: LONG\nslot: prd\nrole: po\n---\n' + 'y'.repeat(16001) + '\n',
+    'agents/TRIAGEM.md': '---\nname: TRIAGEM   # comentário\nslot: operator\ncategory: acme-cat\nrole: backend\nspecialty: "Java, Spring"\nicon: flow\nmodel: opus\neffort: high\ntools: [Read, Glob, Grep]\navatar: triagem\ndescription: Triagem do backend\nsoul: Calmo\nhellos:\n  - Oi! Qual é a feature?\n  - \'E aí # tudo\'\nconventions:\n  template: acme-java\n  subsets: [style-java, acme-sub]\n---\nConduza como o TRIAGEM.\n',
+    'agents/VIGIA.md': '---\nname: VIGIA\nslot: commander\nrole: commander\n---\nComande.\n',
+    'agents/BROKEN.md': '---\nname: BROKEN\nslot: operator\nrole: qa\nnested:\n  deep:\n    x: 1\n---\n',
+    'agents/NOSLOT.md': '---\nname: NOSLOT\nrole: qa\n---\n',
+  });
+  writeTree(path.join(root, 'dup'), { 'squad-plugin.json': { id: 'acme', name: 'Outro Acme' } });
+  writeTree(path.join(root, 'other'), { 'squad-plugin.json': { id: 'other' }, 'agents/TRIAGEM.md': '---\nname: TRIAGEM\nslot: adr\nrole: architect\n---\n', 'agents/ECHO.md': '---\nname: ECHO\nslot: prd\nrole: po\n---\nPRD.\n' });
+  writeTree(path.join(root, 'off'), { 'squad-plugin.json': { id: 'off' }, 'agents/OFF.md': '---\nname: OFFLINE\nslot: prd\nrole: po\n---\n' });
+  writeTree(path.join(root, 'linky'), { 'squad-plugin.json': { id: 'linky', avatars: [{ key: 'evil', file: 'avatars/evil.png' }] } });
+  writeTree(path.join(root, 'outside'), { 'OUT.md': '---\nname: OUTSIDER\nslot: prd\nrole: po\n---\n', 'evil.png': PNG });
+  let links = true;
+  try {
+    mkdirSync(path.join(root, 'linky', 'agents'), { recursive: true }); mkdirSync(path.join(root, 'linky', 'avatars'), { recursive: true });
+    symlinkSync(path.join(root, 'outside', 'OUT.md'), path.join(root, 'linky', 'agents', 'OUT.md'));
+    symlinkSync(path.join(root, 'outside', 'evil.png'), path.join(root, 'linky', 'avatars', 'evil.png'));
+  } catch { links = false; } // Windows without symlink permission
+  writeTree(path.join(root, 'envplugin'), { 'squad-plugin.json': { id: 'envplugin' } });
+  writeTree(path.join(root, 'env2'), { 'squad-plugin.json': { id: 'env-two' } });
+  const cfg = path.join(root, 'cfg', 'local.json');
+  const cfgBody = { plugins: { paths: ['../good', '../dup', '../other', '../off', '../linky', '../missing'], disabled: ['off'] }, runtime: { model: 'sonnet', permissionMode: 'nope' }, profiles: [{ name: 'p1' }] };
+  writeTree(path.dirname(cfg), { 'local.json': cfgBody });
+
+  const data = tmp('squad-data-plugins-'); extraDirs.push(data);
+  const b = await startBridge(data, undefined, { SQUAD_CONFIG: cfg, SQUAD_PLUGINS: [path.join(root, 'envplugin'), path.join(root, 'env2')].join(path.delimiter) });
+  const html = await page(b.base);
+  const tag = pageTag(html, 'squad-plugins');
+  assert.deepEqual(tag.plugins.map(p => p.id), ['acme', 'other', 'linky', 'envplugin', 'env-two']);
+  const acme = tag.plugins[0];
+  assert.equal(acme.name, 'Acme'); assert.equal(acme.version, '1.2.0'); assert.equal(acme.path, realpathSync(path.join(root, 'good')));
+  assert.deepEqual(acme.categories, [{ key: 'acme-cat', label: 'Acme', icon: 'flow', description: 'x', before: 'outros' }]);
+  assert.deepEqual(acme.presets.map(p => p.name), ['TRIAGEM', 'VIGIA']);
+  assert.deepEqual(acme.presets[0], {
+    slot: 'operator', category: 'acme-cat', name: 'TRIAGEM', role: 'backend', specialty: 'Java, Spring', icon: 'flow', model: 'opus', effort: 'high',
+    tools: ['Read', 'Glob', 'Grep'], avatar: 'triagem', description: 'Triagem do backend', style: 'Conduza como o TRIAGEM.', soul: 'Calmo',
+    hellos: ['Oi! Qual é a feature?', 'E aí # tudo'], conv: { template: 'acme-java', subsets: ['style-java', 'acme-sub'] },
+  });
+  assert.equal(acme.presets[1].tools, null); assert.equal(acme.presets[1].conv, null); assert.equal(acme.presets[1].category, '');
+  assert.equal(acme.avatars.length, 1);
+  assert.equal(acme.avatars[0].key, 'plugin:acme/triagem');
+  assert.equal(acme.avatars[0].src, 'data:image/png;base64,' + PNG.toString('base64'));
+  assert.deepEqual(acme.themes, [{ key: 'acme/noite', label: 'Noite', ui: { '--bg': '#05070a', '--line': 'rgba(1, 2, 3, 0.5)' }, city: { bg: 0xff0000, build: 0x00ff00 }, office: {}, agent: {}, run: { work: 0x112233 } }]);
+  assert.deepEqual(acme.conventions.families.backend.templates.map(t => t.key), ['acme-java']);
+  assert.deepEqual(acme.conventions.subsets.map(t => t.key), ['acme-sub']);
+  assert.deepEqual(acme.runtime, { model: 'opus', concurrency: 3 });
+  assert.deepEqual(tag.plugins[1].presets.map(p => p.name), ['ECHO']); // TRIAGEM already came from acme
+  assert.deepEqual(tag.runtime, { model: 'sonnet', concurrency: 3 }); // the configuration wins over the plugins
+  const w = tag.warnings.join('\n');
+  for (const re of [/dup: id acme repetido/, /\[acme\] agents\/BROKEN\.md: linha 7: só um nível/, /\[acme\] agents\/NOSLOT\.md: slot inválido/, /\[other\] agents\/TRIAGEM\.md: nome TRIAGEM repetido \(já definido no plugin acme\)/,
+    /SVG não é aceito/, /fake\.png: não é uma imagem/, /key de categoria inválida/, /exposure/, /--Bad/, /cor inválida em --x/, /agent\.blue/, /runtime\.foo/, /runtime\.permissionMode/, /missing: pasta do plugin não encontrada/,
+    /\[acme\] conventions\.json: template inválido em backend/, /família constructor inválida/, /subset huge-sub ignorado: content deve ser texto de até 20000/, /item inválido em subsets/,
+    /\[acme\] agents\/PROTO\.md: .*chave reservada: __proto__/, /\[acme\] agents\/LONG\.md: corpo maior que 16000/]) assert.match(w, re);
+  assert.ok(!Object.hasOwn(acme.conventions.families, 'constructor'));
+  assert.ok(!/OFFLINE|off\//.test(w));
+  if (links) {
+    assert.deepEqual(tag.plugins[2].presets, []); assert.deepEqual(tag.plugins[2].avatars, []);
+    assert.match(w, /\[linky\] agents\/OUT\.md: aponta para fora da pasta do plugin/);
+    assert.match(w, /avatars\/evil\.png: aponta para fora da pasta do plugin/);
+  }
+  assert.match(b.out(), /Plugins: acme 1\.2\.0 \(2 agente\(s\)\), other/);
+
+  // /api/plugins: same data without the data URLs, plus the configuration; /api/health counts the plugins.
+  assert.equal((await fetch(b.base + '/api/plugins')).status, 401);
+  const listed = await (await b.api('/api/plugins')).json();
+  assert.equal(listed.ok, true);
+  assert.deepEqual(listed.plugins[0].avatars, [{ key: 'plugin:acme/triagem', label: 'TRIAGEM' }]);
+  assert.ok(!JSON.stringify(listed).includes('base64'));
+  assert.deepEqual(listed.config.files, [cfg]);
+  assert.deepEqual(listed.config.disabled, ['off']);
+  assert.deepEqual(listed.config.profiles, [{ name: 'p1' }]);
+  assert.ok(listed.config.paths.includes(path.join(root, 'good')) && listed.config.paths.includes(path.join(root, 'envplugin')));
+  assert.equal((await (await b.api('/api/health')).json()).plugins, 5);
+
+  // Edits are picked up on the next page load: a new agent file, then an invalid configuration (only SQUAD_PLUGINS stays).
+  writeTree(path.join(root, 'envplugin'), { 'agents/NEWBIE.md': '---\nname: NEWBIE\nslot: prd\nrole: po\n---\nNovo.\n' });
+  assert.deepEqual(pageTag(await page(b.base), 'squad-plugins').plugins[3].presets.map(p => p.name), ['NEWBIE']);
+  writeFileSync(cfg, '{ "plugins": {');
+  const broken = pageTag(await page(b.base), 'squad-plugins');
+  assert.deepEqual(broken.plugins.map(p => p.id), ['envplugin', 'env-two']);
+  assert.match(broken.warnings.join('\n'), /local\.json: JSON inválido, arquivo ignorado/);
+  assert.deepEqual(broken.runtime, {});
+  await b.stop();
 });

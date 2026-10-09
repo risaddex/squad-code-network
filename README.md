@@ -249,6 +249,8 @@ A lista completa está no [guia](docs/GUIA.md#-controles).
 | `SQUAD_CLAUDE_BIN` | `claude` | Executável do Claude Code (nome no `PATH` ou caminho completo) |
 | `SQUAD_PROJECTS_DIR` | `./projects` | Raiz das pastas de trabalho dos agentes |
 | `SQUAD_DATA_DIR` | `./data` | Pasta do banco SQLite (`squad.db`) |
+| `SQUAD_CONFIG` | `./squad.local.json` | Arquivo de configuração local usado no lugar do `squad.local.json` |
+| `SQUAD_PLUGINS` | (vazio) | Pastas de plugins extras, separadas por `:` (`;` no Windows) |
 
 Exemplos:
 
@@ -316,6 +318,37 @@ de `data/backups/` para o banco e move os arquivos para `data/legacy-json/`.
 Aberto como arquivo (`index.html`, modo demo), o workspace fica só no navegador. Use **Exportar workspace** nas
 configurações para fazer backup em JSON e **Importar workspace** para restaurar.
 
+### Plugins e configuração local
+
+Agentes, souls, diretrizes, avatares, temas e defaults de execução próprios (de uma empresa ou de gosto pessoal) vêm
+de **plugins**: pastas fora deste repositório que o bridge lê ao servir a página. Para apontar um plugin, crie
+`squad.local.json` na raiz do SQUAD/CODE (fora do git; `squad.config.json`, versionável, segue o mesmo formato e perde
+para o local):
+
+```json
+{
+  "plugins": {
+    "paths": ["../meus-plugins/acme", "~/squad-plugins/pessoal"],
+    "disabled": []
+  },
+  "runtime": { "model": "sonnet", "concurrency": 3 }
+}
+```
+
+Caminhos relativos valem a partir da pasta do arquivo. Um plugin é uma pasta com:
+
+```text
+acme/
+├── squad-plugin.json   # id, name, version, categories, avatars, themes, runtime, conventions
+├── agents/*.md         # um agente por arquivo: frontmatter (name, slot, role, ...) + instruções
+├── avatars/*.png       # png, jpg ou webp (sem SVG), até 1 MB cada
+└── conventions.json    # diretrizes extras (opcional)
+```
+
+Depois de editar um plugin, basta recarregar a página. Os plugins carregados e os avisos (arquivo recusado, valor
+inválido) aparecem no log do bridge, em Configurações > Plugins e em `GET /api/plugins`. Formato completo e regras:
+[docs/plans/plugins-conteudo.md](docs/plans/plugins-conteudo.md).
+
 ---
 
 ## 🛠️ Desenvolvimento, build e testes
@@ -352,6 +385,7 @@ squad-code-network/
 ├── index.html          # app completo, gerado pelo build (não editar)
 ├── server.js           # bridge local: serve o app e executa claude -p
 ├── db.js               # banco SQLite (workspace, versões, sala, conversas, execuções)
+├── plugins.js          # configuração local e carregador de plugins
 ├── package.json        # scripts npm e a dependência better-sqlite3
 ├── build.py            # build completo (avatares + index.html)
 ├── src/                # código-fonte da interface

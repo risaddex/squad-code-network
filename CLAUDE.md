@@ -13,7 +13,7 @@ Code (`claude -p`). The bridge keeps the app's data in a local SQLite database (
 ```sh
 npm install                 # better-sqlite3 (prebuilt binary; Node >= 22)
 npm run dev                 # build index.html from src/, start the bridge, rebuild on src/ changes, restart on server.js / db.js changes
-npm start                   # node server.js → http://127.0.0.1:4317 (--port N or SQUAD_PORT; SQUAD_CLAUDE_BIN for another claude; SQUAD_PROJECTS_DIR for another projects root; SQUAD_DATA_DIR for another database folder)
+npm start                   # node server.js → http://127.0.0.1:4317 (--port N or SQUAD_PORT; SQUAD_CLAUDE_BIN for another claude; SQUAD_PROJECTS_DIR for another projects root; SQUAD_DATA_DIR for another database folder; SQUAD_CONFIG / SQUAD_PLUGINS for plugins)
 python build.py [--copy]    # full build: regenerates src/avatars.js (needs Pillow), writes index.html (--copy: also ../squad-code-network.html)
 npm test                    # bridge tests: node --test tests/bridge.test.mjs (uses tests/fake-claude.mjs, no API cost)
 node --test --test-name-pattern "<test name>" tests/bridge.test.mjs   # single bridge test
@@ -97,6 +97,22 @@ Squad colleagues: the `agents` option (whitelisted CLI subagent fields: `descrip
 to a temp file passed as `--agents <file>`, and `forwardSubagents:true` adds `--forward-subagent-text`. Runs with agents get
 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, so an `Agent` tool call runs in the foreground and its tool_result is the colleague's
 report (framed as "[Subagent hand-back] ... The report follows:" with indented lines; `subagentReport` unwraps it).
+
+**Plugins and local config (`plugins.js`, contract in `docs/plans/plugins-conteudo.md`).** Company- or taste-specific catalog content
+(agents, categories, souls, DIRETRIZES, avatars, map themes, runtime defaults) never goes in `src/`: it comes from **plugins**,
+folders outside the repo listed in `"plugins": {"paths", "disabled"}` of `squad.config.json` (shareable, optional) and `squad.local.json` (git-ignored; local wins;
+`SQUAD_CONFIG` replaces the local file, `SQUAD_PLUGINS` adds folders). `createPluginLoader` reads `squad-plugin.json`, `agents/*.md`
+(strict YAML-subset frontmatter, body = the preset's `style`, alphabetical file order = catalog order), `avatars/*` (signature
+checked, data URLs, no SVG), `conventions.json` and themes, inside the plugin's realpath, with size/count limits that mirror
+`pluginLimits()` in the app (an item over a limit is refused with a warning, never cut). Cached by mtime, re-read on every
+`serveIndex`, injected as `#squad-plugins`; `GET /api/plugins` (no image data + `config`), `plugins` in `/api/health`. In `app.js`,
+`readPlugins`/`mergePluginCatalog` (souls, avatars, `TEMPLATE_AVATARS`, DIRETRIZES without overwriting, `Object.hasOwn` on every
+plugin key) run before the seed, `pluginRuntime` feeds `DEFAULT_RUNTIME` (existing workspaces only get keys they lack), and
+`mergePluginPresets` runs right before `AGENT_PRESETS.op` (name clashes, unknown roles and slot/role mismatches are skipped with a
+warning). Themes: `settings.theme` (`'<plugin>/<key>'`, `''` = default); `city.js` builds the scene before `app.js` finishes, so it
+calls the hoisted `squadThemeBoot()`, which resolves the theme with `bootChoice()` (the same workspace decision the boot uses)
+and sets CSS variables + `window.SQUAD_THEME`; `setTheme` reloads only once the change is persisted. Configurações > Plugins
+lists plugins, warnings and the theme picker. Without the tag (demo, upstream) the app behaves exactly as without plugins.
 
 **`src/app.js` (state, UI, orchestration).**
 - One persisted `state` object (localStorage key `squad-code.network.v2`, export/import as JSON). Served by the bridge, the database

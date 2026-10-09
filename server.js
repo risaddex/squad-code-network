@@ -12,6 +12,8 @@
  *   SQUAD_HOME        overrides the home dir used for ~/.claude/settings.json (tests)
  *   SQUAD_PROJECTS_DIR root of the per-project folders (default: ./projects next to this file)
  *   SQUAD_DATA_DIR    folder of the SQLite database, squad.db (default: ./data next to this file)
+ *   SQUAD_CONFIG      local configuration file used instead of ./squad.local.json (plugins.js, docs/plans/plugins-conteudo.md)
+ *   SQUAD_PLUGINS       extra plugin folders, separated by the platform's path delimiter
  */
 const http = require('node:http');
 const fs = require('node:fs');
@@ -46,6 +48,12 @@ const dbModule = require('./db.js');
 if (dbModule.driverError) { console.error(`SQUAD/CODE: ${dbModule.driverError}`); process.exit(1); }
 const nodeMajor = Number(process.versions.node.split('.')[0]);
 if (nodeMajor < 22) console.warn(`SQUAD/CODE pede o Node 22 ou mais novo (este é o ${process.version}). Atualize se algo falhar.`);
+// Plugins (plugins.js): reread on every serveIndex when a file they came from changed.
+const pluginLoader = require('./plugins.js').createPluginLoader({ root: ROOT, home: HOME });
+function loadPlugins() {
+  try { return pluginLoader.load(); }
+  catch (e) { const warnings = [`Plugins não carregados: ${e.message}`]; return { page: { plugins: [], runtime: {}, warnings }, api: { plugins: [], runtime: {}, warnings, config: { files: [], paths: [], disabled: [], profiles: [] } }, count: 0 }; }
+}
 let store = null;
 function openDb() {
   store = dbModule.openStore(DATA_DIR);
@@ -473,7 +481,7 @@ async function serveIndex(res) {
     return res.end('<!doctype html><meta charset="utf-8"><title>SQUAD/CODE</title><body style="font:15px/1.7 system-ui,sans-serif;background:#05080a;color:#d8e1e5;padding:48px;max-width:640px">'
       + '<h1 style="font-weight:500">index.html não encontrado</h1><p>A interface é gerada a partir de <code>src/</code>. Na pasta do SQUAD/CODE, rode <code>npm run dev</code> (gera e inicia o bridge) ou <code>python build.py</code> e recarregue esta página.</p></body>');
   }
-  const tags = workspaceTag() + '\n' + memoryTag(); // a function replacement: the data may contain `$&` and similar patterns
+  const tags = workspaceTag() + '\n' + memoryTag() + '\n' + jsonTag('squad-plugins', loadPlugins().page); // a function replacement: the data may contain `$&` and similar patterns
   html = html.replace('<head>', () => `<head>\n<meta name="squad-bridge-token" content="${TOKEN}">\n${tags}`);
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
   res.end(html);
@@ -493,8 +501,10 @@ async function handle(req, res) {
     if (req.method === 'GET' && url.pathname === '/api/health') {
       const bin = url.searchParams.get('claudePath') || DEFAULT_BIN;
       const info = await claudeVersion(bin);
-      return json(res, 200, { ok: true, bridge: 'squad-code', claudeVersion: info.version, claudePath: info.resolved, claudeError: info.error, defaultCwd: process.cwd(), projectsDir: longPath(PROJECTS_DIR), home: HOME, platform: process.platform, activeRuns: activeCount(), maxConcurrent, dbReady: !setupNeeded(), dbPath: store?.file || DB_FILE });
+      return json(res, 200, { ok: true, bridge: 'squad-code', claudeVersion: info.version, claudePath: info.resolved, claudeError: info.error, defaultCwd: process.cwd(), projectsDir: longPath(PROJECTS_DIR), home: HOME, platform: process.platform, activeRuns: activeCount(), maxConcurrent, dbReady: !setupNeeded(), dbPath: store?.file || DB_FILE, plugins: loadPlugins().count });
     }
+    // Plugins as injected in the page, without the avatars' data URLs, plus the configuration they came from.
+    if (req.method === 'GET' && url.pathname === '/api/plugins') return json(res, 200, { ok: true, ...loadPlugins().api });
     // First start: the page creates the database with the workspace the person chose (from scratch, the example, a backup or the
     // browser's copy). Validated before anything is written; refused once a workspace exists.
     if (req.method === 'POST' && url.pathname === '/api/setup') {
@@ -625,6 +635,9 @@ server.listen(PORT, HOST, () => {
   console.log(`Pasta dos projetos: ${PROJECTS_DIR}`);
   if (store) console.log(`Banco de dados: ${store.file}`);
   else console.log(`Banco de dados: nenhum em ${DATA_DIR}. Abra ${url} para criar um.`);
+  const plugins = loadPlugins();
+  const pluginList = plugins.page.plugins.map(p => `${p.id}${p.version ? ` ${p.version}` : ''} (${p.presets.length} agente(s))`).join(', ');
+  console.log(`Plugins: ${pluginList || 'nenhum'}${plugins.page.warnings.length ? ` · ${plugins.page.warnings.length} aviso(s): ${plugins.page.warnings.join(' | ')}` : ''}`);
   if (store?.interrupted) console.log(`${store.interrupted} execução(ões) interrompida(s) na última sessão marcada(s) no histórico.`);
   if (process.env.SQUAD_PRINT_TOKEN) console.log(`TOKEN=${TOKEN}`);
   claudeVersion(DEFAULT_BIN).then(info => {
