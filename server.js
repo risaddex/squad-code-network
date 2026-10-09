@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 /*
- * SQUAD/CODE bridge: serves index.html, spawns headless Claude Code (`claude -p`) and keeps the app's data in SQLite (db.js).
+ * SQUAD/CODE bridge: serves index.html, spawns headless agents through an Adapter (Claude Code `claude -p`, Codex `codex exec`)
+ * on a Perfil (profile: executable + account folder) and keeps the app's data in SQLite (db.js).
  * Only dependency: better-sqlite3 (`npm install`). Binds to 127.0.0.1 only and requires a per-start token on every API call.
  *
  *   node server.js [--port 4317]
@@ -9,6 +10,8 @@
  * Environment:
  *   SQUAD_PORT        port (default 4317)
  *   SQUAD_CLAUDE_BIN  claude executable to use when the UI does not set one (default: "claude")
+ *   SQUAD_CODEX_BIN   codex executable of Codex Perfis without their own (default: "codex")
+ *   OTEL_EXPORTER_OTLP_ENDPOINT  OTLP/HTTP endpoint of the bridge's traces when Configurações > Telemetria has none
  *   SQUAD_HOME        overrides the home dir used for ~/.claude/settings.json (tests)
  *   SQUAD_PROJECTS_DIR root of the per-project folders (default: ./projects next to this file)
  *   SQUAD_DATA_DIR    folder of the SQLite database, squad.db (default: ./data next to this file)
@@ -30,6 +33,7 @@ const HOST = '127.0.0.1';
 const TOKEN = crypto.randomBytes(24).toString('hex');
 const HOME = process.env.SQUAD_HOME || os.homedir();
 const DEFAULT_BIN = process.env.SQUAD_CLAUDE_BIN || 'claude';
+const DEFAULT_CODEX_BIN = process.env.SQUAD_CODEX_BIN || 'codex';
 const IS_WIN = process.platform === 'win32';
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'squad-code-'));
 // Every project runs in its own folder under PROJECTS_DIR (created on the first run).
@@ -55,6 +59,11 @@ function loadPlugins() {
   catch (e) { const warnings = [`Plugins não carregados: ${e.message}`]; return { page: { plugins: [], runtime: {}, warnings }, api: { plugins: [], runtime: {}, warnings, config: { files: [], paths: [], disabled: [], profiles: [] } }, count: 0 }; }
 }
 let store = null;
+/* After the database opens: "Codex (padrão)" when codex is on the PATH (once per database). */
+async function afterOpen() {
+  try { if (store && await resolveBin(DEFAULT_CODEX_BIN)) { const made = store.ensureCodexDefault(); if (made) console.log(`Perfil criado: ${made.name}`); } }
+  catch (e) { console.warn(`Perfil do Codex não criado: ${e.message}`); }
+}
 function openDb() {
   store = dbModule.openStore(DATA_DIR);
   if (store.migration?.imported) console.log(`Workspace migrado de data/workspace.json para ${store.file} (${store.migration.versions} versões antigas). Os arquivos JSON foram para ${path.join(DATA_DIR, 'legacy-json')}.`);
@@ -71,6 +80,11 @@ function needStore() {
 
 const PERMISSION_MODES = ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'];
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+// Codex reasoning levels (model_reasoning_effort); `max`/`ultra` only reach models that list them (models_cache.json).
+const CODEX_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const ALL_EFFORTS = [...new Set([...EFFORTS, ...CODEX_EFFORTS])];
+const CLAUDE_MODELS = ['opus', 'sonnet', 'haiku'];
+const CODEX_MODELS = ['gpt-5.5'];
 const TOOL_RE = /^[A-Za-z][A-Za-z0-9_]*(\([^()\r\n"]{0,200}\))?$|^mcp__[A-Za-z0-9_-]+(__[A-Za-z0-9_*-]+)?$/;
 const MODEL_RE = /^[A-Za-z0-9._\-\[\]]{1,80}$/;
 const MAX_EVENTS = 5000;
@@ -178,7 +192,7 @@ function spawnBin(resolved, args, opts) {
   return spawn(resolved, args, opts);
 }
 
-async function claudeVersion(bin) {
+async function binVersion(bin) {
   const resolved = await resolveBin(bin);
   if (!resolved) return { resolved: null, version: null, error: `Executável "${bin}" não encontrado no PATH.` };
   if (versionCache.has(resolved)) return versionCache.get(resolved);
@@ -205,8 +219,208 @@ function killTree(child) {
   else { try { process.kill(-child.pid, 'SIGTERM'); } catch { child.kill('SIGTERM'); } }
 }
 
+/* ---------- Perfis (profiles) ---------- */
+// Before the database exists every run uses this one, the same as the "Claude (padrão)" the migration creates.
+const MEM_DEFAULT = { id: dbModule.DEFAULT_PROFILE_IDS.claude, name: 'Claude (padrão)', adapter: 'claude', bin: '', configDir: '', model: '', effort: '', concurrency: 2, fallbackId: '', threshold: 90, ignoreUserConfig: true, telemetry: { ...dbModule.TELEMETRY_OFF }, isDefault: true };
+const expandHome = p => p === '~' ? os.homedir() : /^~[\\/]/.test(p) ? path.join(os.homedir(), p.slice(2)) : p;
+const listProfiles = () => store ? store.listProfiles() : [MEM_DEFAULT];
+const getProfile = id => store ? (id ? store.getProfile(id) : null) : (id === MEM_DEFAULT.id ? MEM_DEFAULT : null);
+const defaultProfile = () => (store && store.defaultProfile()) || MEM_DEFAULT;
+const profileBin = (p, claudePath) => p.bin || (p.adapter === 'codex' ? DEFAULT_CODEX_BIN : claudePath || DEFAULT_BIN);
+const codexHome = p => p?.configDir || process.env.CODEX_HOME || path.join(HOME, '.codex');
+const windowsOf = id => store ? store.windowsOf(id) : {};
+/** A window at or above the Perfil's threshold whose reset is still ahead. */
+function overLimit(p) {
+  const now = Date.now();
+  return Object.values(windowsOf(p.id)).some(w => Number.isFinite(w.utilization) && w.utilization * 100 >= p.threshold && (!w.resetsAt || Date.parse(w.resetsAt) > now));
+}
+/** Perfil of a run: the one asked (unknown/empty: the default), or its reserve when it is over the threshold and the reserve is not. */
+function pickProfile(id) {
+  const asked = getProfile(id) || defaultProfile();
+  if (asked.fallbackId && overLimit(asked)) {
+    const reserve = getProfile(asked.fallbackId);
+    if (reserve && reserve.adapter === asked.adapter && reserve.id !== asked.id && !overLimit(reserve)) return { profile: reserve, fallbackFrom: asked.id };
+  }
+  return { profile: asked, fallbackFrom: null };
+}
+/* Admission: Chamados (runs with a parent) never take a slot; runs still between the check and their spawn hold one (admitting),
+   reserved synchronously, so parallel requests cannot all pass a cap of 1. */
+const admitting = { total: 0, byProfile: new Map() };
+const admitBump = (pid, n) => { admitting.total += n; admitting.byProfile.set(pid, (admitting.byProfile.get(pid) || 0) + n); };
+function activeOf(profileId) { return [...runs.values()].filter(r => r.status === 'running' && !r.parentRunId && r.profileId === profileId).length + (admitting.byProfile.get(profileId) || 0); }
+function callsOf(profileId) { return [...runs.values()].filter(r => r.status === 'running' && r.parentRunId && r.profileId === profileId).length; }
+
+async function profileStatus(p) {
+  const info = await binVersion(profileBin(p));
+  let configDirOk = true, error = info.error;
+  if (p.configDir) {
+    try { configDirOk = fs.statSync(p.configDir).isDirectory(); } catch { configDirOk = false; }
+    if (!configDirOk) error = [error, `Diretório de configuração inexistente: ${p.configDir}`].filter(Boolean).join(' ');
+  }
+  return { resolved: info.resolved, version: info.version, configDirOk, error: error || null };
+}
+async function profileView(p) {
+  const view = { ...p, status: await profileStatus(p), windows: windowsOf(p.id), active: activeOf(p.id), activeCalls: callsOf(p.id) };
+  // Codex: the models and levels of this Perfil's own account folder (adapters.codex reads the default CODEX_HOME).
+  if (p.adapter === 'codex') view.modelEfforts = codexModels(codexHome(p)) || {};
+  return view;
+}
+
+/** Models of the codex account (models_cache.json, written by codex itself), with the reasoning levels each one takes. */
+function codexModels(home) {
+  try {
+    const file = path.join(home, 'models_cache.json');
+    if (fs.lstatSync(file).size > 4 * 1024 * 1024) return null;
+    const list = JSON.parse(fs.readFileSync(file, 'utf8')).models;
+    const out = {};
+    for (const m of Array.isArray(list) ? list : []) {
+      if (typeof m?.slug !== 'string' || !MODEL_RE.test(m.slug) || m.visibility === 'hide') continue;
+      out[m.slug] = (m.supported_reasoning_levels || []).map(l => l?.effort).filter(e => CODEX_EFFORTS.includes(e));
+    }
+    return Object.keys(out).length ? out : null;
+  } catch { return null; }
+}
+function adaptersCatalog() {
+  const cached = codexModels(codexHome(null));
+  return {
+    claude: { models: CLAUDE_MODELS.map(id => ({ id, label: id[0].toUpperCase() + id.slice(1) })), efforts: EFFORTS },
+    codex: { models: (cached ? Object.keys(cached) : CODEX_MODELS).map(id => ({ id, label: id })), efforts: CODEX_EFFORTS, modelEfforts: cached || {} },
+  };
+}
+/** model_reasoning_effort for a codex run: `max`/`ultra` only when the model lists it, otherwise `xhigh`. */
+function codexEffort(effort, model, home) {
+  if (!effort) return '';
+  if (effort !== 'max' && effort !== 'ultra') return effort;
+  const levels = model ? codexModels(home)?.[model] : null;
+  return levels && levels.includes(effort) ? effort : 'xhigh';
+}
+
+const PROFILE_FIELDS = ['name', 'adapter', 'bin', 'configDir', 'model', 'effort', 'concurrency', 'fallbackId', 'threshold', 'ignoreUserConfig', 'telemetry'];
+/** Checks a Perfil sent by the page (a PUT may send only some fields: the rest comes from `current`). */
+async function validateProfile(body, current = null) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Perfil inválido.');
+  const src = { ...(current || { bin: '', configDir: '', model: '', effort: '', concurrency: 2, fallbackId: '', threshold: 90, ignoreUserConfig: true, telemetry: dbModule.TELEMETRY_OFF }) };
+  for (const k of PROFILE_FIELDS) if (body[k] !== undefined) src[k] = body[k];
+  const p = { id: current?.id };
+  p.name = typeof src.name === 'string' ? src.name.trim() : '';
+  if (!p.name || p.name.length > 40) throw new Error('Nome do Perfil: de 1 a 40 caracteres.');
+  if (!dbModule.ADAPTERS.includes(src.adapter)) throw new Error('Adapter inválido. Use claude ou codex.');
+  p.adapter = src.adapter;
+  p.configDir = typeof src.configDir === 'string' ? src.configDir.trim() : '';
+  if (p.configDir) {
+    p.configDir = expandHome(p.configDir);
+    if (!path.isAbsolute(p.configDir)) throw new Error('O diretório de configuração precisa ser um caminho absoluto (ou começar com ~).');
+    let dir = false; try { dir = fs.statSync(p.configDir).isDirectory(); } catch {}
+    if (!dir) throw new Error(`Diretório de configuração inexistente: ${p.configDir}`);
+    p.configDir = longPath(path.resolve(p.configDir));
+  }
+  p.bin = typeof src.bin === 'string' ? expandHome(src.bin.trim()) : '';
+  if (p.bin && !(await resolveBin(p.bin))) throw new Error(`Executável "${p.bin}" não encontrado.`);
+  p.model = typeof src.model === 'string' ? src.model.trim() : '';
+  if (p.model && !MODEL_RE.test(p.model)) throw new Error('Modelo inválido.');
+  p.effort = typeof src.effort === 'string' ? src.effort.trim() : '';
+  if (p.effort && !(p.adapter === 'codex' ? CODEX_EFFORTS : EFFORTS).includes(p.effort)) throw new Error('Nível de esforço inválido para esse Adapter.');
+  p.concurrency = Number(src.concurrency);
+  if (!Number.isInteger(p.concurrency) || p.concurrency < 1 || p.concurrency > 10) throw new Error('Teto de execuções do Perfil: de 1 a 10.');
+  p.threshold = Number(src.threshold);
+  if (!Number.isInteger(p.threshold) || p.threshold < 50 || p.threshold > 100) throw new Error('Limiar da Janela de uso: de 50 a 100.');
+  p.fallbackId = typeof src.fallbackId === 'string' ? src.fallbackId.trim() : '';
+  if (p.fallbackId) {
+    const reserve = store?.getProfile(p.fallbackId);
+    if (!reserve) throw new Error('Perfil reserva não encontrado.');
+    if (reserve.id === p.id) throw new Error('Um Perfil não pode ser a própria reserva.');
+    if (reserve.adapter !== p.adapter) throw new Error('O Perfil reserva precisa ser do mesmo Adapter.');
+  }
+  p.ignoreUserConfig = src.ignoreUserConfig !== false;
+  const t = src.telemetry && typeof src.telemetry === 'object' ? src.telemetry : {};
+  p.telemetry = { enabled: t.enabled === true, native: t.native === true, content: t.content === true };
+  return p;
+}
+
+/* ---------- telemetry (OTLP/HTTP JSON, one trace per run) ---------- */
+const INHERITED_TELEMETRY = /^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$|CLAUDE_CODE_OTEL_|BETA_TRACING_ENDPOINT$|ENABLE_BETA_TRACING_DETAILED$)/;
+const HEADER_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,100}$/;
+const ENV_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+/** Where the traces go. Header values are read from the bridge's environment when sent and never stored, logged or returned. */
+function telemetryConfig() {
+  const s = (store && store.getSetting('telemetry')) || {};
+  // An endpoint with user:password in it is ignored (it would reach the API, logs and the codex argv): secrets go in headers.
+  const endpoint = [s.endpoint, process.env.OTEL_EXPORTER_OTLP_ENDPOINT].find(e => e && !urlHasCredentials(e)) || '';
+  if (!credsWarned && urlHasCredentials(process.env.OTEL_EXPORTER_OTLP_ENDPOINT || '')) { credsWarned = true; console.warn('OTEL_EXPORTER_OTLP_ENDPOINT tem usuário ou senha na URL e foi ignorado. Use um header com o nome da variável de ambiente em Configurações > Telemetria.'); }
+  return { endpoint, source: s.endpoint ? 'settings' : endpoint ? 'env' : '', serviceName: s.serviceName || 'squad-code', headersEnv: s.headersEnv && typeof s.headersEnv === 'object' ? s.headersEnv : {} };
+}
+let credsWarned = false;
+function urlHasCredentials(text) { try { const u = new URL(text); return !!(u.username || u.password); } catch { return false; } }
+function telemetryHeaders(cfg) {
+  const out = {};
+  for (const [name, env] of Object.entries(cfg.headersEnv)) if (process.env[env]) out[name] = process.env[env];
+  return out;
+}
+function validateTelemetry(body) {
+  const endpoint = typeof body?.endpoint === 'string' ? body.endpoint.trim() : '';
+  if (endpoint) {
+    let u; try { u = new URL(endpoint); } catch { throw new Error('Endpoint OTLP inválido.'); }
+    if (!/^https?:$/.test(u.protocol) || /["\\\s]/.test(endpoint) || endpoint.length > 500) throw new Error('Endpoint OTLP inválido: use uma URL http(s).');
+    if (u.username || u.password) throw new Error('O endpoint OTLP não pode ter usuário ou senha na URL: use um header com o nome da variável de ambiente.');
+  }
+  const serviceName = typeof body?.serviceName === 'string' ? body.serviceName.trim().slice(0, 80) : '';
+  const headersEnv = {};
+  const h = body?.headersEnv && typeof body.headersEnv === 'object' && !Array.isArray(body.headersEnv) ? body.headersEnv : {};
+  if (Object.keys(h).length > 20) throw new Error('Até 20 headers.');
+  for (const [name, env] of Object.entries(h)) {
+    if (!HEADER_RE.test(name)) throw new Error(`Header inválido: ${name.slice(0, 60)}`);
+    if (typeof env !== 'string' || !ENV_RE.test(env)) throw new Error(`Informe o NOME da variável de ambiente do header ${name}, não o valor.`);
+    headersEnv[name] = env;
+  }
+  return { endpoint, serviceName, headersEnv };
+}
+const telemetryView = () => { const c = telemetryConfig(); return { ok: true, endpoint: c.endpoint, source: c.source, serviceName: c.serviceName, headers: Object.entries(c.headersEnv).map(([name, env]) => ({ name, env, present: !!process.env[env] })) }; };
+const otlpBase = endpoint => endpoint.replace(/\/+$/, '').replace(/\/v1\/(traces|logs|metrics)$/, '');
+const sha = (text, hex) => crypto.createHash('sha256').update(text).digest('hex').slice(0, hex);
+const traceIdOf = run => sha(run.rootRunId, 32);
+const spanIdOf = (runId, toolId) => sha(toolId ? `tool:${runId}:${toolId}` : `run:${runId}`, 16);
+const nanos = ms => String(BigInt(Math.round(ms)) * 1000000n);
+const attr = (key, v) => ({ key, value: typeof v === 'number' && Number.isInteger(v) ? { intValue: String(v) } : typeof v === 'boolean' ? { boolValue: v } : { stringValue: String(v ?? '') } });
+function squadAttrs(run) {
+  return { 'squad.project': run.project || '', 'squad.project_id': run.meta.projectId || '', 'squad.agent_id': run.meta.agentId || '', 'squad.feature_id': run.meta.featureId || '', 'squad.kind': run.meta.kind || '', 'squad.profile': run.profileName, 'squad.adapter': run.adapter };
+}
+/** Fire and forget at the end of a run whose Perfil has telemetry on; a failure never touches the run. */
+function sendTrace(run, exit) {
+  const cfg = telemetryConfig();
+  if (!run.profile.telemetry?.enabled || !cfg.endpoint) return;
+  const traceId = traceIdOf(run), end = Date.parse(run.endedAt), start = Date.parse(run.startedAt), u = exit.usage || {};
+  const root = {
+    traceId, spanId: spanIdOf(run.id), name: 'squad.run', kind: 1, startTimeUnixNano: nanos(start), endTimeUnixNano: nanos(end),
+    attributes: Object.entries({ ...squadAttrs(run), 'gen_ai.system': run.adapter === 'codex' ? 'openai' : 'anthropic', 'gen_ai.request.model': exit.model || run.model || '', 'gen_ai.usage.input_tokens': u.input ?? 0, 'gen_ai.usage.output_tokens': u.output ?? 0, 'gen_ai.usage.cache_read_input_tokens': u.cacheRead ?? 0, 'squad.status': run.status, ...(run.profile.telemetry.content ? { 'gen_ai.prompt': run.prompt.slice(0, 16000), 'gen_ai.completion': String(exit.result || '').slice(0, 16000) } : {}) }).map(([k, v]) => attr(k, v)),
+    status: exit.isError ? { code: 2, message: String(exit.error || '').slice(0, 500) } : { code: 1 },
+  };
+  // A Chamado (call) hangs from the parent's tool span, in the parent's trace.
+  if (run.parent) root.parentSpanId = spanIdOf(run.parent.id, run.toolUseId);
+  const spans = [root];
+  for (const [id, t] of run.toolSpans) spans.push({ traceId, spanId: spanIdOf(run.id, id), parentSpanId: root.spanId, name: `squad.tool ${t.name}`, kind: 1, startTimeUnixNano: nanos(t.start), endTimeUnixNano: nanos(t.end || end), attributes: [attr('squad.tool', t.name), attr('squad.tool.error', !!t.error)], status: t.error ? { code: 2 } : { code: 1 } });
+  const body = { resourceSpans: [{ resource: { attributes: [attr('service.name', cfg.serviceName)] }, scopeSpans: [{ scope: { name: 'squad-code-bridge' }, spans }] }] };
+  fetch(otlpBase(cfg.endpoint) + '/v1/traces', { method: 'POST', headers: { 'content-type': 'application/json', ...telemetryHeaders(cfg) }, body: JSON.stringify(body), signal: AbortSignal.timeout(4000) })
+    .catch(() => {}); // never logged with its headers
+}
+/** The CLIs' own telemetry (Perfil telemetry.native): Claude through env vars, Codex through -c otel.* (only without secret headers). */
+function nativeTelemetry(run, profile, env, args, warn) {
+  const cfg = telemetryConfig();
+  if (!profile.telemetry?.enabled || !profile.telemetry.native || !cfg.endpoint) return;
+  const base = otlpBase(cfg.endpoint), content = !!profile.telemetry.content;
+  if (profile.adapter === 'claude') {
+    Object.assign(env, { CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'otlp', OTEL_LOGS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_ENDPOINT: base, OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json', OTEL_SERVICE_NAME: cfg.serviceName,
+      OTEL_RESOURCE_ATTRIBUTES: Object.entries(squadAttrs(run)).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join(',') });
+    const h = telemetryHeaders(cfg);
+    if (Object.keys(h).length) env.OTEL_EXPORTER_OTLP_HEADERS = Object.entries(h).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join(',');
+    if (content) env.OTEL_LOG_USER_PROMPTS = '1';
+  } else {
+    if (Object.keys(cfg.headersEnv).length) return warn('Telemetria nativa do Codex desligada: os headers do OTLP levam segredos, que nunca vão para a linha de comando.');
+    args.push('-c', `otel.exporter={otlp-http={endpoint=${JSON.stringify(base + '/v1/logs')},protocol="json"}}`, '-c', `otel.trace_exporter={otlp-http={endpoint=${JSON.stringify(base + '/v1/traces')},protocol="json"}}`, '-c', `otel.log_user_prompt=${content}`);
+  }
+}
+
 /* ---------- runs ---------- */
-function activeCount() { return [...runs.values()].filter(r => r.status === 'running').length; }
+function activeCount() { return [...runs.values()].filter(r => r.status === 'running' && !r.parentRunId).length + admitting.total; }
 
 function pushEvent(run, event) {
   run.events.push(event);
@@ -214,6 +428,49 @@ function pushEvent(run, event) {
   const line = `data: ${JSON.stringify(event)}\n\n`;
   for (const res of run.clients) res.write(line);
   persistEvent(run, event);
+  observe(run, event);
+}
+
+/* What the bridge learns from the stream: tool spans (telemetry), the model, Claude's usage windows; a Chamado's text also goes to
+   the calling run, under the open tool call (as --forward-subagent-text does for Claude subagents). */
+function observe(run, event) {
+  const content = Array.isArray(event.message?.content) ? event.message.content : null;
+  if (run.toolSpans && content && !event.parent_tool_use_id) {
+    if (event.type === 'assistant') for (const b of content) if (b?.type === 'tool_use' && b.id) run.toolSpans.set(b.id, { name: String(b.name || ''), start: Date.now() });
+    if (event.type === 'user') for (const b of content) { const t = b?.type === 'tool_result' && run.toolSpans.get(b.tool_use_id); if (t) { t.end = Date.now(); t.error = !!b.is_error; } }
+  }
+  if (event.type === 'system' && event.subtype === 'init' && typeof event.model === 'string' && event.model) run.seenModel = event.model;
+  if (event.type === 'rate_limit_event' && store) {
+    const w = claudeWindows(event);
+    if (w) try { store.saveWindows(run.profileId, w); } catch {}
+  }
+  if (run.parent && event.type === 'assistant' && !event.parent_tool_use_id && run.parent.status === 'running') {
+    pushEvent(run.parent, { ...event, parent_tool_use_id: run.toolUseId || run.parent.translator?.openCall() || null });
+  }
+}
+/** rate_limit_event → {five_hour, seven_day}: utilization 0..1 and the reset instant (epoch seconds in the event). */
+function claudeWindows(evt) {
+  const info = evt.rate_limit_info || evt.rateLimitInfo;
+  if (!info || typeof info !== 'object') return null;
+  const out = {};
+  const put = (w, v) => {
+    if (!v || typeof v !== 'object') return;
+    let u = Number(v.utilization ?? v.used_percent);
+    if (!Number.isFinite(u)) return;
+    if (u > 1.5) u /= 100; // a percentage
+    const r = Number(v.resetsAt ?? v.resets_at);
+    out[w] = { utilization: u, resetsAt: Number.isFinite(r) && r > 0 ? new Date(r < 1e12 ? r * 1000 : r).toISOString() : null };
+  };
+  const uw = info.unifiedWindows || info.unified_windows;
+  if (uw && typeof uw === 'object') for (const w of dbModule.WINDOWS) put(w, uw[w]);
+  else if (dbModule.WINDOWS.includes(info.rateLimitType)) put(info.rateLimitType, info);
+  return Object.keys(out).length ? out : null;
+}
+function claudeUsage(r) {
+  const u = r?.usage;
+  if (!u || typeof u !== 'object') return null;
+  const n = v => Number.isFinite(v) ? v : 0;
+  return { input: n(u.input_tokens), cacheRead: n(u.cache_read_input_tokens), cacheWrite: n(u.cache_creation_input_tokens), output: n(u.output_tokens), reasoning: n(u.output_tokens_details?.thinking_tokens ?? u.reasoning_output_tokens) };
 }
 
 /* Run history (db.js): events go to the database in small batches. Partial text deltas are not kept (the console never shows
@@ -233,20 +490,22 @@ function flushRun(run) {
   try { store.appendRunEvents(run.id, batch); }
   catch (e) { run.persist = false; console.warn(`Histórico da execução ${run.id} não gravado: ${e.message}`); }
 }
+const cut4k = v => typeof v === 'string' && v.length > 4000 ? v.slice(0, 4000) + '…' : v;
 function storedEvent(event) {
   if (event.type !== 'user' || !Array.isArray(event.message?.content)) return event;
-  const cut = v => typeof v === 'string' && v.length > 4000 ? v.slice(0, 4000) + '…' : v;
-  const block = b => b?.type !== 'tool_result' ? b : { ...b, content: Array.isArray(b.content) ? b.content.map(x => x?.type === 'text' ? { ...x, text: cut(x.text) } : x) : cut(b.content) };
+  const block = b => b?.type !== 'tool_result' ? b : { ...b, content: Array.isArray(b.content) ? b.content.map(x => x?.type === 'text' ? { ...x, text: cut4k(x.text) } : x) : cut4k(b.content) };
   return { ...event, message: { ...event.message, content: event.message.content.map(block) } };
 }
 
 function validateRunOptions(o = {}) {
   const out = {};
   out.claudePath = typeof o.claudePath === 'string' && o.claudePath.trim() ? o.claudePath.trim() : DEFAULT_BIN;
+  out.claudePathSet = typeof o.claudePath === 'string' && !!o.claudePath.trim();
+  out.profile = typeof o.profile === 'string' ? o.profile.trim().slice(0, 100) : '';
   if (typeof o.project === 'string' && o.project.trim()) {
     const dir = projectDir(o.project);
     fs.mkdirSync(dir, { recursive: true });
-    out.cwd = longPath(dir); out.projectRun = true;
+    out.cwd = longPath(dir); out.projectRun = true; out.project = o.project.trim();
   } else if (typeof o.cwd === 'string' && o.cwd.trim()) {
     // Explicit folder (tests, direct API use). Never an implicit one: process.cwd() is usually this app's own folder.
     const cwd = path.resolve(o.cwd.trim());
@@ -255,7 +514,7 @@ function validateRunOptions(o = {}) {
   } else throw new Error('Execução sem pasta de projeto: informe a pasta da operação (opção "project", em projects/).');
   if (o.model) { if (!MODEL_RE.test(o.model)) throw new Error('Modelo inválido.'); out.model = o.model; }
   if (o.permissionMode) { if (!PERMISSION_MODES.includes(o.permissionMode)) throw new Error('Modo de permissão inválido.'); out.permissionMode = o.permissionMode; }
-  if (o.effort) { if (!EFFORTS.includes(o.effort)) throw new Error('Nível de esforço inválido.'); out.effort = o.effort; }
+  if (o.effort) { if (!ALL_EFFORTS.includes(o.effort)) throw new Error('Nível de esforço inválido.'); out.effort = o.effort; }
   if (o.maxBudgetUsd !== undefined && o.maxBudgetUsd !== '' && o.maxBudgetUsd !== null) {
     const n = Number(o.maxBudgetUsd); if (!Number.isFinite(n) || n <= 0 || n > 1000) throw new Error('Orçamento máximo inválido.'); out.maxBudgetUsd = String(n);
   }
@@ -270,20 +529,21 @@ function validateRunOptions(o = {}) {
   for (const d of out.addDirs) if (!fs.existsSync(d)) throw new Error(`Diretório adicional inexistente: ${d}`);
   // Streams text deltas as `stream_event` lines (chat bubbles grow while the model writes).
   out.partial = o.partial === true;
-  // Squad colleagues the agent may call with the Agent tool (--agents file) and their text in the stream (--forward-subagent-text).
-  out.agents = validateAgents(o.agents);
+  // Squad colleagues the agent may call: Claude gets them as an --agents file (Agent tool), Codex through the bridge's MCP.
+  const colleagues = validateAgents(o.agents);
+  out.agents = colleagues?.agents || null; out.agentMeta = colleagues?.meta || {};
   out.forwardSubagents = o.forwardSubagents === true;
   const timeout = Number(o.timeoutSec); out.timeoutSec = Number.isFinite(timeout) && timeout >= 10 && timeout <= 7200 ? timeout : 900;
   return out;
 }
 
-/** CLI-defined subagents: whitelisted fields only, bounded sizes. null = none. */
+/** CLI-defined subagents: whitelisted fields only, bounded sizes. null = none. `profile`/`agentId` stay out of the --agents file. */
 function validateAgents(value) {
   if (value === undefined || value === null) return null;
   if (typeof value !== 'object' || Array.isArray(value)) throw new Error('Agentes inválidos.');
   const entries = Object.entries(value);
   if (entries.length > 20) throw new Error('Até 20 agentes por execução.');
-  const out = {};
+  const out = Object.create(null), meta = Object.create(null);
   for (const [key, def] of entries) {
     if (!/^[a-z0-9][a-z0-9-]{0,47}$/.test(key)) throw new Error(`Identificador de agente inválido: ${key.slice(0, 60)}`);
     if (!def || typeof def !== 'object' || Array.isArray(def)) throw new Error(`Definição inválida do agente ${key}.`);
@@ -295,78 +555,341 @@ function validateAgents(value) {
       agent.tools = def.tools;
     }
     if (def.model) { if (!MODEL_RE.test(def.model)) throw new Error(`Modelo inválido do agente ${key}.`); agent.model = def.model; }
-    if (def.effort) { if (!EFFORTS.includes(def.effort)) throw new Error(`Esforço inválido do agente ${key}.`); agent.effort = def.effort; }
+    if (def.effort) { if (!ALL_EFFORTS.includes(def.effort)) throw new Error(`Esforço inválido do agente ${key}.`); agent.effort = def.effort; }
     out[key] = agent;
+    meta[key] = { profile: typeof def.profile === 'string' ? def.profile.trim().slice(0, 100) : '', agentId: typeof def.agentId === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(def.agentId) ? def.agentId : null };
   }
   if (JSON.stringify(out).length > 400000) throw new Error('Definição dos agentes muito grande.');
-  return entries.length ? out : null;
+  return entries.length ? { agents: out, meta } : null;
 }
 
-async function startRun(body) {
+const CODEX_WRITE_TOOLS = ['Edit', 'Write', 'Bash', 'MultiEdit', 'NotebookEdit'];
+const claudeLike = m => /^(opus|sonnet|haiku|fable|claude|inherit|default)/i.test(m || '');
+/** A folder inside a git repository (codex refuses others without --skip-git-repo-check). Project folders stop at PROJECTS_DIR. */
+function inGitRepo(dir, projectRun) {
+  for (let d = dir, i = 0; i < 64; i++) {
+    if (fs.existsSync(path.join(d, '.git'))) return true;
+    if (projectRun) return false;
+    const up = path.dirname(d); if (up === d) return false; d = up;
+  }
+  return false;
+}
+
+/** argv of `codex exec --json` (prompt on stdin). Secrets never go here: the MCP token is an env var of the child. */
+function codexArgs(run, opts, profile, model, effort, warn) {
+  const names = opts.tools === null ? null : [...opts.tools, ...opts.allowedTools.map(t => t.replace(/\(.*$/, ''))];
+  const write = opts.permissionMode !== 'plan' && (names === null || names.some(t => CODEX_WRITE_TOOLS.includes(t)));
+  const args = ['exec', '--json', '-C', opts.cwd, '--sandbox', write ? 'workspace-write' : 'read-only', '-c', 'approval_policy="never"'];
+  if (profile.ignoreUserConfig) {
+    // Without the person's config.toml, and without the skill/plugin/app catalogs and memories it would still load: an "ok" went
+    // from ~20k to ~13k input tokens on codex-cli 0.161 (the login in CODEX_HOME is kept).
+    args.push('--ignore-user-config', '-c', 'skills.include_instructions=false', '-c', 'skills.bundled.enabled=false', '-c', 'include_apps_instructions=false',
+      '-c', 'features.plugins=false', '-c', 'features.apps=false', '-c', 'features.memories=false');
+  }
+  if (!inGitRepo(opts.cwd, opts.projectRun)) args.push('--skip-git-repo-check');
+  if (model) args.push('-m', model);
+  if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
+  for (const d of opts.addDirs) args.push('--add-dir', d);
+  if (opts.agents) {
+    args.push('-c', `mcp_servers.squad.url="http://${HOST}:${PORT}/mcp"`, '-c', 'mcp_servers.squad.bearer_token_env_var="SQUAD_MCP_TOKEN"', '-c', `mcp_servers.squad.tool_timeout_sec=${opts.timeoutSec + 60}`,
+      // With approval_policy="never" codex refuses MCP calls that ask for approval: this one tool is pre-approved.
+      '-c', 'mcp_servers.squad.tools.chamar_colega.approval_mode="approve"');
+  }
+  if (opts.maxBudgetUsd) warn('O Codex não tem orçamento máximo por execução: o limite foi ignorado.');
+  return args;
+}
+
+/** Codex `exec --json` events → Claude stream-json (ADR 0001). feed() returns the events to emit; finish() the closing result. */
+function codexTranslator(run) {
+  const st = { threadId: null, last: '', turns: 0, failed: null, lastError: null, started: new Set(), calls: [], usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0 } };
+  const assistant = content => ({ type: 'assistant', message: { role: 'assistant', content } });
+  const isCall = it => it.type === 'mcp_tool_call' && it.server === 'squad' && it.tool === 'chamar_colega';
+  const toolUse = it => {
+    const base = { type: 'tool_use', id: String(it.id) };
+    if (it.type === 'command_execution') return { ...base, name: 'Bash', input: { command: String(it.command ?? '') } };
+    if (it.type === 'file_change') return { ...base, name: 'Edit', input: { changes: Array.isArray(it.changes) ? it.changes : [] } };
+    if (isCall(it)) { const a = it.arguments || {}, pedido = String(a.pedido ?? ''); return { ...base, name: 'Agent', input: { subagent_type: String(a.agente ?? ''), description: pedido.slice(0, 80), prompt: pedido } }; }
+    if (it.type === 'mcp_tool_call') return { ...base, name: `mcp__${it.server}__${it.tool}`, input: it.arguments ?? {} };
+    if (it.type === 'web_search') return { ...base, name: 'WebSearch', input: { query: String(it.query ?? '') } };
+    return null;
+  };
+  const toolResult = it => {
+    let text = '', isError = it.status === 'failed';
+    if (it.type === 'command_execution') { text = String(it.aggregated_output ?? ''); if (Number.isInteger(it.exit_code) && it.exit_code !== 0) isError = true; }
+    else if (it.type === 'file_change') text = (Array.isArray(it.changes) ? it.changes : []).map(c => `${c?.kind ?? 'update'} ${c?.path ?? ''}`).join('\n');
+    else if (it.type === 'mcp_tool_call') {
+      if (it.error) { isError = true; text = String(it.error.message ?? it.error); }
+      else text = (Array.isArray(it.result?.content) ? it.result.content : []).map(b => b?.type === 'text' ? b.text : '').filter(Boolean).join('\n');
+      if (it.result?.isError || it.result?.is_error) isError = true;
+    } else if (it.type === 'web_search') text = it.query ? `Busca: ${it.query}` : '';
+    return { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: String(it.id), content: cut4k(text), is_error: isError }] } };
+  };
+  function feed(evt) {
+    const it = evt.item && typeof evt.item === 'object' ? evt.item : null;
+    switch (evt.type) {
+      case 'thread.started': st.threadId = evt.thread_id || null; return [{ type: 'system', subtype: 'init', session_id: st.threadId, model: run.model || null, adapter: 'codex', cwd: run.cwd }];
+      case 'turn.completed': {
+        st.turns++;
+        const u = evt.usage || {}, n = v => Number.isFinite(v) ? v : 0;
+        st.usage.input += n(u.input_tokens); st.usage.cacheRead += n(u.cached_input_tokens); st.usage.cacheWrite += n(u.cache_write_input_tokens); st.usage.output += n(u.output_tokens); st.usage.reasoning += n(u.reasoning_output_tokens);
+        return [];
+      }
+      case 'turn.failed': st.failed = String(evt.error?.message || 'Falha no turno do Codex.'); return [];
+      case 'error': st.lastError = String(evt.message || 'Erro do Codex.'); st.failed = st.failed || st.lastError; return [{ type: 'bridge', subtype: 'warning', message: st.lastError.slice(0, 2000) }];
+      case 'item.started': {
+        if (!it) return [];
+        const use = toolUse(it);
+        if (!use) return [];
+        st.started.add(use.id); if (isCall(it)) st.calls.push(use.id);
+        return [assistant([use])];
+      }
+      case 'item.completed': {
+        if (!it) return [];
+        if (it.type === 'agent_message') { st.last = String(it.text ?? ''); return st.last ? [assistant([{ type: 'text', text: st.last }])] : []; }
+        if (it.type === 'error') return [{ type: 'bridge', subtype: 'warning', message: String(it.message ?? '').slice(0, 2000) }];
+        const use = toolUse(it);
+        if (!use) return []; // reasoning, todo_list
+        const out = st.started.has(use.id) ? [] : [assistant([use])];
+        st.started.delete(use.id); st.calls = st.calls.filter(id => id !== use.id);
+        out.push(toolResult(it));
+        return out;
+      }
+      default: return []; // turn.started, item.updated
+    }
+  }
+  function finish(code, durationMs) {
+    const isError = !!st.failed || code !== 0 || (!st.turns && !!st.lastError);
+    return { type: 'result', subtype: isError ? 'error_during_execution' : 'success', is_error: isError, result: isError && !st.last ? (st.failed || st.lastError || '') : st.last, session_id: st.threadId, num_turns: st.turns, duration_ms: durationMs, total_cost_usd: null,
+      usage: { input_tokens: st.usage.input, cache_read_input_tokens: st.usage.cacheRead, cache_creation_input_tokens: st.usage.cacheWrite, output_tokens: st.usage.output, reasoning_output_tokens: st.usage.reasoning } };
+  }
+  return { feed, finish, openCall: () => st.calls.at(-1) || null, state: st };
+}
+
+/* Codex keeps each session in <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl, with the account's rate limits in its
+   token_count events. Read only, no symlinks, only the file's tail. */
+const SESSION_TAIL = 4 * 1024 * 1024;
+const pad2 = n => String(n).padStart(2, '0');
+/* Every component under CODEX_HOME (sessions/YYYY/MM/DD) must be a real directory, never a symlink. Node has no openat, so a
+   component could still be swapped between the check and the open: the file is opened with O_NOFOLLOW and, once open, the whole
+   chain is checked again (no symlink, each directory with the same device/inode as in the first pass) and the fd must be the file
+   the path names now. Any difference discards the read. The bridge only takes numbers from the file, never returns its text. */
+function realDir(dir) { try { return fs.lstatSync(dir).isDirectory(); } catch { return false; } }
+/** Device/inode of each directory of the chain, or null when one is missing or is not a real directory. */
+function realChain(home, parts) {
+  const ids = [];
+  let d = home;
+  for (const part of parts) {
+    d = path.join(d, part);
+    let st; try { st = fs.lstatSync(d); } catch { return null; }
+    if (!st.isDirectory()) return null;
+    ids.push(`${st.dev}:${st.ino}`);
+  }
+  return ids;
+}
+const sameIds = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
+/** ref = {home, chain, name, ids}: a file found by codexSessionFile/latestCodexSession. */
+function readTail(ref) {
+  const file = path.join(ref.home, ...ref.chain, ref.name);
+  const st = fs.lstatSync(file);
+  if (!st.isFile()) return '';
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const fst = fs.fstatSync(fd);
+    if (!fst.isFile() || fst.ino !== st.ino || fst.dev !== st.dev) return '';
+    // After the open: the same real directories, and the path still names this very file.
+    if (!sameIds(realChain(ref.home, ref.chain), ref.ids)) return '';
+    const again = fs.lstatSync(file);
+    if (!again.isFile() || again.ino !== fst.ino || again.dev !== fst.dev) return '';
+    const size = fst.size, len = Math.min(size, SESSION_TAIL), buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    return buf.toString('utf8');
+  } finally { fs.closeSync(fd); }
+}
+function codexSessionFile(home, threadId, dates) {
+  if (!/^[A-Za-z0-9-]{8,80}$/.test(threadId || '')) return null;
+  for (const d of dates) {
+    const local = [String(d.getFullYear()), pad2(d.getMonth() + 1), pad2(d.getDate())];
+    const utc = [String(d.getUTCFullYear()), pad2(d.getUTCMonth() + 1), pad2(d.getUTCDate())];
+    for (const parts of [local, utc]) {
+      const chain = ['sessions', ...parts], ids = realChain(home, chain);
+      if (!ids) continue;
+      const hit = fs.readdirSync(path.join(home, ...chain), { withFileTypes: true }).find(e => e.isFile() && e.name.endsWith(`${threadId}.jsonl`));
+      if (hit) return { home, chain, name: hit.name, ids };
+    }
+  }
+  return null;
+}
+function latestCodexSession(home) {
+  // readdir entries are not followed: a symlinked YYYY/MM/DD is neither a directory nor a file here.
+  const desc = parts => realChain(home, parts) ? fs.readdirSync(path.join(home, ...parts), { withFileTypes: true }).filter(e => e.isDirectory() && /^\d{2,4}$/.test(e.name)).map(e => e.name).sort().reverse() : [];
+  for (const y of desc(['sessions'])) for (const m of desc(['sessions', y])) for (const d of desc(['sessions', y, m])) {
+    const chain = ['sessions', y, m, d], ids = realChain(home, chain);
+    if (!ids) continue;
+    const dir = path.join(home, ...chain);
+    const files = fs.readdirSync(dir, { withFileTypes: true }).filter(e => e.isFile() && e.name.endsWith('.jsonl')).map(e => ({ name: e.name, mtime: fs.lstatSync(path.join(dir, e.name)).mtimeMs }));
+    if (files.length) return { home, chain, name: files.sort((a, b) => b.mtime - a.mtime)[0].name, ids };
+  }
+  return null;
+}
+/** Last rate limits (primary 300 min → five_hour, secondary 10080 min → seven_day) and the model of a codex session file. */
+function codexSessionInfo(ref) {
+  const out = { windows: null, model: null };
+  if (!ref) return out;
+  let text; try { text = readTail(ref); } catch { return out; }
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0 && (!out.windows || !out.model); i--) {
+    if (!lines[i].includes('rate_limits') && !lines[i].includes('turn_context')) continue;
+    let o; try { o = JSON.parse(lines[i]); } catch { continue; }
+    const p = o.payload || {};
+    if (!out.model && o.type === 'turn_context' && typeof p.model === 'string' && MODEL_RE.test(p.model)) out.model = p.model;
+    const rl = p.rate_limits;
+    if (!out.windows && rl && typeof rl === 'object') {
+      const w = {};
+      for (const slot of [rl.primary, rl.secondary]) {
+        if (!slot || !Number.isFinite(slot.used_percent)) continue;
+        const name = slot.window_minutes === 300 ? 'five_hour' : slot.window_minutes === 10080 ? 'seven_day' : null;
+        if (name) w[name] = { utilization: slot.used_percent / 100, resetsAt: Number.isFinite(slot.resets_at) ? new Date(slot.resets_at * 1000).toISOString() : null };
+      }
+      if (Object.keys(w).length) out.windows = w;
+    }
+  }
+  return out;
+}
+
+const mcpTokens = new Map(); // sha256(token) → run (Codex runs with squad colleagues)
+const bearerHash = t => crypto.createHash('sha256').update(String(t)).digest('hex');
+
+/**
+ * Starts a run. `internal.parent`: a Chamado (call) made through the bridge's MCP by that run; it skips the concurrency caps
+ * (the caller already holds a slot and waits for it) and joins the caller's trace.
+ */
+async function startRun(body, internal = {}) {
   const prompt = typeof body.prompt === 'string' ? body.prompt : '';
   if (!prompt.trim()) throw new Error('Prompt vazio.');
   if (prompt.length > 400000) throw new Error('Prompt muito grande.');
   const systemPrompt = typeof body.systemPrompt === 'string' ? body.systemPrompt.slice(0, 100000) : '';
   const opts = validateRunOptions(body.options);
-  if (activeCount() >= maxConcurrent) throw Object.assign(new Error(`Limite de ${maxConcurrent} execuções simultâneas atingido.`), { status: 429 });
-  const resolved = await resolveBin(opts.claudePath);
-  if (!resolved) throw new Error(`Claude Code não encontrado ("${opts.claudePath}"). Ajuste o caminho nas configurações.`);
+  const parent = internal.parent || null;
+  // internal.exact: that Perfil and no other (the usage probe of Configurações > Perfis).
+  const { profile, fallbackFrom } = internal.exact ? { profile: getProfile(opts.profile) || defaultProfile(), fallbackFrom: null } : pickProfile(opts.profile);
+  const adapter = profile.adapter;
+  let release = () => {};
+  if (!parent) {
+    if (activeCount() >= maxConcurrent) throw Object.assign(new Error(`Limite de ${maxConcurrent} execuções simultâneas atingido.`), { status: 429 });
+    if (activeOf(profile.id) >= profile.concurrency) throw Object.assign(new Error(`O Perfil "${profile.name}" já está com ${profile.concurrency} execução(ões) em andamento (teto do Perfil).`), { status: 429 });
+    // The slot is taken before the first await and given back once the run is in `runs` (or failed to start).
+    admitBump(profile.id, 1);
+    let held = true; release = () => { if (held) { held = false; admitBump(profile.id, -1); } };
+  }
+  try { return await launchRun(body, internal, opts, profile, fallbackFrom, prompt, systemPrompt); }
+  finally { release(); }
+}
+
+async function launchRun(body, internal, opts, profile, fallbackFrom, prompt, systemPrompt) {
+  const parent = internal.parent || null;
+  const adapter = profile.adapter;
+  // claudePath (runtime) only counts when the Perfil has no executable of its own.
+  const bin = profileBin(profile, opts.claudePath);
+  const resolved = await resolveBin(bin);
+  if (!resolved) throw new Error(adapter === 'codex' ? `Codex não encontrado ("${bin}"). Ajuste o executável do Perfil "${profile.name}".` : `Claude Code não encontrado ("${bin}"). Ajuste o caminho nas configurações.`);
+  if (adapter === 'claude' && opts.effort && !EFFORTS.includes(opts.effort)) throw new Error('Nível de esforço inválido para o Claude.');
   if (opts.projectRun) await ensureProjectRepo(opts.cwd);
 
   const id = crypto.randomUUID();
-  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-prompts', 'none'];
-  let sysFile = null, settingsFile = null, agentsFile = null;
-  // OS temp cleanup can remove the (usually empty) folder while the bridge keeps running.
-  if (systemPrompt.trim() || opts.projectRun || opts.agents) await fsp.mkdir(TMP_DIR, { recursive: true });
-  if (systemPrompt.trim()) {
-    sysFile = path.join(TMP_DIR, `${id}.system.md`);
-    await fsp.writeFile(sysFile, systemPrompt, 'utf8');
-    args.push('--append-system-prompt-file', sysFile);
-  }
-  if (opts.projectRun) {
-    settingsFile = path.join(TMP_DIR, `${id}.settings.json`);
-    // The file tools also refuse reads outside the project folder (and --add-dir), so agents never take this app or the
-    // person's other folders for the project.
-    await fsp.writeFile(settingsFile, JSON.stringify({ claudeMdExcludes: APP_MEMORY_EXCLUDES, permissions: { blockReadsOutsideWorkingDirectories: true } }), 'utf8');
-    args.push('--settings', settingsFile);
-  }
-  if (opts.agents) {
-    agentsFile = path.join(TMP_DIR, `${id}.agents.json`);
-    await fsp.writeFile(agentsFile, JSON.stringify(opts.agents), 'utf8');
-    args.push('--agents', agentsFile);
-  }
-  if (opts.forwardSubagents) args.push('--forward-subagent-text');
-  if (opts.model) args.push('--model', opts.model);
-  if (opts.permissionMode) args.push('--permission-mode', opts.permissionMode);
-  if (opts.effort) args.push('--effort', opts.effort);
-  if (opts.maxBudgetUsd) args.push('--max-budget-usd', opts.maxBudgetUsd);
-  if (opts.tools) args.push('--tools', opts.tools.length ? opts.tools.join(',') : '');
-  if (opts.allowedTools.length) args.push('--allowedTools', opts.allowedTools.join(','));
-  if (opts.disallowedTools.length) args.push('--disallowedTools', opts.disallowedTools.join(','));
-  for (const d of opts.addDirs) args.push('--add-dir', d);
-  if (opts.partial) args.push('--include-partial-messages');
-
-  const child = spawnBin(resolved, args, {
-    cwd: opts.cwd, windowsHide: true, detached: !IS_WIN,
-    // With squad colleagues, calls run in the foreground: the Agent tool result is the colleague's answer, not a launch notice.
-    // Project runs: git stops at PROJECTS_DIR (see ensureProjectRepo), even when the folder's own .git is missing.
-    env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: process.env.CLAUDE_CODE_ENTRYPOINT || 'squad-code-bridge', ...(opts.agents ? { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1' } : {}), ...(opts.projectRun ? { GIT_CEILING_DIRECTORIES: gitCeiling() } : {}) },
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+  const warnings = [];
+  const warn = message => warnings.push(message);
+  let model = opts.model || profile.model || '';
+  let effort = opts.effort || profile.effort || '';
+  const env = { ...process.env, ...(opts.projectRun ? { GIT_CEILING_DIRECTORIES: gitCeiling() } : {}) };
+  // Only what the Perfil decides reaches the child: inherited telemetry switches (OTEL_*, CLAUDE_CODE_ENABLE_TELEMETRY,
+  // OTEL_LOG_USER_PROMPTS…) are dropped here and nativeTelemetry sets them again when the Perfil turns them on.
+  for (const k of Object.keys(env)) if (INHERITED_TELEMETRY.test(k)) delete env[k];
+  let args, sysFile = null, settingsFile = null, agentsFile = null, stdin = prompt, mcpToken = null;
   const run = {
     id, status: 'running', startedAt: new Date().toISOString(), endedAt: null, label: String(body.label || '').slice(0, 200),
-    cwd: opts.cwd, args: args.map(a => a === sysFile ? '<system-prompt-file>' : a === settingsFile ? '<settings-file>' : a === agentsFile ? '<agents-file>' : a), child, events: [], clients: new Set(),
-    result: null, sysFile, settingsFile, agentsFile, timer: null, cancelled: false,
+    cwd: opts.cwd, args: [], child: null, events: [], clients: new Set(), result: null, timer: null, cancelled: false,
     // History: who ran it and where (body.meta, whitelisted in db.js), saved events count and the batch waiting to be written.
     // Without a database yet (direct API use before the setup), the run still works but stays out of the history.
     meta: dbModule.runMeta(body.meta), project: typeof body.options?.project === 'string' ? body.options.project.slice(0, 80) : '', persist: !!store, saved: 0, pending: [], flushTimer: null,
+    profile, profileId: profile.id, profileName: profile.name, adapter, model: '', opts, prompt, parent, toolUseId: internal.toolUseId || null, rootRunId: parent ? parent.rootRunId : id,
+    parentRunId: parent ? parent.id : null, children: new Set(), toolSpans: profile.telemetry?.enabled ? new Map() : null, translator: null,
   };
+  run.done = new Promise(resolve => { run.resolveDone = resolve; });
+
+  if (adapter === 'codex') {
+    if (claudeLike(model)) { if (opts.model) warn(`O modelo "${opts.model}" é do Claude: o Perfil Codex usa ${profile.model || 'o modelo padrão da conta'}.`); model = profile.model && !claudeLike(profile.model) ? profile.model : ''; }
+    effort = codexEffort(effort, model, codexHome(profile));
+    run.model = model;
+    args = codexArgs(run, opts, profile, model, effort, warn);
+    if (profile.configDir) env.CODEX_HOME = profile.configDir;
+    if (opts.agents) { mcpToken = crypto.randomBytes(32).toString('hex'); env.SQUAD_MCP_TOKEN = mcpToken; }
+    // The agent's instructions go in front of the task on stdin (codex has no system prompt file).
+    if (systemPrompt.trim()) stdin = `<instrucoes-do-agente>\n${systemPrompt}\n</instrucoes-do-agente>\n\n<tarefa>\n${prompt}\n</tarefa>`;
+    run.translator = codexTranslator(run);
+  } else {
+    run.model = model;
+    args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-prompts', 'none'];
+    // OS temp cleanup can remove the (usually empty) folder while the bridge keeps running.
+    if (systemPrompt.trim() || opts.projectRun || opts.agents) await fsp.mkdir(TMP_DIR, { recursive: true });
+    if (systemPrompt.trim()) {
+      sysFile = path.join(TMP_DIR, `${id}.system.md`);
+      await fsp.writeFile(sysFile, systemPrompt, 'utf8');
+      args.push('--append-system-prompt-file', sysFile);
+    }
+    if (opts.projectRun) {
+      settingsFile = path.join(TMP_DIR, `${id}.settings.json`);
+      // The file tools also refuse reads outside the project folder (and --add-dir), so agents never take this app or the
+      // person's other folders for the project.
+      await fsp.writeFile(settingsFile, JSON.stringify({ claudeMdExcludes: APP_MEMORY_EXCLUDES, permissions: { blockReadsOutsideWorkingDirectories: true } }), 'utf8');
+      args.push('--settings', settingsFile);
+    }
+    if (opts.agents) {
+      agentsFile = path.join(TMP_DIR, `${id}.agents.json`);
+      await fsp.writeFile(agentsFile, JSON.stringify(opts.agents), 'utf8');
+      args.push('--agents', agentsFile);
+    }
+    if (opts.forwardSubagents) args.push('--forward-subagent-text');
+    if (model) args.push('--model', model);
+    if (opts.permissionMode) args.push('--permission-mode', opts.permissionMode);
+    if (effort) args.push('--effort', effort);
+    if (opts.maxBudgetUsd) args.push('--max-budget-usd', opts.maxBudgetUsd);
+    if (opts.tools) args.push('--tools', opts.tools.length ? opts.tools.join(',') : '');
+    if (opts.allowedTools.length) args.push('--allowedTools', opts.allowedTools.join(','));
+    if (opts.disallowedTools.length) args.push('--disallowedTools', opts.disallowedTools.join(','));
+    for (const d of opts.addDirs) args.push('--add-dir', d);
+    if (opts.partial) args.push('--include-partial-messages');
+    env.CLAUDE_CODE_ENTRYPOINT = process.env.CLAUDE_CODE_ENTRYPOINT || 'squad-code-bridge';
+    // With squad colleagues, calls run in the foreground: the Agent tool result is the colleague's answer, not a launch notice.
+    if (opts.agents) env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
+    if (profile.configDir) env.CLAUDE_CONFIG_DIR = profile.configDir;
+  }
+  nativeTelemetry(run, profile, env, args, warn);
+  if (adapter === 'codex') args.push('-'); // the prompt comes on stdin
+
+  // A Chamado never outlives its caller: checked again here, with no await before the spawn and parent.children.add below.
+  if (parent && !parentAlive(parent)) {
+    for (const file of [sysFile, settingsFile, agentsFile]) if (file) fsp.rm(file, { force: true }).catch(() => {});
+    throw Object.assign(new Error('A execução que fez o Chamado já terminou ou foi cancelada.'), { status: 409 });
+  }
+  const child = spawnBin(resolved, args, { cwd: opts.cwd, windowsHide: true, detached: !IS_WIN, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  Object.assign(run, { child, sysFile, settingsFile, agentsFile, args: args.map(a => a === sysFile ? '<system-prompt-file>' : a === settingsFile ? '<settings-file>' : a === agentsFile ? '<agents-file>' : a) });
+  if (mcpToken) { run.mcpKey = bearerHash(mcpToken); mcpTokens.set(run.mcpKey, run); }
+  if (parent) parent.children.add(run);
   runs.set(id, run);
   if (run.persist) try { store.insertRun(run); } catch (e) { run.persist = false; console.warn(`Histórico da execução ${id} não gravado: ${e.message}`); }
-  pushEvent(run, { type: 'bridge', subtype: 'spawned', pid: child.pid, cwd: opts.cwd, args: run.args, at: run.startedAt });
+  pushEvent(run, { type: 'bridge', subtype: 'spawned', pid: child.pid, cwd: opts.cwd, args: run.args, at: run.startedAt, adapter });
+  pushEvent(run, { type: 'bridge', subtype: 'profile', profileId: profile.id, name: profile.name, adapter, ...(fallbackFrom ? { fallbackFrom } : {}) });
+  for (const message of warnings) pushEvent(run, { type: 'bridge', subtype: 'warning', message });
 
   run.timer = setTimeout(() => { run.timedOut = true; pushEvent(run, { type: 'bridge', subtype: 'timeout', timeoutSec: opts.timeoutSec }); killTree(child); }, opts.timeoutSec * 1000);
 
+  const onLine = line => {
+    let evt; try { evt = JSON.parse(line); } catch { evt = null; }
+    if (!evt || typeof evt !== 'object') return pushEvent(run, { type: 'raw', text: line.slice(0, 4000) });
+    if (run.translator) { for (const e of run.translator.feed(evt)) pushEvent(run, e); return; }
+    if (evt.type === 'result') run.result = evt;
+    pushEvent(run, evt);
+  };
   let buffer = '';
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', chunk => {
@@ -374,10 +897,7 @@ async function startRun(body) {
     let nl;
     while ((nl = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, nl).trim(); buffer = buffer.slice(nl + 1);
-      if (!line) continue;
-      let evt; try { evt = JSON.parse(line); } catch { evt = { type: 'raw', text: line.slice(0, 4000) }; }
-      if (evt.type === 'result') run.result = evt;
-      pushEvent(run, evt);
+      if (line) onLine(line);
     }
   });
   let stderrTail = '';
@@ -385,42 +905,147 @@ async function startRun(body) {
   child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk).slice(-4000); pushEvent(run, { type: 'stderr', text: chunk.slice(0, 4000) }); });
   child.on('error', err => { stderrTail += err.message; });
   child.on('close', code => {
+    run.closing = true;
     clearTimeout(run.timer);
-    if (buffer.trim()) { try { const evt = JSON.parse(buffer); if (evt.type === 'result') run.result = evt; pushEvent(run, evt); } catch { pushEvent(run, { type: 'raw', text: buffer.slice(0, 4000) }); } }
+    if (buffer.trim()) onLine(buffer.trim());
+    if (run.mcpKey) mcpTokens.delete(run.mcpKey); // revoked: the run's colleagues can no longer be called
+    for (const c of run.children) if (c.status === 'running') { c.cancelled = true; killTree(c.child); }
+    run.endedAt = new Date().toISOString();
+    let usage = null, model = run.seenModel || run.model || null;
+    if (run.translator) {
+      run.result = run.translator.finish(code, Date.parse(run.endedAt) - Date.parse(run.startedAt));
+      pushEvent(run, run.result);
+      const st = run.translator.state;
+      usage = { ...st.usage };
+      try {
+        const info = codexSessionInfo(codexSessionFile(codexHome(profile), st.threadId, [new Date(run.startedAt), new Date()]));
+        if (info.model) model = info.model;
+        if (info.windows && store) store.saveWindows(profile.id, info.windows);
+      } catch {}
+    } else {
+      usage = claudeUsage(run.result);
+      if (!run.seenModel && run.result?.modelUsage && typeof run.result.modelUsage === 'object') model = Object.keys(run.result.modelUsage)[0] || model;
+    }
     const r = run.result || {};
     const isError = run.cancelled || run.timedOut || code !== 0 || !!r.is_error;
     run.status = run.cancelled ? 'cancelled' : run.timedOut ? 'timeout' : isError ? 'error' : 'done';
-    run.endedAt = new Date().toISOString();
     const exit = {
       type: 'exit', status: run.status, code, isError,
       result: typeof r.result === 'string' ? r.result : '',
       costUsd: r.total_cost_usd ?? r.cost_usd ?? null, durationMs: r.duration_ms ?? null,
       numTurns: r.num_turns ?? null, sessionId: r.session_id ?? null,
-      error: isError ? (run.cancelled ? 'Execução cancelada pelo operador.' : run.timedOut ? 'Tempo limite excedido.' : (r.is_error && r.result) || stderrTail.trim().slice(-1500) || `claude saiu com código ${code}`) : null,
+      error: isError ? (run.cancelled ? 'Execução cancelada pelo operador.' : run.timedOut ? 'Tempo limite excedido.' : (r.is_error && r.result) || stderrTail.trim().slice(-1500) || `${adapter} saiu com código ${code}`) : null,
+      usage, profileId: profile.id, adapter, model,
     };
     pushEvent(run, exit);
     if (run.persist) try { store.finishRun(run, exit); } catch (e) { console.warn(`Histórico da execução ${id} não finalizado: ${e.message}`); }
+    try { sendTrace(run, exit); } catch {}
     for (const res of run.clients) res.end();
     run.clients.clear();
     for (const file of [run.sysFile, run.settingsFile, run.agentsFile]) if (file) fsp.rm(file, { force: true }).catch(() => {});
     run.child = null;
-    // Keep finished runs for 30 minutes so late subscribers can replay.
+    if (parent) parent.children.delete(run);
+    run.usage = usage; run.model = model || run.model; // the effective ones, for /api/runs/:id while the run is in memory
+    run.resolveDone(exit);
+    // Keep finished runs for 30 minutes so late subscribers can replay (without the links that would keep their families alive).
+    run.parent = null; run.toolSpans = null;
     setTimeout(() => runs.delete(id), 30 * 60 * 1000).unref();
   });
 
   child.stdin.on('error', () => {});
-  child.stdin.end(prompt, 'utf8');
+  child.stdin.end(stdin, 'utf8');
   return run;
 }
 
+/* ---------- MCP of the bridge (POST /mcp): the squad colleagues of a Codex run, as the tool chamar_colega (ADR 0003) ---------- */
+const parentAlive = run => run.status === 'running' && !run.cancelled && !run.closing && !run.timedOut;
+const rpcError = (id, code, message) => ({ jsonrpc: '2.0', id: id ?? null, error: { code, message } });
+function colleagueTool(run) {
+  const agents = run.opts.agents || {};
+  const list = Object.entries(agents).map(([slug, a]) => `- ${slug}: ${a.description}`).join('\n');
+  return {
+    name: 'chamar_colega',
+    description: `Chama um colega do squad e espera o relatório dele. Colegas disponíveis:\n${list}`,
+    annotations: { title: 'Chamar colega do squad', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    inputSchema: { type: 'object', properties: { agente: { type: 'string', enum: Object.keys(agents), description: 'Identificador do colega.' }, pedido: { type: 'string', description: 'O que você precisa dele, com o contexto necessário.' } }, required: ['agente', 'pedido'], additionalProperties: false },
+  };
+}
+async function callColleague(run, a) {
+  const agents = run.opts.agents || {}, slug = String(a?.agente ?? ''), def = Object.hasOwn(agents, slug) ? agents[slug] : null;
+  const text = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError });
+  if (!def) return text(`Colega desconhecido: ${slug.slice(0, 60)}. Disponíveis: ${Object.keys(agents).join(', ')}.`, true);
+  const pedido = typeof a?.pedido === 'string' ? a.pedido.trim() : '';
+  if (!pedido) return text('Informe o pedido para o colega.', true);
+  if (!parentAlive(run)) return text('A execução que fez o Chamado já terminou.', true);
+  const meta = Object.hasOwn(run.opts.agentMeta, slug) ? run.opts.agentMeta[slug] : {};
+  const o = run.opts;
+  const options = { profile: meta.profile || '', model: def.model, effort: def.effort, permissionMode: o.permissionMode, timeoutSec: o.timeoutSec, addDirs: o.addDirs, ...(def.tools ? { tools: def.tools } : {}), ...(o.claudePathSet ? { claudePath: o.claudePath } : {}), ...(o.projectRun ? { project: o.project } : { cwd: o.cwd }) };
+  let child;
+  try {
+    child = await startRun({ prompt: pedido.slice(0, 400000), systemPrompt: def.prompt, label: `Chamado: ${slug}`, options, meta: { ...run.meta, agentId: meta.agentId || null, kind: 'call' } }, { parent: run, toolUseId: run.translator?.openCall() || null });
+  } catch (e) { return text(`Não foi possível chamar ${slug}: ${e.message}`, true); }
+  const exit = await child.done;
+  return exit.isError ? text(`${slug} não concluiu: ${exit.error || 'erro'}${exit.result ? `\n${exit.result}` : ''}`, true) : text(exit.result || '(sem resposta)');
+}
+async function handleMcp(req, res) {
+  if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST', 'content-type': 'application/json' }); return res.end(JSON.stringify(rpcError(null, -32000, 'Use POST.'))); }
+  const m = String(req.headers.authorization || '').match(/^Bearer\s+([A-Za-z0-9]+)$/i);
+  const run = m ? mcpTokens.get(bearerHash(m[1])) : null;
+  if (!run || run.status !== 'running') return json(res, 401, rpcError(null, -32001, 'Token do MCP inválido ou execução encerrada.'));
+  let msg;
+  try { msg = await readBody(req); } catch (e) { return json(res, e.status === 413 ? 413 : 400, rpcError(null, -32700, e.message)); }
+  // The run may have ended while the body was arriving: the token dies with it.
+  if (!parentAlive(run) || mcpTokens.get(bearerHash(m[1])) !== run) return json(res, 401, rpcError(null, -32001, 'Token do MCP inválido ou execução encerrada.'));
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg) || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') return json(res, 400, rpcError(msg?.id, -32600, 'Requisição JSON-RPC inválida.'));
+  const { id, method, params } = msg;
+  if (id === undefined || id === null) { res.writeHead(202); return res.end(); } // notifications (notifications/initialized, …)
+  const reply = result => json(res, 200, { jsonrpc: '2.0', id, result });
+  switch (method) {
+    case 'initialize': {
+      const asked = typeof params?.protocolVersion === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(params.protocolVersion) ? params.protocolVersion : '2025-06-18';
+      return reply({ protocolVersion: asked, capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'squad', version: '1.0.0' }, instructions: 'Colegas do squad SQUAD/CODE: use chamar_colega para pedir algo a um deles e esperar o relatório.' });
+    }
+    case 'ping': return reply({});
+    case 'tools/list': return reply({ tools: [colleagueTool(run)] });
+    case 'tools/call':
+      if (params?.name !== 'chamar_colega') return json(res, 200, rpcError(id, -32602, `Ferramenta desconhecida: ${String(params?.name).slice(0, 60)}`));
+      return reply(await callColleague(run, params.arguments || {}));
+    default: return json(res, 200, rpcError(id, -32601, `Método não suportado: ${method.slice(0, 60)}`));
+  }
+}
+
+/** Claude: a minimal `claude -p` on haiku without tools (its rate_limit_event updates the windows). Codex: the newest session file. */
+async function refreshWindows(p) {
+  if (p.adapter === 'codex') {
+    const info = codexSessionInfo(latestCodexSession(codexHome(p)));
+    if (info.windows && store) store.saveWindows(p.id, info.windows);
+    return { observed: !!info.windows };
+  }
+  const dir = path.join(TMP_DIR, 'probe');
+  await fsp.mkdir(dir, { recursive: true });
+  const run = await startRun({ prompt: 'Responda só: ok', label: 'Atualizar uso do Perfil', options: { cwd: dir, profile: p.id, model: 'haiku', tools: [], permissionMode: 'dontAsk', timeoutSec: 120 }, meta: { kind: 'probe' } }, { exact: true });
+  const exit = await run.done;
+  if (exit.isError) throw new Error(`Não foi possível atualizar o uso: ${exit.error}`);
+  return { observed: run.events.some(e => e.type === 'rate_limit_event') };
+}
+
 function runSummary(r) {
-  return { id: r.id, status: r.status, label: r.label, ...r.meta, project: r.project, startedAt: r.startedAt, endedAt: r.endedAt, cwd: r.cwd, events: r.events.length };
+  return { id: r.id, status: r.status, label: r.label, ...r.meta, project: r.project, startedAt: r.startedAt, endedAt: r.endedAt, cwd: r.cwd, events: r.events.length, profileId: r.profileId, adapter: r.adapter, model: r.model || null, parentRunId: r.parentRunId, usage: r.usage || null, costUsd: r.result?.total_cost_usd ?? r.result?.cost_usd ?? null, durationMs: r.result?.duration_ms ?? null, sessionId: r.result?.session_id ?? null };
 }
 
 /* ---------- settings.json ---------- */
 // A project folder (`project`) may not exist yet: it is created by its first run or by the first save here.
-function settingsPath(scope, cwd, project) {
-  if (scope === 'user') return path.join(HOME, '.claude', 'settings.json');
+// The user scope follows a Claude Perfil's account folder (CLAUDE_CONFIG_DIR) when `profile` names one.
+function settingsPath(scope, cwd, project, profileId) {
+  if (scope === 'user') {
+    if (profileId) {
+      const p = getProfile(profileId);
+      if (!p) throw new Error('Perfil não encontrado.');
+      if (p.adapter !== 'claude') throw new Error('O settings.json é do Claude: escolha um Perfil Claude.');
+      if (p.configDir) return path.join(p.configDir, 'settings.json');
+    }
+    return path.join(HOME, '.claude', 'settings.json');
+  }
   if (scope === 'project' || scope === 'local') {
     let base;
     if (project && project.trim()) base = projectDir(project);
@@ -433,17 +1058,17 @@ function settingsPath(scope, cwd, project) {
   throw new Error('Escopo inválido. Use user, project ou local.');
 }
 
-async function readSettings(scope, cwd, project) {
-  const file = settingsPath(scope, cwd, project);
+async function readSettings(scope, cwd, project, profileId) {
+  const file = settingsPath(scope, cwd, project, profileId);
   try { const text = await fsp.readFile(file, 'utf8'); return { ok: true, scope, path: file, exists: true, text }; }
   catch (e) { if (e.code === 'ENOENT') return { ok: true, scope, path: file, exists: false, text: '{\n}\n' }; throw e; }
 }
 
-async function writeSettings(scope, cwd, project, text) {
+async function writeSettings(scope, cwd, project, profileId, text) {
   if (typeof text !== 'string') throw new Error('Conteúdo ausente.');
   let parsed; try { parsed = JSON.parse(text); } catch (e) { throw new Error('JSON inválido: ' + e.message); }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('settings.json deve ser um objeto JSON.');
-  const file = settingsPath(scope, cwd, project);
+  const file = settingsPath(scope, cwd, project, profileId);
   await fsp.mkdir(path.dirname(file), { recursive: true });
   let backup = null;
   if (fs.existsSync(file)) { backup = file + '.bak'; await fsp.copyFile(file, backup); }
@@ -493,6 +1118,8 @@ async function handle(req, res) {
   if (!allowedOrigin(req.headers.origin)) return fail(res, 403, 'Origem não permitida.');
 
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) return serveIndex(res);
+  // MCP of the bridge for Codex runs: its own bearer token per run, never the page's token.
+  if (url.pathname === '/mcp') return handleMcp(req, res);
   if (!url.pathname.startsWith('/api/')) return fail(res, 404, 'Não encontrado.');
   if (!tokenOk(req, url)) return fail(res, 401, 'Token do bridge inválido. Recarregue a página servida pelo bridge.');
 
@@ -500,8 +1127,19 @@ async function handle(req, res) {
   try {
     if (req.method === 'GET' && url.pathname === '/api/health') {
       const bin = url.searchParams.get('claudePath') || DEFAULT_BIN;
-      const info = await claudeVersion(bin);
-      return json(res, 200, { ok: true, bridge: 'squad-code', claudeVersion: info.version, claudePath: info.resolved, claudeError: info.error, defaultCwd: process.cwd(), projectsDir: longPath(PROJECTS_DIR), home: HOME, platform: process.platform, activeRuns: activeCount(), maxConcurrent, dbReady: !setupNeeded(), dbPath: store?.file || DB_FILE, plugins: loadPlugins().count });
+      let info = await binVersion(bin);
+      // engines: whether some Perfil of each Adapter can run. claudeVersion (the page's live/demo switch) falls back to the version
+      // of the first usable Perfil, so a machine with only Codex is not stuck in the demo; enginePath/engineAdapter say which.
+      const engines = { claude: false, codex: false };
+      let usable = null;
+      for (const p of listProfiles()) {
+        const v = await binVersion(p.adapter === 'claude' && !p.bin ? bin : profileBin(p));
+        if (v.version) { engines[p.adapter] = true; if (!usable) usable = { adapter: p.adapter, ...v }; }
+      }
+      if (info.version) engines.claude = true;
+      const live = info.version ? { adapter: 'claude', ...info } : usable;
+      if (!info.version && live) info = { ...info, version: live.version };
+      return json(res, 200, { ok: true, bridge: 'squad-code', claudeVersion: info.version, claudePath: info.resolved, claudeError: info.error, engines, engineAdapter: live?.adapter || null, enginePath: live?.resolved || null, defaultCwd: process.cwd(), projectsDir: longPath(PROJECTS_DIR), home: HOME, platform: process.platform, activeRuns: activeCount(), maxConcurrent, dbReady: !setupNeeded(), dbPath: store?.file || DB_FILE, profiles: listProfiles().length, plugins: loadPlugins().count });
     }
     // Plugins as injected in the page, without the avatars' data URLs, plus the configuration they came from.
     if (req.method === 'GET' && url.pathname === '/api/plugins') return json(res, 200, { ok: true, ...loadPlugins().api });
@@ -511,7 +1149,7 @@ async function handle(req, res) {
       const body = await readBody(req, MAX_WORKSPACE);
       if (!setupNeeded()) return json(res, 409, { ok: false, conflict: true, path: store.file, error: 'Já existe um banco de dados com um workspace. Recarregue a página.' });
       dbModule.checkWorkspace(body);
-      if (!store) openDb();
+      if (!store) { openDb(); await afterOpen(); }
       const saved = store.syncWorkspace(body, '', false);
       console.log(`Banco de dados criado: ${store.file}`);
       return json(res, 201, saved);
@@ -592,11 +1230,50 @@ async function handle(req, res) {
       if (req.method === 'PUT' || req.method === 'POST') return json(res, 200, needStore().saveChat(parts[2], key, await readBody(req, MAX_WORKSPACE)));
       if (req.method === 'DELETE') return json(res, 200, needStore().deleteChat(parts[2], key));
     }
+    if (url.pathname === '/api/profiles' && req.method === 'GET') {
+      return json(res, 200, { ok: true, profiles: await Promise.all(listProfiles().map(profileView)), adapters: adaptersCatalog() });
+    }
+    if (url.pathname === '/api/profiles' && req.method === 'POST') {
+      needStore();
+      const p = await validateProfile(await readBody(req));
+      return json(res, 201, { ok: true, profile: await profileView(store.createProfile(p)) });
+    }
+    if (parts[1] === 'profiles' && parts[2] && !parts[4]) {
+      const pid = decodeURIComponent(parts[2]);
+      const current = getProfile(pid);
+      if (!current) return fail(res, 404, 'Perfil não encontrado.');
+      if (!parts[3] && req.method === 'PUT') {
+        needStore();
+        const p = await validateProfile(await readBody(req), current);
+        return json(res, 200, { ok: true, profile: await profileView(needStore().updateProfile(pid, p)) });
+      }
+      if (!parts[3] && req.method === 'DELETE') return json(res, 200, needStore().deleteProfile(pid));
+      if (parts[3] === 'default' && req.method === 'POST') return json(res, 200, { ok: true, profile: await profileView(needStore().setDefaultProfile(pid)) });
+      if (parts[3] === 'test' && req.method === 'POST') {
+        const status = await profileStatus(current);
+        return json(res, 200, { ok: !!status.version && status.configDirOk, status });
+      }
+      if (parts[3] === 'refresh' && req.method === 'POST') {
+        const out = await refreshWindows(current);
+        return json(res, 200, { ok: true, ...out, windows: windowsOf(pid) });
+      }
+    }
+    if (url.pathname === '/api/usage' && req.method === 'GET') {
+      const from = url.searchParams.get('from') || '', to = url.searchParams.get('to') || '', by = url.searchParams.get('by') || 'profile';
+      for (const v of [from, to]) if (v && Number.isNaN(Date.parse(v))) return fail(res, 400, 'Data inválida (use ISO 8601).');
+      const iso = v => v ? new Date(v).toISOString() : '';
+      if (!store) return json(res, 200, { ok: true, by, from, to, rows: [] });
+      return json(res, 200, { ok: true, by, from, to, rows: store.usage({ from: iso(from), to: iso(to), by }) });
+    }
+    if (url.pathname === '/api/telemetry') {
+      if (req.method === 'GET') return json(res, 200, telemetryView());
+      if (req.method === 'PUT') { const t = validateTelemetry(await readBody(req)); needStore().setSetting('telemetry', t); return json(res, 200, telemetryView()); }
+    }
     if (url.pathname === '/api/claude/settings') {
       const scope = url.searchParams.get('scope') || 'user';
-      const cwd = url.searchParams.get('cwd') || '', project = url.searchParams.get('project') || '';
-      if (req.method === 'GET') return json(res, 200, await readSettings(scope, cwd, project));
-      if (req.method === 'PUT') { const body = await readBody(req); return json(res, 200, await writeSettings(scope, cwd, project, body.text)); }
+      const cwd = url.searchParams.get('cwd') || '', project = url.searchParams.get('project') || '', profile = url.searchParams.get('profile') || '';
+      if (req.method === 'GET') return json(res, 200, await readSettings(scope, cwd, project, profile));
+      if (req.method === 'PUT') { const body = await readBody(req); return json(res, 200, await writeSettings(scope, cwd, project, profile, body.text)); }
     }
     return fail(res, 404, 'Rota não encontrada.');
   } catch (err) {
@@ -631,6 +1308,7 @@ server.listen(PORT, HOST, () => {
     catch (e) { console.error(`SQUAD/CODE: não foi possível abrir o banco em ${DATA_DIR}.\n${e.message}`); try { fs.rmSync(TMP_DIR, { recursive: true, force: true }); } catch {} process.exit(1); }
   }
   const url = `http://${HOST}:${PORT}`;
+  afterOpen();
   console.log(`SQUAD/CODE bridge ativo em ${url}`);
   console.log(`Pasta dos projetos: ${PROJECTS_DIR}`);
   if (store) console.log(`Banco de dados: ${store.file}`);
@@ -640,7 +1318,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Plugins: ${pluginList || 'nenhum'}${plugins.page.warnings.length ? ` · ${plugins.page.warnings.length} aviso(s): ${plugins.page.warnings.join(' | ')}` : ''}`);
   if (store?.interrupted) console.log(`${store.interrupted} execução(ões) interrompida(s) na última sessão marcada(s) no histórico.`);
   if (process.env.SQUAD_PRINT_TOKEN) console.log(`TOKEN=${TOKEN}`);
-  claudeVersion(DEFAULT_BIN).then(info => {
+  binVersion(DEFAULT_BIN).then(info => {
     if (info.version) console.log(`Claude Code ${info.version} (${info.resolved})`);
     else console.warn(`Claude Code não encontrado (${DEFAULT_BIN}): ${info.error}\n  Instale o Claude Code, rode "claude" uma vez para fazer login e reinicie, ou aponte SQUAD_CLAUDE_BIN para o executável.\n  Sem ele o app abre, mas as execuções ficam só na simulação.`);
   }, () => {});

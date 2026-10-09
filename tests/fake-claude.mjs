@@ -21,7 +21,12 @@ process.stdin.on('end', () => {
   // GITCHECK in the prompt: report the repository git finds from the cwd, as the agents' git commands would (null = none).
   let gitTop;
   if (input.includes('GITCHECK')) { try { gitTop = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { gitTop = null; } }
-  emit({ type: 'system', subtype: 'init', cwd: process.cwd(), gitCeiling: process.env.GIT_CEILING_DIRECTORIES || null, gitTop, session_id: 'fake-session', model: opt('--model') || 'default', permissionMode: opt('--permission-mode') || 'default', args, settings, agents, foregroundAgents: process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS === '1' });
+  emit({ type: 'system', subtype: 'init', cwd: process.cwd(), gitCeiling: process.env.GIT_CEILING_DIRECTORIES || null, gitTop, session_id: 'fake-session', model: opt('--model') || 'default', permissionMode: opt('--permission-mode') || 'default', args, settings, agents, foregroundAgents: process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS === '1', configDir: process.env.CLAUDE_CONFIG_DIR || null, telemetryEnv: Object.keys(process.env).filter(k => /^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$)/.test(k)).sort(),
+    // Native telemetry: what reached the env (header values only as "set", the tests check they never reach argv).
+    otel: process.env.CLAUDE_CODE_ENABLE_TELEMETRY ? { endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT, protocol: process.env.OTEL_EXPORTER_OTLP_PROTOCOL, headers: process.env.OTEL_EXPORTER_OTLP_HEADERS || null, resource: process.env.OTEL_RESOURCE_ATTRIBUTES, prompts: process.env.OTEL_LOG_USER_PROMPTS || null } : null });
+  // RATE<nn> in the prompt: the account's usage windows at nn% (as the rate_limit_event of Claude Code).
+  const rate = input.match(/RATE(\d+)/);
+  if (rate) emit({ type: 'rate_limit_event', rate_limit_info: { unifiedWindows: { five_hour: { utilization: Number(rate[1]) / 100, resetsAt: Math.floor(Date.now() / 1000) + 3600 }, seven_day: { utilization: 0.1, resetsAt: Math.floor(Date.now() / 1000) + 86400 } } } });
   // With squad colleagues, call the first one through the Agent tool (as Claude Code streams it).
   const colleague = agents && Object.keys(agents)[0];
   if (colleague && !input.includes('SLEEP') && !input.includes('FAIL')) {
@@ -35,5 +40,5 @@ process.stdin.on('end', () => {
   emit({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'README.md' } }] } });
   if (args.includes('--include-partial-messages')) for (const text of ['wor', 'king']) emit({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } });
   emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } });
-  emit({ type: 'result', subtype: 'success', is_error: false, result: `ECHO:${input.trim()}|SYS:${system.trim()}`, total_cost_usd: 0.001, duration_ms: 12, num_turns: 1, session_id: 'fake-session' });
+  emit({ type: 'result', subtype: 'success', is_error: false, result: `ECHO:${input.trim()}|SYS:${system.trim()}`, total_cost_usd: 0.001, duration_ms: 12, num_turns: 1, session_id: 'fake-session', usage: { input_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 30, output_tokens: 4, output_tokens_details: { thinking_tokens: 2 } }, modelUsage: { [opt('--model') || 'claude-fake']: {} } });
 });

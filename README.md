@@ -251,6 +251,16 @@ A lista completa está no [guia](docs/GUIA.md#-controles).
 | `SQUAD_DATA_DIR` | `./data` | Pasta do banco SQLite (`squad.db`) |
 | `SQUAD_CONFIG` | `./squad.local.json` | Arquivo de configuração local usado no lugar do `squad.local.json` |
 | `SQUAD_PLUGINS` | (vazio) | Pastas de plugins extras, separadas por `:` (`;` no Windows) |
+| `SQUAD_CODEX_BIN` | `codex` | Executável do Codex usado pelos Perfis Codex sem executável próprio |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | (vazio) | Destino OTLP/HTTP dos traces quando Configurações > Telemetria não define um |
+
+**Perfis.** Cada agente roda num Perfil: uma instância de um Adapter (`claude` ou `codex`) com executável, pasta da conta
+(`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), modelo, esforço, teto de execuções e Perfil reserva. Os Perfis ficam no `squad.db`
+(fora do workspace e dos backups). Na criação do banco nasce "Claude (padrão)" e, se o `codex` estiver no `PATH`,
+"Codex (padrão)". Execuções Codex usam `codex exec --json` (prompt pelo stdin, sandbox `read-only` ou `workspace-write`
+conforme as ferramentas do agente, nunca `danger-full-access`); os Chamados entre colegas passam pelo MCP local do bridge
+(`/mcp`, token próprio por execução). Segredos de telemetria nunca são gravados: informe só o nome da variável de ambiente
+que guarda o valor do header.
 
 Exemplos:
 
