@@ -1513,3 +1513,86 @@ test('revisão M5: só se sobrescreve um embutido; o segundo override é denied;
   const plain = await startBridge({});
   assert.deepEqual((await plain.json('/api/health')).adapterSources, { claude: 'builtin', codex: 'builtin' });
 });
+
+/* ---------- revisão final do Codex ---------- */
+test('B1: meta.kind "probe" vindo do corpo público não contorna o beforeSpawn (nem o failClosed); o probe de /refresh segue sem hook', async () => {
+  const b = await polBridge({}, { policy: { grants: ['run.mutate'], failClosed: true } });
+  await setupDb(b);
+  await setMode(b, { block: 'tudo bloqueado' });
+  const res = await postRun(b, { prompt: 'oi', options: { cwd: WORKDIR }, meta: { kind: 'probe' } });
+  assert.equal(res.status, 403);
+  assert.match((await res.json()).error, /Execução bloqueada pelo plugin policy/);
+  await setMode(b, { throw: true });
+  assert.equal((await postRun(b, { prompt: 'oi', options: { cwd: WORKDIR }, meta: { kind: 'probe' } })).status, 403, 'failClosed também vale');
+  const seenBefore = (await seenOf(b)).length;
+  assert.equal((await b.api('/api/profiles/claude-default/refresh', { method: 'POST' })).status, 200);
+  assert.equal((await seenOf(b)).length, seenBefore, 'o probe interno não chama o hook');
+});
+
+test('B2: um path compartilhado que aponta para a pasta de um plugin do home (ou um alias por symlink) não elimina o local', () => {
+  const home = scratch('squad-pl-b2-');
+  const dir = path.join(home, '.squad-code', 'plugins');
+  cpSync(fx('hello'), path.join(dir, 'hello'), { recursive: true });
+  const alias = path.join(scratch('squad-pl-b2l-'), 'alias');
+  symlinkSync(path.join(dir, 'hello'), alias);
+  for (const shared of [[path.join(dir, 'hello')], [alias]]) {
+    const { loader } = loaderFor({ home, shared: { plugins: { paths: shared } }, local: { plugins: { enabled: ['hello'] } } });
+    const r = loader.load();
+    const hello = r.discovery.plugins.filter(p => p.id === 'hello');
+    assert.equal(hello.length, 1, JSON.stringify(hello.map(p => [p.status, p.source])));
+    assert.equal(hello[0].local, true); assert.equal(hello[0].status, undefined); assert.equal(hello[0].source, 'home');
+    assert.ok(hello[0].serverFile);
+  }
+  // e o mesmo vale quando o caminho compartilhado vem antes do local na ordem de leitura de dois paths locais/compartilhados
+  const { loader } = loaderFor({ home, shared: { plugins: { paths: [path.join(dir, 'hello')] } }, local: { plugins: { paths: [alias], enabled: ['hello'] } } });
+  assert.equal(loader.load().discovery.plugins.filter(p => p.id === 'hello' && !p.status).length, 1);
+});
+
+test('B3: a sondagem do executável (--version) de um adapter de plugin usa o env mínimo, e o cache não mistura os contextos', async () => {
+  const b = await startBridge({ local: adapterCfg(['adapter']), env: { SQUAD_TEST_SECRET: 'sentinela-secreta' } });
+  await setupDb(b);
+  const eco = await newProfile(b, { name: 'Eco', adapter: 'x-echo' });
+  assert.equal(eco.status.version, 'x-echo 1.0.0', 'sem VAZOU:');
+  const listed = (await b.json('/api/profiles')).profiles.find(p => p.id === eco.id);
+  assert.equal(listed.status.version, 'x-echo 1.0.0');
+  const test = await (await b.api(`/api/profiles/${eco.id}/test`, { method: 'POST' })).json();
+  assert.equal(test.status.version, 'x-echo 1.0.0');
+  assert.doesNotMatch(JSON.stringify(await b.json('/api/health')), /sentinela-secreta|VAZOU/);
+  // o mesmo executável por um Perfil de adapter embutido (env completo) enxerga a variável: o cache distingue os dois contextos
+  const bin = fx('fake-adapter') + '/bin.mjs';
+  const builtin = await newProfile(b, { name: 'Claude no bin', adapter: 'claude', bin });
+  assert.match(builtin.status.version, /VAZOU:sentinela-secreta/);
+  const again = (await b.json('/api/profiles')).profiles;
+  assert.equal(again.find(p => p.id === eco.id).status.version, 'x-echo 1.0.0');
+  assert.match(again.find(p => p.id === builtin.id).status.version, /VAZOU/);
+});
+
+test('N1: depois do estouro do import (top-level await lento) o register() nunca é chamado', async () => {
+  const marker = path.join(scratch('squad-pl-mark-'), 'marker.txt');
+  const b = await startBridge({ local: pcfg([fx('slow-import'), fx('hello')], ['slow-import', 'hello']), env: { SQUAD_PLUGIN_REGISTER_TIMEOUT_MS: '300', SQUAD_PLUGIN_MARKER: marker, SQUAD_SLOW_MS: '800' } });
+  const plugins = byId(await b.json('/api/plugins'));
+  assert.equal(plugins['slow-import'].status, 'error'); assert.match(plugins['slow-import'].error, /tempo limite/i);
+  assert.equal(plugins.hello.status, 'active');
+  await sleep(1300); // o import termina bem depois do estouro
+  assert.doesNotMatch(readFileSync(marker, 'utf8'), /register-called slow-import/);
+  assert.equal(byId(await b.json('/api/plugins'))['slow-import'].status, 'error');
+});
+
+test('N2: restartRequired detecta mudança no código do plugin (hash do server), no env e no configSchema', async () => {
+  const dir = path.join(scratch('squad-pl-n2-'), 'hello');
+  cpSync(fx('hello'), dir, { recursive: true });
+  const b = await startBridge({ local: pcfg([dir], ['hello']) });
+  assert.equal((await b.json('/api/plugins')).restartRequired, false);
+  assert.equal((await b.json('/api/plugins')).restartRequired, false, 'estável entre leituras');
+  writeFileSync(path.join(dir, 'server.mjs'), readFileSync(path.join(dir, 'server.mjs'), 'utf8') + '\n// mudou\n');
+  assert.equal((await b.json('/api/plugins')).restartRequired, true, 'código mudou');
+  const c = await startBridge({ local: pcfg([dir], ['hello']) });
+  assert.equal((await c.json('/api/plugins')).restartRequired, false);
+  const manifest = JSON.parse(readFileSync(path.join(dir, 'squad-plugin.json'), 'utf8'));
+  writeJson(path.join(dir, 'squad-plugin.json'), { ...manifest, env: ['HELLO_SECRET', 'OUTRA'] });
+  assert.equal((await c.json('/api/plugins')).restartRequired, true, 'env mudou');
+  const d = await startBridge({ local: pcfg([dir], ['hello']) });
+  assert.equal((await d.json('/api/plugins')).restartRequired, false);
+  writeJson(path.join(dir, 'squad-plugin.json'), { ...manifest, env: ['HELLO_SECRET', 'OUTRA'], configSchema: { type: 'object' } });
+  assert.equal((await d.json('/api/plugins')).restartRequired, true, 'configSchema mudou');
+});

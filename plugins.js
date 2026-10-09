@@ -758,6 +758,9 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
     } catch (e) { if (e.code !== 'ENOENT') warn(`${rel(homeDir)}: não foi possível listar (${e.code || e.message})`); }
     // The same folder through two paths counts once. Local sources go first: with a repeated id the local one wins (the shared one is
     // listed as refused, with a warning).
+    // Local sources are ordered first BEFORE the duplicates go: a shared path pointing at a local plugin's folder (or an alias of it)
+    // must not take its place and then be refused, which would drop the local plugin (and its failClosed policy) altogether.
+    cands.sort((a, b) => Number(b.local) - Number(a.local));
     const real = new Set(), unique = [];
     for (const c of cands) {
       let r = c.dir; try { r = fs.realpathSync(c.dir); } catch {}

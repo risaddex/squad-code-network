@@ -15,8 +15,8 @@ bridge (adapters plugáveis, rotas, eventos, `beforeSpawn`). Extensão da págin
    `runtime.permissionMode`, `addDirs` e `extraAllowedTools` vindos de fonte compartilhada (config ou plugin achado só por ela)
    também são ignorados com aviso (ver `docs/plans/plugins-conteudo.md`).
 3. **Importação dentro do callback do `listen`.** Descoberta e validação dos manifestos (só leitura) antes; `import()` + `register`
-   depois de a porta ser nossa. `plugins.ready` é aguardado por `handle()` (após `tokenOk`), `serveIndex`, `startRun` (junto de
-   `configProfilesReady`) e `afterOpen` (antes de `syncConfigProfiles`).
+   depois de a porta ser nossa. `plugins.ready` é aguardado por `handle()` (após `tokenOk`), `serveIndex`, `startRun` (antes de
+   `configProfilesReady`, ver Desvios) e `afterOpen` (antes de `syncConfigProfiles`).
 4. `run:beforeSpawn` é **fail-open** por padrão; `plugins.entries.<id>.failClosed: true` vira bloqueio.
 5. Observadores com fila limitada (1000, descarta o mais antigo), `setImmediate`, tempo limite por handler (3 s,
    `plugins.hookTimeoutMs`, `SQUAD_PLUGIN_HOOK_TIMEOUT_MS` nos testes) e disjuntor após 20 falhas seguidas.
@@ -30,38 +30,40 @@ bridge (adapters plugáveis, rotas, eventos, `beforeSpawn`). Extensão da págin
 
 ## Passos
 
-### Passo 1: Contrato
+### Passo 1: Contrato: concluído (`064c834`)
 ADR 0004, este documento, `CONTEXT.md` (Plugin: conteúdo e/ou código, código só pela Configuração local; Capacidade; Adapter
 registrado no bridge).
 
-### Passo 2: Registro de adapters e funções puras
+### Passo 2: Registro de adapters e funções puras: concluído (`064c834`)
 Apêndice A2 e A5: `adapters/index.js` (registro), `adapters/claude.js` e `adapters/codex.js` com as funções puras movidas do
 `server.js` (uso, janelas, catálogo, esforços, args, tradutor, sessão). Testes unitários em `tests/adapters.test.mjs`. Sem mudança
-de comportamento.
+de comportamento (pequenas diferenças de robustez registradas em "Desvios").
 
-### Passo 3: `server.js` passa a usar o registro
+### Passo 3: `server.js` passa a usar o registro: concluído (`064c834`)
 Apêndice A1/A2: lookups simples, lançamento (`prepare`, `files`, `tail`, `mcpToken`), fim da execução (`finish`, `onEvent`,
 `recordWindows`), `refreshWindows`, `settingsFile`, `engines`, catálogo. `npm test` verde a cada troca; teste novo de Perfil com
 adapter desconhecido.
 
-### Passo 4: Schemas, descoberta e ordem
+### Passo 4: Schemas, descoberta e ordem: concluído (`1729838`)
 Apêndice A4: `schemas/squad-plugin.schema.json`, `plugins` em `squad.schema.json`, `CONSTANTS` (`PLUGIN_CAPABILITIES`,
-`PLUGIN_EVENTS`); `plugins.js` passa a descobrir todos os plugins (um caminho só, `discover` e `orderPlugins`; conteúdo, código ou os
+`PLUGIN_EVENTS`); `plugins.js` passa a descobrir todos os plugins (um caminho só, no `load()`, com `orderPlugins`; conteúdo, código ou os
 dois no mesmo manifesto); `plugin-host.js` com o host de código; `GET /api/plugins` único; decisão 2.
 
-### Passo 5: Carga, `register` e rotas
+### Passo 5: Carga, `register` e rotas: concluído (`1729838`)
 Apêndice A4: `import()` no `listen`, `plugins.ready`, `ctx` (`log`, `settings`, `dataDir`, `secret`, `onDispose`, `hasCapability`,
 `use`), isolamento de erro e congelamento do ctx; `registerRoute` sob `/api/plugins/<id>/` com token/Host/Origin do núcleo.
 
-### Passo 6: Eventos e `beforeSpawn`
+### Passo 6: Eventos e `beforeSpawn`: concluído (`15e3e19`)
 Apêndice A3: `run:start`, `run:event`, `run:finish`, `profile:usage`, `workspace:saved`; `run:beforeSpawn` depois da reserva
 síncrona (veto devolve a vaga), `appendSystem`, fail-open/failClosed, `run.content`.
 
-### Passo 7: `registerAdapter`
+### Passo 7: `registerAdapter`: concluído (`15e3e19`)
 Adapter de plugin (`adapter`, `adapter.override`), `engines` e catálogo dinâmicos, erro claro com plugin desligado.
 
-### Passo 8: Documentação e revisão
-README, `CLAUDE.md`, `scripts/dev.mjs` observando `plugins.js` e `adapters/`, "Desvios" neste arquivo; revisão do Codex.
+### Passo 8: Documentação e revisão: concluído
+README (seção Plugins), `CLAUDE.md` (parágrafo "Plugins and adapter registry"), `CONTEXT.md`, `scripts/dev.mjs` observando
+`plugins.js`, `plugin-host.js`, `schema.js`, `schemas/` e `adapters/`, e "Desvios" revisados nesta etapa, com as correções da
+revisão do Codex (B1, B2, B3, N1, N2 abaixo).
 
 ## Desvios
 
@@ -81,7 +83,7 @@ Passos 2 e 3 (registro, `adapters/claude.js`, `adapters/codex.js`, `server.js` c
 - **`validateProfile`:** a mensagem lista os kinds do registro ("Use claude ou codex." enquanto só há os embutidos) e `impl.validateProfile?.(src, p)` roda depois das checagens do núcleo. O enum de `plugins.js`/`db.js` continua sendo os embutidos (teste `builtinKinds() == CONSTANTS.ADAPTERS`).
 - **Ficam no núcleo, de propósito:** `DEFAULT_CODEX_BIN` e `afterOpen`/`ensureCodexDefault` (o `db.js` é dono dos ids padrão, A1), `MEM_DEFAULT` com `adapter: 'claude'`, e em `/api/health` o `{ adapter: 'claude' }` de `claudeVersion` (é o interruptor demo/ao vivo da página, que depende do Claude por definição). `grep "=== 'codex'" server.js` não encontra mais nada.
 - **`cut4k`** subiu para o bloco de helpers do `server.js` (os adapters o recebem pelo `host`); `adapters/claude.js` importa `WINDOWS` de `db.js`.
-- **Testes:** `tests/golden-argv.json` guarda o argv completo de 7 execuções (claude cheio/mínimo/telemetria nativa, codex cheio/somente leitura/modelo do Claude/telemetria nativa) gerado pelo `server.js` do HEAD antes do registro; o teste compara o argv atual com ele (caminhos e porta normalizados), e confere que os `-c otel.*` vêm antes do `-` final. O teste do Adapter desconhecido usa teto 1 no Perfil e repete a execução para provar que nenhuma vaga foi tomada; o do vazamento usa um `serviceName` com NUL (o `spawn` lança síncrono depois de o adapter escrever os arquivos). A ADR 0001 não tem tabela, então o tradutor foi testado contra a descrição dela e o mapeamento do código (system/assistant/user/result, `Agent` para `chamar_colega`, uso somado por turno). Os testes de integração de `adapters.test.mjs` usam portas 4800+ para não colidir com os de `bridge.test.mjs` (que rodam em paralelo, em outro processo). `package.json` ainda não inclui `plugins.test.mjs` (não existe; entrou no passo 5).
+- **Testes:** `tests/golden-argv.json` guarda o argv completo de 7 execuções (claude cheio/mínimo/telemetria nativa, codex cheio/somente leitura/modelo do Claude/telemetria nativa) gerado pelo `server.js` do HEAD antes do registro; o teste compara o argv atual com ele (caminhos e porta normalizados), e confere que os `-c otel.*` vêm antes do `-` final. O teste do Adapter desconhecido usa teto 1 no Perfil e repete a execução para provar que nenhuma vaga foi tomada; o do vazamento usa um `serviceName` com NUL (o `spawn` lança síncrono depois de o adapter escrever os arquivos). A ADR 0001 não tem tabela, então o tradutor foi testado contra a descrição dela e o mapeamento do código (system/assistant/user/result, `Agent` para `chamar_colega`, uso somado por turno). Os testes de integração de `adapters.test.mjs` usam portas 4800+ para não colidir com os de `bridge.test.mjs` (que rodam em paralelo, em outro processo). `package.json` passou a incluir `plugins.test.mjs` no passo 5 (o arquivo ainda não existia no passo 2-3).
 
 Passos 4 e 5 (schemas, descoberta, ordem, carga, `ctx` e rotas). O que divergiu do Apêndice:
 
@@ -99,7 +101,7 @@ Passos 4 e 5 (schemas, descoberta, ordem, carga, `ctx` e rotas). O que divergiu 
 - **Orçamento de carga:** todos os `register` juntos têm 30 s (`SQUAD_PLUGIN_LOAD_BUDGET_MS` nos testes); o que estoura ou sobra vira `error` "tempo total de carga esgotado" (sem importar os que sobraram).
 - **Revisão (segurança):** o `plugins.disabled` do compartilhado não desliga plugin com `server` (só o local); plugin desligado por `plugins.disabled` ou por `requires` não atendido (também os só de conteúdo, que saem da página) continua em `/api/plugins` como `disabled`. `settings`, `failClosed` e `hookTimeoutMs` só valem do arquivo local. `runtime.permissionMode`, `addDirs` e `extraAllowedTools` de fonte compartilhada são ignorados com aviso (um plugin só vale como local se algum arquivo local o nomear, via `SQUAD_PLUGINS` ou na pasta do home). Ids reservados do Windows são recusados (`CONSTANTS.WINDOWS_RESERVED_RE`, a mesma regra das pastas de projeto). Id repetido: as fontes locais são lidas primeiro e vencem; a repetida (ou a recusada) aparece em `/api/plugins` com `status: invalid`, com chave própria por pasta (`id@pasta`), e a rota/`use()` respondem pelo plugin válido. As mensagens de `settings` inválidas citam o campo e a regra, nunca o valor (nem no log); `configSchema` com `pattern` acima de 200 caracteres, `anyOf`/`oneOf` com mais de 16 alternativas ou mais de 32 níveis é recusado antes de validar (`error`).
 - **Para o passo 6 (S-L9):** o despachante de eventos filtra o payload pelo grant de cada plugin: `prompt`/`systemPrompt` só com `run.content`, o workspace só com `workspace.read`; sem o grant o campo nem existe no objeto entregue.
-- **Testes:** `tests/plugins.test.mjs` (35 testes, portas 4700-4799 reservadas, `startBridge` próprio com `SQUAD_HOME`, `SQUAD_CONFIG`, `SQUAD_CONFIG_SHARED` e dados temporários), fixtures em `tests/fixtures/plugins/` (`hello`, `throws-on-register`, `not-enabled`, `bad-settings`, `route-echo`, mais `hangs-on-register`, `no-grant`, `needs-hello`, `content-only`, `code-and-content`, `slow`, `zz-after`, `cycle-a` e `cycle-b`). `no-grant` (A5, passo 6) entrou já aqui porque `on('run:beforeSpawn')` é o jeito de provar `denied` sem `registerAdapter`; `code-and-content` prova o manifesto único (conteúdo só com `enabled` e só com o código ativo). O corpo acima de `MAX_BODY` derruba a conexão (o `readBody` do núcleo destrói a requisição): o teste distingue `status 413` de `derrubada`, aceita só esses dois e confere `/api/health` depois. Os testes de `throws-on-register`/`hangs-on-register` conferem por arquivo marcador que o `onDispose` rodou, que as rotas ficaram vazias e que o registro tardio foi recusado; o do plugin `slow` prova que `/api/health` e `serveIndex` esperam `plugins.ready`.
+- **Testes:** `tests/plugins.test.mjs` (35 testes no passo 5 e 68 ao fim do passo 7; portas 4700-4799 reservadas, usadas 4700-4770 no passo 5 e 4700-4714 depois, ver passo 6-7; `startBridge` próprio com `SQUAD_HOME`, `SQUAD_CONFIG`, `SQUAD_CONFIG_SHARED` e dados temporários), fixtures em `tests/fixtures/plugins/` (`hello`, `throws-on-register`, `not-enabled`, `bad-settings`, `route-echo`, mais `hangs-on-register`, `no-grant`, `needs-hello`, `content-only`, `code-and-content`, `slow`, `zz-after`, `cycle-a` e `cycle-b`). `no-grant` (A5, passo 6) entrou já aqui porque `on('run:beforeSpawn')` é o jeito de provar `denied` sem `registerAdapter`; `code-and-content` prova o manifesto único (conteúdo só com `enabled` e só com o código ativo). O corpo acima de `MAX_BODY` derruba a conexão (o `readBody` do núcleo destrói a requisição): o teste distingue `status 413` de `derrubada`, aceita só esses dois e confere `/api/health` depois. Os testes de `throws-on-register`/`hangs-on-register` conferem por arquivo marcador que o `onDispose` rodou, que as rotas ficaram vazias e que o registro tardio foi recusado; o do plugin `slow` prova que `/api/health` e `serveIndex` esperam `plugins.ready`.
 
 Passos 6 e 7 (eventos, `run:beforeSpawn` e `registerAdapter`). O que divergiu do Apêndice:
 
@@ -119,6 +121,7 @@ Passos 6 e 7 (eventos, `run:beforeSpawn` e `registerAdapter`). O que divergiu do
 - **Fila sob pressão:** descarta primeiro `run:event` (um `stream_event` antes de qualquer outro), preservando `run:start`, `run:finish`, `profile:usage` e `workspace:saved`; só então o mais antigo. `drain` roda com `.catch`; o orçamento do `beforeSpawn` usa `performance.now()`; quando um plugin anterior gastou o orçamento, a mensagem do `failClosed` diz "esgotado pelos plugins anteriores".
 - **Adapter de plugin é menos confiável que o embutido:** o filho herda um **env mínimo** (`PATH, HOME, USER, LOGNAME, LANG, LC_*, TMPDIR/TEMP/TMP, SHELL, TERM`, mais as variáveis do `env` do manifesto, mais o que o próprio `prepare` define; no Windows também `SystemRoot, ComSpec, PATHEXT, USERPROFILE, APPDATA, LOCALAPPDATA, WINDIR`; `GIT_CEILING_DIRECTORIES` do núcleo continua); os embutidos seguem com o env inteiro (golden argv/env). `nativeTelemetry` **não é chamado** para adapter de plugin (nenhum header OTLP chega a ele) e o Perfil que o pediu recebe um aviso `bridge/warning`. O adapter recebe uma **visão do run** (`id, kind, label, parentRunId, effort, profile` próprio, `cwd, startedAt, opts`, e getters para `model, seenModel, result, endedAt, translator, status`), sem `parent`, `events`, `files`, `clients`, `child`; `opts` sem `agentMeta` e sem `agents[*].prompt` (também no `spec.opts` do `prepare`).
 - **Override só de embutido:** a entrada atual precisa ser `builtin: true`; um segundo override (outro plugin ou repetição) é `denied`. O registro guarda `source` (`builtin` ou `plugin:<id>`) e `envNames`; `adapterSource` aparece em `/api/profiles` (no catálogo de cada adapter e em cada Perfil) e `adapterSources` em `/api/health`; o start loga `Adapter "claude" substituído pelo plugin X.`. O catálogo dos embutidos ganhou `adapterSource: 'builtin'`.
+- **Revisão final (Codex).** (B1) O hook só é pulado por `internal.exact` (definido só pelo bridge); `body.meta.kind: "probe"` do corpo público **não** contorna mais o `beforeSpawn`, nem o `failClosed`. (B2) A descoberta (`plugins.js`) ordena as fontes locais antes de deduplicar por realpath: um path compartilhado que aponte para a pasta de um plugin do home (ou um alias por symlink) não elimina o local. (B3) `binVersion(bin, impl)`: a sondagem `--version` do executável de adapter de plugin (`profileStatus`, `/api/health`, `/test`) roda com o env mínimo (`adapterEnv`, o mesmo do lançamento) e o cache de versões tem chave por contexto (executável + env mínimo + `env` do manifesto). (N1) Depois do `import()` verifica-se se a tentativa expirou ou o bridge está encerrando antes de chamar `register()` (top-level await lento não chama mais `register` depois do `error`). (N2) A assinatura de `restartRequired` inclui o sha1 do arquivo `server` (relido só quando tamanho/mtime mudam) e `apiVersion`, `env` e `configSchema` do manifesto. `scripts/dev.mjs` também reinicia o bridge ao mudar `plugins.js`, `plugin-host.js`, `schema.js` e `schemas/`. As faixas de porta de `bridge.test.mjs` (4400-4699 + incremento) podem encostar nas de `plugins.test.mjs` (4700+), e uma execução concorrente com porta ocupada derrubava `startBridge` ("porta já está em uso"): `npm test` passou a rodar os arquivos em sequência (`--test-concurrency=1`).
 - **Variáveis novas para teste:** `SQUAD_PLUGIN_HOOK_TIMEOUT_MS` (sobrepõe `plugins.hookTimeoutMs`) e `SQUAD_PLUGIN_BEFORESPAWN_BUDGET_MS`.
 - **Testes:** 21 novos (passos 6-7) e mais 12 da revisão em `tests/plugins.test.mjs` (5 do despachante direto, sem rede, com `createPluginHost` e `globalThis.__observer` para fila/disjuntor/tempo limite; 5 de eventos e S-L9 e disjuntor no bridge; 8 de `beforeSpawn`; 4 de `registerAdapter`) e 1 em `tests/adapters.test.mjs` (undo do registro). Fixtures novas: `event-log`, `observer-bad`, `policy` (controlado por `POST /mode`) e `fake-adapter` (`x-echo`, `bin.mjs`; `settings.kind/failAfter/twice/invalid`). O `startBridge` do `plugins.test.mjs` expõe `tmp` (TMPDIR do bridge, para provar que o veto não deixa temporário) e a faixa de portas aleatórias caiu de 40 para 15 (4700-4714 mais as usadas em ordem). No teste do Chamado vetado, o `fake-codex` não repassa `isError` no item da chamada, então o erro de ferramenta é conferido pelo `isError` da resposta MCP (e pelo texto no stream do pai).
 
@@ -161,7 +164,8 @@ Os números de linha referem-se ao `server.js` antes do passo 3.
 ### A2. Interface
 
 Cada módulo: `module.exports = host => adapter`. `host` = `{HOME, HOST, PORT, TMP_DIR, DEFAULT_BIN, DEFAULT_CODEX_BIN, MODEL_RE,
-cut4k, resolveBin, startRun, saveWindows(profileId, windows, source), warn, fsp, EFFORTS, CODEX_EFFORTS}`.
+cut4k, resolveBin, startRun, saveWindows(profileId, windows, source), warn, fsp, EFFORTS, CODEX_EFFORTS}` (acrescentou `ROOT` e
+`longPath`; `saveWindows` virou `recordWindows`; ver Desvios).
 
 ```js
 Adapter = {
@@ -179,7 +183,7 @@ Adapter = {
   validateLaunch?(opts, profile) -> void,          // throws
   resolveModelEffort({opts, profile, model, effort, warn}) -> {model, effort},
   prepare(spec) -> Promise<{args, stdin, files:[{path,mask}], translator|null, mcpToken?, tail:string[], model}>,
-  nativeTelemetry?(run, profile, {env, args, warn, base, cfg, content, headers}) -> void,
+  nativeTelemetry?(run, profile, {env, args, warn, base, cfg, content, headers, attrs}) -> void,  // attrs: ver Desvios
   onEvent?(run, event) -> {windows?}|void,          // síncrono, caminho quente
   finish(run, {code, durationMs}) -> {result?, usage, model?, windows?},
   refreshWindows(profile) -> Promise<{observed}>,
@@ -202,13 +206,13 @@ Fica no núcleo: `pickProfile`, `overLimit`, `fallbackId`, admissão, `configPro
 
 | Evento | Onde | Payload |
 |---|---|---|
-| `run:start` | após `pushEvent` dos warnings (1174), antes do timer (1176) | `{runId, parentRunId, rootRunId, kind, label, project, projectId, agentId, featureId, profileId, profileName, adapter, model, cwd, pid, startedAt, fallbackFrom}` |
+| `run:start` | antes do primeiro `pushEvent` (ver Desvios, passos 6-7) | `{runId, parentRunId, rootRunId, kind, label, project, projectId, agentId, featureId, profileId, profileName, adapter, model, cwd, pid, startedAt, fallbackFrom}` (+ `prompt` e `systemPrompt` com `run.content`) |
 | `run:event` | em `pushEvent` (714-721), após `observe` | `{runId, event}`; sem `stream_event` salvo opt-in `{partial:true}` |
 | `run:finish` | após `sendTrace` (1234), antes de fechar clients | `{runId, parentRunId, kind, profileId, adapter, model, status, isError, error, code, costUsd, durationMs, numTurns, usage, sessionId}` |
 | `profile:usage` | `recordWindows(profileId, windows, source)` substitui 734 (`event`), 1215 (`session`), 1313 (`refresh`) | `{profileId, adapter, windows, source, overThreshold}` |
 | `workspace:saved` | após `syncWorkspace` em PUT /api/workspace (1507) e POST /api/setup (1445), só com mudança | `{rev, savedAt, changes, setup}` (nunca o workspace) |
 
-Prompt/system prompt, e o conteúdo do stream (`run:event` completo, erro e sessionId do `run:finish`), só com capability `run.content` (sem ela, projeção/código; ver "Desvios"); o workspace só com `workspace.read`; o despachante monta o payload por plugin, omitindo o que o grant não cobre (S-L9). Eventos são somente leitura (documentado, não clonados).
+Prompt/system prompt, e o conteúdo do stream (`run:event` completo, erro e sessionId do `run:finish`), só com capability `run.content` (sem ela, projeção/código; ver "Desvios"). `workspace.read` ainda não entrega nada: `workspace:saved` nunca leva o workspace e `ctx.getWorkspace()` não existe (ver Desvios, passo 6-7); a capacidade só é aceita e concedida. O despachante monta o payload por plugin, omitindo o que o grant não cobre (S-L9). Eventos são somente leitura; cada plugin recebe a sua cópia congelada (ver Desvios).
 
 `run:beforeSpawn`: dentro de `launchRun`, **depois** da reserva (`admitBump`), entre a criação do `run` (1109) e o ramo do adapter
 (1111). Sem processo, temporários, `runs.set` nem histórico ainda: veto não deixa resto; `release` no `finally` devolve a vaga.
@@ -243,7 +247,8 @@ effort, tools, permissionMode, cwd, promptChars, hasSystemPrompt, agentSlugs}`. 
 - `squad.schema.json`: `plugins: {paths, disabled, enabled, hookTimeoutMs, entries: {<id>: {grants, settings, failClosed}}}`.
 - `GET /api/plugins` (um só, para conteúdo e código): `{ok, plugins:[{id, name, version, description, path, categories, presets,
   avatars, themes, conventions, runtime, hasCode, status, error, source, requires, env, capabilities:{asked, granted, missing}, routes,
-  events, adapters, warnings}], runtime, warnings, config, restartRequired}`. `/api/health`: `plugins: <ativos>`;
+  events, adapters, observers?, warnings}], runtime, warnings, config, restartRequired}` (`env` e `observers` entraram nos passos
+  4-7; ver Desvios). `/api/health`: `plugins: <ativos>`;
   `engines` ganha chaves só com adapters de plugin. Log de start: "Plugins: ...".
 - Rotas: em `handle()` após `tokenOk`/`parts`; `parts[1]==='plugins' && parts[2]` → `plugins.route`; handler `(req, res, {url,
   params, body(), http})`; objeto → JSON 200, `{status, body}`, ou escrita direta em `res`; exceção → 500; sem timeout (SSE);

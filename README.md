@@ -253,6 +253,10 @@ A lista completa está no [guia](docs/GUIA.md#-controles).
 | `SQUAD_CONFIG_SHARED` | `./squad.config.json` | Arquivo usado no lugar do `squad.config.json` (testes) |
 | `SQUAD_PLUGINS` | (vazio) | Pastas de plugins extras, separadas por `:` (`;` no Windows) |
 | `SQUAD_CODEX_BIN` | `codex` | Executável do Codex usado pelos Perfis Codex sem executável próprio |
+| `SQUAD_PLUGIN_REGISTER_TIMEOUT_MS` | `10000` | Limite do `register(ctx)` de cada plugin com código (testes) |
+| `SQUAD_PLUGIN_LOAD_BUDGET_MS` | `30000` | Tempo total de carga do código de todos os plugins (testes) |
+| `SQUAD_PLUGIN_HOOK_TIMEOUT_MS` | `3000` | Limite de cada handler de evento e de `run:beforeSpawn`; sobrepõe `plugins.hookTimeoutMs` (testes) |
+| `SQUAD_PLUGIN_BEFORESPAWN_BUDGET_MS` | `5000` | Orçamento total dos handlers de `run:beforeSpawn` de uma execução (testes) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | (vazio) | Destino OTLP/HTTP dos traces quando Configurações > Telemetria não define um |
 
 **Perfis.** Cada agente roda num Perfil: uma instância de um Adapter (`claude` ou `codex`) com executável, pasta da conta
@@ -351,7 +355,7 @@ Caminhos relativos valem a partir da pasta do arquivo. Um plugin é uma pasta co
 
 ```text
 acme/
-├── squad-plugin.json   # id, name, version, categories, avatars, themes, runtime, conventions
+├── squad-plugin.json   # id, name, version, categories, avatars, themes, runtime, conventions (e server, se tiver código)
 ├── agents/*.md         # um agente por arquivo: frontmatter (name, slot, role, ...) + instruções
 ├── avatars/*.png       # png, jpg ou webp (sem SVG), até 1 MB cada
 └── conventions.json    # diretrizes extras (opcional)
@@ -376,9 +380,79 @@ campo, e Perfil que sai do arquivo sai do banco. Editar, Tornar padrão e Exclui
 aparece no card. O `$schema` aponta para `schemas/squad.schema.json` (o manifesto do plugin tem `schemas/squad-plugin.schema.json`
 e o frontmatter dos agentes, `schemas/squad-agent.schema.json`), e o editor passa a validar e completar os campos.
 
-Depois de editar um plugin, basta recarregar a página. Os plugins carregados e os avisos (arquivo recusado, valor
-inválido) aparecem no log do bridge, em Configurações > Plugins e em `GET /api/plugins`. Formato completo e regras:
+Depois de editar o conteúdo de um plugin, basta recarregar a página. Os plugins carregados e os avisos (arquivo recusado,
+valor inválido) aparecem no log do bridge, em Configurações > Plugins e em `GET /api/plugins`. Formato completo e regras:
 [docs/plans/plugins-conteudo.md](docs/plans/plugins-conteudo.md).
+
+### Plugins com código
+
+O mesmo `squad-plugin.json` pode trazer, além do conteúdo (ou no lugar dele), código do bridge: um `server.mjs` que exporta
+`register(ctx)`. Com ele um plugin estende o bridge sem alterar o núcleo: rotas próprias em `/api/plugins/<id>/`,
+observadores dos eventos de execução (`run:start`, `run:event`, `run:finish`, `profile:usage`, `workspace:saved`), veto antes
+de uma execução começar (`run:beforeSpawn`) e Adapters novos ou substitutos dos embutidos (`claude`, `codex`).
+
+> **Aviso:** o código de um plugin roda **no processo do bridge, com as permissões da sua conta**. Não é sandbox: um plugin
+> pode ler e gravar arquivos e executar comandos como você. `capabilities` (pedidas pelo manifesto) e `grants` (concedidas por
+> você) são consentimento auditável, não contenção. Instale só código em que você confia.
+
+Só a configuração **local** (`squad.local.json`, ou o arquivo de `SQUAD_CONFIG`) ativa código: um plugin com `server` achado só
+pelo `squad.config.json` fica bloqueado, com aviso. A pasta do plugin vem de `plugins.paths` (relativos ao arquivo que os
+declara), de `SQUAD_PLUGINS` ou de `~/.squad-code/plugins/<id>/` (a pasta leva o nome do id). Depois, em `plugins`:
+
+- `enabled`: ids dos plugins com código que podem rodar (um plugin só de conteúdo não precisa estar aqui); o conteúdo de um
+  plugin com código só entra no catálogo quando o código carregou;
+- `entries.<id>.grants`: capacidades concedidas; sem elas o plugin fica `denied`;
+- `entries.<id>.settings`: valores validados pelo `configSchema` do manifesto (o aviso de erro cita o campo, nunca o valor);
+  segredos entram como nomes de variáveis declaradas em `env`, nunca como valor;
+- `entries.<id>.failClosed`: `true` faz uma falha de `run:beforeSpawn` bloquear a execução (padrão: a execução segue);
+- `hookTimeoutMs`: limite de cada handler de evento (padrão 3000 ms).
+
+```json
+{
+  "plugins": {
+    "paths": ["../meus-plugins/meu-plugin"],
+    "enabled": ["meu-plugin"],
+    "entries": { "meu-plugin": { "grants": [], "settings": {} } }
+  }
+}
+```
+
+| Capacidade | Libera |
+|---|---|
+| `run.mutate` | `ctx.on('run:beforeSpawn', fn)`: vetar uma execução (`{ block: 'motivo' }`, resposta 403) ou acrescentar texto ao system prompt (`{ appendSystem }`) |
+| `run.content` | Prompt e system prompt em `run:start` e `run:beforeSpawn`; o stream completo em `run:event` (e `{ partial: true }` para os `stream_event`); texto de erro e `sessionId` em `run:finish`. Sem ela, o plugin recebe só metadados |
+| `adapter` | `ctx.registerAdapter(kind, impl)`: um motor novo, que roda com ambiente mínimo e sem telemetria nativa |
+| `adapter.override` | Substituir `claude` ou `codex` embutidos (exige também `adapter`) |
+| `workspace.read` | Reservada: pode ser pedida e concedida, mas nenhuma API a entrega ainda |
+
+Exemplo mínimo. `squad-plugin.json`:
+
+```json
+{
+  "id": "meu-plugin",
+  "name": "Meu plugin",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "server": "server.mjs"
+}
+```
+
+`server.mjs`:
+
+```js
+export function register(ctx) {
+  let ultimo = null;
+  ctx.on('run:finish', run => { ultimo = { status: run.status, costUsd: run.costUsd }; });
+  ctx.registerRoute('GET', '/ultimo', () => ({ ultimo }));
+}
+```
+
+Com isso, `GET /api/plugins/meu-plugin/ultimo` responde com a última execução (com o token do bridge, como as demais
+chamadas `/api`). `GET /api/plugins` lista todos os plugins, com o resumo do conteúdo, `hasCode` e o `status` (`active`,
+`data`, `disabled`, `error`, `denied`, `invalid`, `blocked`), as capacidades pedidas, concedidas e faltantes, as rotas, os
+eventos, os Adapters e os avisos. O conteúdo é relido a cada página; mudanças no código exigem reiniciar o bridge
+(`restartRequired` avisa). Detalhes e decisões: [docs/plans/plugins.md](docs/plans/plugins.md) e
+[ADR 0004](docs/adr/0004-plugins-nao-alteram-o-nucleo.md).
 
 ---
 
@@ -392,7 +466,7 @@ inválido) aparecem no log do bridge, em Configurações > Plugins e em `GET /ap
 | `npm start` | Só o bridge (`node server.js`) |
 | `python build.py` | Build completo: regenera `src/avatars.js` (precisa de Pillow) e `index.html`. No macOS/Linux use `python3` |
 | `python build.py --copy` | O mesmo, e também grava uma cópia em `../squad-code-network.html` (fora da pasta do projeto) |
-| `npm test` | Testes do bridge (`node --test`), com um Claude falso: sem custo de API |
+| `npm test` | Testes do bridge, dos adapters e dos plugins (`node --test` sobre `tests/bridge.test.mjs`, `tests/adapters.test.mjs` e `tests/plugins.test.mjs`, em sequência), com Claude e Codex falsos: sem custo de API |
 | `node --test --test-name-pattern "<nome>" tests/bridge.test.mjs` | Roda um único teste do bridge |
 | `node --check src/app.js` | Verificação rápida de sintaxe depois de editar |
 | `node scripts/vendor-three.mjs [versão]` | Regenera `src/vendor/three.min.js` (baixa three + esbuild numa pasta temporária) |
@@ -416,7 +490,10 @@ squad-code-network/
 ├── index.html          # app completo, gerado pelo build (não editar)
 ├── server.js           # bridge local: serve o app e executa claude -p
 ├── db.js               # banco SQLite (workspace, versões, sala, conversas, execuções)
-├── plugins.js          # configuração local e carregador de plugins
+├── plugins.js          # configuração local, descoberta dos plugins e carregador do conteúdo
+├── plugin-host.js      # código dos plugins: carga, ctx, rotas, eventos e Adapters de plugin
+├── adapters/           # registro dos adapters (claude, codex) e funções de cada motor
+├── schemas/            # JSON Schema da configuração, do manifesto dos plugins e dos agentes
 ├── package.json        # scripts npm e a dependência better-sqlite3
 ├── build.py            # build completo (avatares + index.html)
 ├── src/                # código-fonte da interface

@@ -77,10 +77,22 @@ function withoutContent(p) {
 }
 const denied = (cap, raw) => Object.assign(new Error(raw ? cap : `Capacidade "${cap}" não concedida`), { denied: true });
 
+const hashCache = new Map(); // file → { key: size:mtime, hash }
+/** sha1 of a plugin's server file (re-read only when its size or mtime changed). */
+function fileHash(file) {
+  try {
+    const st = fs.statSync(file), key = `${st.size}:${st.mtimeMs}`, hit = hashCache.get(file);
+    if (hit && hit.key === key) return hit.hash;
+    const hash = crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex');
+    hashCache.set(file, { key, hash });
+    return hash;
+  } catch { return ''; }
+}
 /** A signature of the plugins with code discovery found and of what the configuration says, to tell when a restart is needed (content is reread live). */
 function signature(disc) {
   const cfg = disc.config || {};
-  const items = disc.plugins.filter(p => p.hasCode).map(p => [p.id, p.dir, p.source, p.local, p.status || '', p.manifest.version, p.manifest.server, p.manifest.requires, p.manifest.capabilities]);
+  // The code (hash of the server file) and every manifest field that changes how it loads count: a restart is needed when they move.
+  const items = disc.plugins.filter(p => p.hasCode).map(p => [p.id, p.dir, p.source, p.local, p.status || '', p.manifest.version, p.manifest.apiVersion, p.manifest.server, p.manifest.requires, p.manifest.capabilities, p.manifest.env, p.manifest.configSchema, p.serverFile ? fileHash(p.serverFile) : '']);
   return crypto.createHash('sha1').update(JSON.stringify([items, cfg.enabled || [], cfg.entries || {}, cfg.hookTimeoutMs || 0])).digest('hex');
 }
 
@@ -254,6 +266,8 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
     try {
       await withTimeout((async () => {
         const mod = await import(pathToFileURL(r.serverFile).href);
+        // A module with a slow top-level await can come back after the time ran out (or the bridge started closing): never call register then.
+        if (r.frozen || host.closing) throw new Error('o import terminou depois do tempo limite ou do encerramento; register() não foi chamado');
         const reg = mod.register ?? mod.default?.register ?? mod.default;
         if (typeof reg !== 'function') throw new Error('o módulo não exporta register(ctx)');
         r.api = await reg.call(mod.register ? mod : mod.default?.register ? mod.default : undefined, made.ctx);

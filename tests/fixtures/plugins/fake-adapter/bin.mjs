@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Motor de mentira do Adapter x-echo: lê o prompt do stdin e responde em stream-json.
 const args = process.argv.slice(2);
-if (args.includes('--version')) { console.log('x-echo 1.0.0'); process.exit(0); }
+if (args.includes('--version')) { console.log(`x-echo 1.0.0${process.env.SQUAD_TEST_SECRET ? ` VAZOU:${process.env.SQUAD_TEST_SECRET}` : ''}`); process.exit(0); }
 let input = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', d => { input += d; });

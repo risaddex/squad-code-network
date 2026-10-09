@@ -1,8 +1,8 @@
 # Plugins não alteram o núcleo: o núcleo oferece pontos de extensão
 
 Para manter o fork perto do upstream e permitir integrações (novos motores, políticas, observabilidade) sem editar o bridge,
-decidimos que extensões com código entram como **Plugins**: pastas com `squad-plugin.json` e um `register(ctx)`, carregadas pelo
-bridge, que só podem usar o que o `ctx` oferece (rotas sob `/api/plugins/<id>/`, eventos de execução, `run:beforeSpawn`,
+decidimos que extensões com código entram pelos mesmos **Plugins** que já trazem conteúdo: o `squad-plugin.json` pode declarar um
+`server` com `register(ctx)` (além do conteúdo ou no lugar dele), carregado pelo bridge, que só pode usar o que o `ctx` oferece (rotas sob `/api/plugins/<id>/`, eventos de execução, `run:beforeSpawn`,
 `registerAdapter`). Os Adapters embutidos (`claude`, `codex`) passam a viver num registro (`adapters/`) que o `server.js` consulta,
 e um Plugin pode registrar outros. Sem dependências externas: CommonJS no bridge, `import()` dinâmico para o código do plugin,
 validação com o `schema.js` do projeto.
@@ -21,4 +21,6 @@ validação com o `schema.js` do projeto.
 - Plugins com código só são ativados pela configuração **local** (`squad.local.json`); o `squad.config.json` versionado não pode
   fazer o bridge executar código de ninguém.
 - O `ctx` é um contrato público com `apiVersion`; só cresce de forma aditiva.
-- Com zero plugins, o comportamento e as respostas do bridge são os mesmos de antes.
+- Há um só tipo de Plugin, uma só descoberta e um só `GET /api/plugins` para conteúdo e código (`plugins.js` descobre e lê o
+  conteúdo, `plugin-host.js` carrega o código).
+- Sem plugins com código, o comportamento do bridge (rotas, execuções, eventos) é o mesmo de antes.

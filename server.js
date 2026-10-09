@@ -212,13 +212,20 @@ function spawnBin(resolved, args, opts) {
   return spawn(resolved, args, opts);
 }
 
-function binVersion(bin) {
+/** The environment a child of this Adapter gets: the whole one for a built-in, a minimal one (plus its manifest's `env`) for a plugin's. */
+function adapterEnv(impl) {
+  if (!impl || impl.builtin !== false) return process.env;
+  return Object.fromEntries(Object.entries(process.env).filter(([k]) => MIN_ENV_RE.test(k) || (impl.envNames || []).includes(k)));
+}
+// `impl`: the Adapter the executable belongs to; a plugin's is probed with the minimal environment, and the cache keeps the contexts apart.
+function binVersion(bin, impl = null) {
   const name = probeNames.get(bin);
   const resolving = probeFresh(name) ? name.promise : remember(probeNames, bin, resolveBin(bin), () => false);
   return resolving.then(resolved => {
     if (!resolved) return { resolved: null, version: null, error: `Executável "${bin}" não encontrado no PATH.` };
-    const hit = versionCache.get(resolved);
-    return probeFresh(hit) ? hit.promise : remember(versionCache, resolved, probeVersion(resolved), info => !!info.version);
+    const minimal = !!impl && impl.builtin === false, cacheKey = minimal ? `${resolved}\0min\0${(impl.envNames || []).join(',')}` : resolved;
+    const hit = versionCache.get(cacheKey);
+    return probeFresh(hit) ? hit.promise : remember(versionCache, cacheKey, probeVersion(resolved, minimal ? adapterEnv(impl) : null), info => !!info.version);
   });
 }
 /** Keeps `promise` under `key` while pending; once settled, `ok(value)` decides whether it stays for good or for PROBE_RETRY_MS. */
@@ -228,9 +235,9 @@ function remember(map, key, promise, ok) {
   promise.then(v => { hit.pending = false; hit.ok = ok(v); hit.at = Date.now(); });
   return promise;
 }
-function probeVersion(resolved) {
+function probeVersion(resolved, env = null) {
   return new Promise(resolve => {
-    const child = spawnBin(resolved, ['--version'], { windowsHide: true });
+    const child = spawnBin(resolved, ['--version'], { windowsHide: true, ...(env ? { env } : {}) });
     let out = ''; let err = '';
     const timer = setTimeout(() => child.kill(), 15000);
     child.stdout.on('data', d => { out += d; });
@@ -302,7 +309,7 @@ async function profileStatus(p) {
   const impl = registry.get(p.adapter);
   if (!impl) return { resolved: null, version: null, configDirOk: true, error: missingAdapter(p) };
   if (impl.status) return impl.status(p);
-  const info = await binVersion(profileBin(p));
+  const info = await binVersion(profileBin(p), impl);
   let configDirOk = true, error = info.error;
   if (p.configDir) {
     try { configDirOk = fs.statSync(p.configDir).isDirectory(); } catch { configDirOk = false; }
@@ -938,8 +945,7 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
   const { model, effort } = impl.resolveModelEffort({ opts, profile, model: opts.model || profile.model || '', effort: opts.effort || profile.effort || '', warn });
   // An Adapter of a plugin gets a minimal environment (PATH, HOME, locale, temp folders... plus what its manifest declares in `env`);
   // the bridge's own variables (tokens, API keys) stay behind. The built-ins keep the whole environment.
-  const base = impl.builtin === false ? Object.fromEntries(Object.entries(process.env).filter(([k]) => MIN_ENV_RE.test(k) || (impl.envNames || []).includes(k))) : process.env;
-  const env = { ...base, ...(opts.projectRun ? { GIT_CEILING_DIRECTORIES: gitCeiling() } : {}) };
+  const env = { ...adapterEnv(impl), ...(opts.projectRun ? { GIT_CEILING_DIRECTORIES: gitCeiling() } : {}) };
   // Only what the Perfil decides reaches the child: inherited telemetry switches (OTEL_*, CLAUDE_CODE_ENABLE_TELEMETRY,
   // OTEL_LOG_USER_PROMPTS…) are dropped here and nativeTelemetry sets them again when the Perfil turns them on.
   for (const k of Object.keys(env)) if (INHERITED_TELEMETRY.test(k)) delete env[k];
@@ -959,9 +965,10 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
   // run:beforeSpawn (plugins with run.mutate): after the slot was taken, before anything exists to undo (no temp files, no process, not in
   // `runs`, not in the history), so a veto leaves nothing behind and the caller's `release` gives the slot back. Only with a plugin that
   // listens, so without one there is no extra await. parentAlive below stays synchronous with the spawn.
-  // Not for the usage probe of a Perfil (internal.exact / kind 'probe'): it is the bridge's own housekeeping, not an agent's run.
+  // Not for the usage probe of a Perfil (internal.exact, set only by the bridge itself): it is housekeeping, not an agent's run. Never decided
+  // by body.meta, which is the caller's.
   let pluginNotes = [];
-  if (!internal.exact && run.meta.kind !== 'probe' && pluginHost.listens('run:beforeSpawn')) {
+  if (!internal.exact && pluginHost.listens('run:beforeSpawn')) {
     const hook = await pluginHost.beforeSpawn({ runId: id, parentRunId: run.parentRunId, isCall: !!parent, kind: run.meta.kind, project: run.project, projectId: run.meta.projectId, agentId: run.meta.agentId, featureId: run.meta.featureId,
       profile: { id: profile.id, name: profile.name, adapter }, model: model || '', effort: effort || '', tools: opts.tools, permissionMode: opts.permissionMode ?? null, cwd: opts.cwd,
       promptChars: prompt.length, hasSystemPrompt: !!systemPrompt.trim(), agentSlugs: Object.keys(opts.agents || {}), prompt, systemPrompt });
@@ -1260,7 +1267,7 @@ async function handle(req, res) {
       let usable = null;
       for (const p of listProfiles()) {
         if (!registry.has(p.adapter)) continue; // its Adapter is not registered (plugin off): the Perfil cannot run
-        const v = await binVersion(profileBin(p, bin));
+        const v = await binVersion(profileBin(p, bin), registry.get(p.adapter));
         if (v.version) { engines[p.adapter] = true; if (!usable) usable = { adapter: p.adapter, ...v }; }
       }
       if (info.version) engines.claude = true;

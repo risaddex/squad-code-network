@@ -31,11 +31,11 @@ _Avoid_: perfil global, default
 ## Extensão
 
 **Plugin**:
-Pasta fora do repositório com `squad-plugin.json` que estende o SQUAD/CODE sem alterar o núcleo nem o que já está salvo no workspace: conteúdo de catálogo (agentes, categorias, souls, diretrizes, avatares, Temas, padrões de execução), código do bridge (rotas próprias, eventos de execução, veto antes de iniciar uma execução, Adapters) ou os dois. Conteúdo pode vir de qualquer arquivo de configuração; código só é ativado pela Configuração local desta máquina.
-_Avoid_: pacote, extensão (para a pasta), addon, módulo
+Pasta fora do repositório com `squad-plugin.json` que estende o SQUAD/CODE sem alterar o núcleo nem o que já está salvo no workspace: conteúdo de catálogo (agentes, categorias, souls, diretrizes, avatares, Temas, padrões de execução), código do bridge (rotas próprias, eventos de execução, veto antes de iniciar uma execução, Adapters) ou os dois. Conteúdo pode vir de qualquer arquivo de configuração; o código roda no mesmo processo que o bridge, sem sandbox, e só é ativado pela Configuração local desta máquina.
+_Avoid_: extensão (para a pasta), addon, módulo
 
 **Capacidade**:
-Permissão que um Plugin com código pede no manifesto e que a pessoa concede na Configuração local para usar um ponto de extensão sensível (mudar uma execução, registrar um Adapter, ver o conteúdo dos prompts).
+Permissão que um Plugin com código pede no manifesto e que a pessoa concede na Configuração local para usar um ponto de extensão sensível (vetar ou mudar uma execução antes de começar, registrar ou substituir um Adapter, ver o conteúdo dos prompts e do stream).
 _Avoid_: capability, permissão (para o pedido)
 
 **Tema**:
@@ -43,5 +43,5 @@ Paleta da interface e do mapa (cidade e escritório) oferecida por um Plugin e e
 _Avoid_: skin, estilo
 
 **Configuração local**:
-Os arquivos `squad.config.json` (compartilhável) e `squad.local.json` (desta máquina, fora do git) que apontam os Plugins (`plugins.paths` / `plugins.disabled`) e declaram Perfis; o local vence o compartilhado.
+Os arquivos `squad.config.json` (compartilhável) e `squad.local.json` (desta máquina, fora do git) que apontam os Plugins (`plugins.paths` / `plugins.disabled`, e `plugins.enabled` / `plugins.entries` para o código) e declaram Perfis; o local vence o compartilhado, e só o local ativa código.
 _Avoid_: settings, preferências
