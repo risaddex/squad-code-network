@@ -1662,6 +1662,10 @@ body:not(.reduce-motion) .at-tile.leaving,.at-tile.leaving{animation:at-leave .4
 .prof-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .danger-text{color:#e48b7b}
 .prof-confirm{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;padding:10px 12px;border:1px solid #e2614c55;background:#2a111044;font-size:11px;color:#e6c3bc}
+.prof-cfg-error{display:flex;gap:8px;align-items:flex-start;margin:8px 0 0;padding:8px 10px;border:1px solid #e0a84a55;background:#e0a84a10;font-size:11px;line-height:1.5;color:#ead2a6;overflow-wrap:anywhere}
+.prof-cfg-error svg{flex:none;width:13px;height:13px;margin-top:2px}
+.prof-card.cfg-bad{border-left-color:#e0a84a}
+.prof-form-head .tag svg{width:11px;height:11px;margin-right:4px;vertical-align:-1px}
 .prof-confirm span{flex:1;min-width:200px}
 .prof-form{border:1px solid #30c5e833;background:#30c5e806;padding:14px;margin-bottom:12px}
 .prof-form-head .eyebrow{margin-bottom:10px}

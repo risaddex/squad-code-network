@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "squad-plugin.schema.json",
+  "title": "Manifesto de Plugin do SQUAD/CODE (squad-plugin.json)",
+  "description": "Pasta que estende o catálogo (agentes em agents/*.md, categorias, avatares, temas, diretrizes, padrões de execução). O frontmatter dos agentes segue squad-agent.schema.json.",
+  "type": "object",
+  "required": [
+    "id"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Caminho deste schema, para o editor validar o arquivo."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,40}$",
+      "description": "Id único do Plugin."
+    },
+    "name": {
+      "type": "string",
+      "maxLength": 80,
+      "description": "Nome mostrado no app (vazio = o id)."
+    },
+    "version": {
+      "type": "string",
+      "maxLength": 40,
+      "description": "Versão do Plugin."
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 1000,
+      "description": "Descrição."
+    },
+    "categories": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/category"
+      },
+      "description": "Categorias de operadores no Squad Studio (até 30)."
+    },
+    "avatars": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/avatar"
+      },
+      "description": "Avatares (png, jpg, webp; até 1 MB cada, 12 MB no total; até 200)."
+    },
+    "themes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/theme"
+      },
+      "description": "Temas da interface e do mapa (até 20)."
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtime"
+    },
+    "conventions": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Arquivo de diretrizes (.json) dentro do Plugin; padrão conventions.json."
+    }
+  },
+  "$defs": {
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Padrões de execução (as chaves de DEFAULT_RUNTIME do app). Valem para workspaces novos e campos vazios; nunca sobrescrevem o que a pessoa salvou.",
+      "properties": {
+        "permissionMode": {
+          "enum": [
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "manual",
+            "dontAsk",
+            "plan"
+          ],
+          "description": "Modo de permissão do Claude Code."
+        },
+        "model": {
+          "type": "string",
+          "description": "Modelo padrão (alias ou id). Vazio = padrão da CLI.",
+          "anyOf": [
+            {
+              "maxLength": 0
+            },
+            {
+              "pattern": "^[A-Za-z0-9._\\-\\[\\]]{1,80}$"
+            }
+          ]
+        },
+        "effort": {
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "description": "Esforço padrão. Vazio = padrão do modelo."
+        },
+        "maxBudgetUsd": {
+          "description": "Teto de custo por execução em USD: número maior que 0 e até 1000, ou o mesmo como texto decimal simples com até 4 casas (sem sinal, expoente ou espaços). \"\" ou null = sem teto.",
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "maxLength": 0
+            },
+            {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1000
+            },
+            {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,2}(?:\\.[0-9]{1,4})?|0\\.(?=[0-9]{0,3}[1-9])[0-9]{1,4}|1000(?:\\.0{1,4})?)$"
+            }
+          ]
+        },
+        "timeoutSec": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 7200,
+          "description": "Tempo máximo de uma execução, em segundos."
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Execuções simultâneas (teto global)."
+        },
+        "restrictTools": {
+          "type": "boolean",
+          "description": "Usar só as ferramentas do agente (--tools)."
+        },
+        "addDirs": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Pastas extras (--add-dir), lista ou texto separado por vírgula."
+        },
+        "extraAllowedTools": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Ferramentas extras permitidas, lista ou texto separado por vírgula."
+        }
+      }
+    },
+    "category": {
+      "type": "object",
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,40}$",
+          "description": "Key da categoria."
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Rótulo (vazio = a key)."
+        },
+        "icon": {
+          "type": "string",
+          "description": "Ícone (chave de ICONS).",
+          "anyOf": [
+            {
+              "maxLength": 0
+            },
+            {
+              "pattern": "^[a-z0-9-]{1,40}$"
+            }
+          ]
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Descrição."
+        },
+        "before": {
+          "type": "string",
+          "description": "Inserir antes desta categoria (padrão outros).",
+          "anyOf": [
+            {
+              "maxLength": 0
+            },
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,40}$"
+            }
+          ]
+        }
+      }
+    },
+    "avatar": {
+      "type": "object",
+      "required": [
+        "key",
+        "file"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,40}$",
+          "description": "Key do avatar; no app vira plugin:<id>/<key>."
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Rótulo."
+        },
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Imagem dentro do Plugin (png, jpg, jpeg, webp; sem SVG)."
+        }
+      }
+    },
+    "theme": {
+      "type": "object",
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,40}$",
+          "description": "Key do tema; no app vira <id>/<key>."
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Rótulo."
+        },
+        "ui": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Variáveis CSS (--nome) com cores #hex, rgb() ou rgba()."
+        },
+        "city": {
+          "type": "object",
+          "description": "Cores da cidade (bg, build, tree, water, wall: 0xRRGGBB ou \"#rrggbb\") e exposure (0.5..2)."
+        },
+        "office": {
+          "type": "object",
+          "description": "Cores do escritório (chaves de C em city.js)."
+        },
+        "agent": {
+          "type": "object",
+          "description": "Cor dos agentes: { \"blue\": \"#29c8ff\" }."
+        },
+        "run": {
+          "type": "object",
+          "description": "Tons da execução (chaves de RUN_TONE)."
+        }
+      }
+    }
+  }
+}

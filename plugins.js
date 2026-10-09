@@ -8,6 +8,15 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
+// JSON Schemas in schemas/ (schema.js): the shape of the configuration, the manifest and an agent's frontmatter. The checks below
+// stay (paths, realpath, image signatures, limits, colors); the schema adds what they do not cover: an unknown field is a warning,
+// any other schema error refuses the item (a Perfil, category, avatar, theme or agent) with the path of the field.
+const { validate: schemaValidate, formatError, loadSchema } = require('./schema.js');
+const SCHEMAS = { config: loadSchema('squad.schema.json'), plugin: loadSchema('squad-plugin.schema.json'), agent: loadSchema('squad-agent.schema.json') };
+const isUnknown = e => e.keyword === 'additionalProperties';
+const errorsUnder = (errors, prefix) => errors.filter(e => e.path === prefix || e.path.startsWith(prefix + '.') || e.path.startsWith(prefix + '['));
+const relPath = (p, prefix) => p.slice(prefix.length).replace(/^\./, '');
 
 const LIMITS = { plugins: 20, agents: 200, text: 256 * 1024, image: 1024 * 1024, images: 12 * 1024 * 1024, avatars: 200, themes: 20, categories: 30, cssVars: 200 };
 const PLUGIN_ID_RE = /^[a-z0-9][a-z0-9-]{1,40}$/;
@@ -27,10 +36,17 @@ const SUBSET_TEXT = { ...TEXT.conv, content: 8000 };
 // The tools an agent can have: TOOLS in src/app.js (pluginLimits().tools); normalizeWorkspace drops any other name.
 const TOOLS = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', 'WebFetch', 'WebSearch', 'NotebookEdit'];
 const NAME_RE = /^[A-Z0-9][A-Z0-9-]{1,23}$/;
+const ROLE_RE = /^[a-z0-9-]{1,40}$/;
 const SLOTS = ['commander', 'adr', 'prd', 'operator'];
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+// Codex reasoning levels (model_reasoning_effort); server.js takes both lists from here.
+const CODEX_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const ADAPTERS = ['claude', 'codex'];
 const PERMISSION_MODES = ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'];
 const MODEL_RE = /^[A-Za-z0-9._\-\[\]]{1,80}$/;
+// maxBudgetUsd as text: a plain decimal greater than 0 and at most 1000, up to 4 decimal places (no sign, exponent, hex, spaces or
+// leading dot); the lookahead keeps 0.0000 out. The schemas use the same expression.
+const BUDGET_RE = /^(?:[1-9][0-9]{0,2}(?:\.[0-9]{1,4})?|0\.(?=[0-9]{0,3}[1-9])[0-9]{1,4}|1000(?:\.0{1,4})?)$/;
 const ICON_RE = /^[a-z0-9-]{1,40}$/;
 const AVATAR_REF_RE = /^[A-Za-z0-9][A-Za-z0-9:/_-]{0,80}$/;
 const CSS_VAR_RE = /^--[a-z0-9-]{1,40}$/;
@@ -194,8 +210,10 @@ function validateRuntime(value, where, warn) {
       case 'model': typeof v === 'string' && (v === '' || MODEL_RE.test(v)) ? out[k] = v : bad(k); break;
       case 'effort': typeof v === 'string' && (v === '' || EFFORTS.includes(v)) ? out[k] = v : bad(k); break;
       case 'maxBudgetUsd': {
+        // A number in (0, 1000], or the same as text in plain decimal (BUDGET_RE); '' or null = no cap. Same rule as the schema.
         if (v === '' || v === null) { out[k] = ''; break; }
-        const n = Number(v); Number.isFinite(n) && n > 0 && n <= 1000 ? out[k] = String(n) : bad(k); break;
+        const n = typeof v === 'number' ? v : typeof v === 'string' && BUDGET_RE.test(v) ? Number(v) : NaN;
+        Number.isFinite(n) && n > 0 && n <= 1000 ? out[k] = String(n) : bad(k); break;
       }
       case 'timeoutSec': { const n = Number(v); Number.isInteger(n) && n >= 10 && n <= 7200 ? out[k] = n : bad(k); break; }
       case 'concurrency': { const n = Number(v); Number.isInteger(n) && n >= 1 && n <= 8 ? out[k] = n : bad(k); break; }
@@ -256,7 +274,7 @@ function validatePreset(data, body) {
   const slot = field('slot', v => str(v, 20));
   if (!SLOTS.includes(slot)) throw new Error(`slot inválido (${slot || 'vazio'}): use ${SLOTS.join(', ')}`);
   const role = field('role', v => str(v, 40));
-  if (!/^[a-z0-9-]{1,40}$/.test(role)) throw new Error('role ausente ou inválido');
+  if (!ROLE_RE.test(role)) throw new Error('role ausente ou inválido');
   let category = field('category', v => str(v, 41));
   if (slot !== 'operator') category = '';
   else if (!category) category = 'outros';
@@ -354,35 +372,36 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
   const rel = p => { const r = path.relative(root, p); return r && !r.startsWith('..') && !path.isAbsolute(r) ? r : p; };
 
   // `profiles` of one configuration file, merged into profMap by key. Paths: `~` and relative ones resolve against the declaring
-  // file's folder (a bare executable name stays a PATH lookup). A malformed list or entry sets profilesError.
-  function readProfiles(list, file, base, profMap, config, warn) {
+  // file's folder (a bare executable name stays a PATH lookup). Only a list that is not a list sets profilesError (the bridge then
+  // leaves every configured Perfil as it is); an item without a valid key is ignored with a warning; an item with a valid key and an
+  // invalid field (schema) is marked `invalid`: the bridge keeps cfg-<key> as it was, or does not create it.
+  function readProfiles(list, file, base, profMap, config, warn, errors) {
     const where = rel(file);
-    if (!Array.isArray(list)) { warn(`${where}: "profiles" deve ser uma lista`); config.profilesError = true; return; }
+    if (!Array.isArray(list)) { warn(`${where}: "profiles" deve ser uma lista`); config.profilesError = true; config.errorFiles.push(file); return; }
     const seen = new Set();
     for (const [i, raw] of list.entries()) {
-      if (!isObj(raw)) { warn(`${where}: profiles[${i}] deve ser um objeto`); config.profilesError = true; continue; }
+      const at = `profiles[${i}]`, errs = errorsUnder(errors, at);
+      if (!isObj(raw)) { warn(`${where}: ${at} deve ser um objeto; ignorado`); continue; }
       const key = typeof raw.key === 'string' ? raw.key.trim() : '';
-      if (!PROFILE_KEY_RE.test(key)) { warn(`${where}: profiles[${i}]: "key" ausente ou inválida (${String(raw.key ?? '').slice(0, 40) || 'vazia'}; use a-z, 0-9 e hífen)`); config.profilesError = true; continue; }
-      if (seen.has(key)) { warn(`${where}: Perfil ${key} repetido no mesmo arquivo`); config.profilesError = true; continue; }
+      if (!PROFILE_KEY_RE.test(key)) { warn(`${where}: ${at}: "key" ausente ou inválida (${String(raw.key ?? '').slice(0, 40) || 'vazia'}; use a-z, 0-9 e hífen); ignorado`); continue; }
+      const entry = profMap.get(key) || { key, fields: {}, source: '', files: [], invalid: [] };
+      const bad = msg => { const m = `${where}: Perfil ${key}: ${msg}`; warn(m); entry.invalid.push(m); };
+      if (seen.has(key)) bad('repetido no mesmo arquivo');
+      else if (!profMap.has(key) && profMap.size >= MAX_CONFIG_PROFILES) bad(`passa do limite de ${MAX_CONFIG_PROFILES} Perfis`);
+      else {
+        for (const e of errs) if (isUnknown(e)) warn(`${where}: Perfil ${key}: campo "${relPath(e.path, at)}" desconhecido, ignorado`);
+        for (const e of errs) if (!isUnknown(e)) bad(`${relPath(e.path, at)}: ${e.message}`);
+      }
       seen.add(key);
-      if (!profMap.has(key) && profMap.size >= MAX_CONFIG_PROFILES) { warn(`${where}: mais de ${MAX_CONFIG_PROFILES} Perfis: ${key} ignorado`); config.profilesError = true; continue; }
-      const entry = profMap.get(key) || { key, fields: {}, source: '', files: [] };
-      for (const [k, v] of Object.entries(raw)) {
-        if (k === 'key') continue;
-        if (!PROFILE_FIELDS.includes(k)) { warn(`${where}: Perfil ${key}: campo "${k}" desconhecido, ignorado`); continue; }
-        if ((k === 'configDir' || (k === 'bin' && /[\\/]|^~|^\./.test(v))) && typeof v === 'string' && v.trim()) entry.fields[k] = expand(v, base);
-        else if (k === 'telemetry') {
+      if (!entry.invalid.length) {
+        for (const k of PROFILE_FIELDS) {
+          if (!Object.hasOwn(raw, k)) continue;
+          const v = raw[k];
+          if ((k === 'configDir' || (k === 'bin' && /[\\/]|^~|^\./.test(v))) && typeof v === 'string' && v.trim()) entry.fields[k] = expand(v, base);
           // Only the switches validateProfile takes (secrets never live in a Perfil: headers are bridge settings, by variable name).
-          if (!isObj(v)) { warn(`${where}: Perfil ${key}: "telemetry" deve ser um objeto {enabled, native, content}, ignorado`); continue; }
-          const t = {};
-          for (const [tk, tv] of Object.entries(v)) {
-            if (!TELEMETRY_KEYS.includes(tk)) warn(`${where}: Perfil ${key}: campo "telemetry.${tk}" desconhecido, ignorado`);
-            else if (typeof tv !== 'boolean') warn(`${where}: Perfil ${key}: "telemetry.${tk}" deve ser true ou false, ignorado`);
-            else t[tk] = tv;
-          }
-          entry.fields.telemetry = { ...(entry.fields.telemetry || {}), ...t };
+          else if (k === 'telemetry') entry.fields.telemetry = { ...(entry.fields.telemetry || {}), ...Object.fromEntries(TELEMETRY_KEYS.filter(t => Object.hasOwn(v, t)).map(t => [t, v[t]])) };
+          else entry.fields[k] = v;
         }
-        else entry.fields[k] = v;
       }
       entry.source = file;
       if (!entry.files.includes(file)) entry.files.push(file);
@@ -398,10 +417,13 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
     const warn = msg => { if (warnings.length < 200) warnings.push(msg); };
 
     /* configuration: squad.config.json, then squad.local.json (or SQUAD_CONFIG), then SQUAD_PLUGINS */
-    const cfgFiles = [path.join(root, 'squad.config.json'), env.SQUAD_CONFIG ? path.resolve(cwd, env.SQUAD_CONFIG) : path.join(root, 'squad.local.json')];
+    // SQUAD_CONFIG_SHARED replaces squad.config.json and SQUAD_CONFIG replaces squad.local.json (tests, other setups).
+    const cfgFiles = [env.SQUAD_CONFIG_SHARED ? path.resolve(cwd, env.SQUAD_CONFIG_SHARED) : path.join(root, 'squad.config.json'), env.SQUAD_CONFIG ? path.resolve(cwd, env.SQUAD_CONFIG) : path.join(root, 'squad.local.json')];
     // profiles: merged by key across the files (a later file overrides field by field); profilesError: some file or entry could not be
     // read, so the bridge leaves the configured Perfis as they are instead of removing what it no longer sees.
-    const config = { files: [], paths: [], disabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: false };
+    // localFile: where a new defaultProfile is written when no file declares one; hashes: sha1 of each file as read (the bridge refuses
+    // to write over a file changed since); profileWarnings: the warnings about profiles/defaultProfile (shown in the PERFIS tab).
+    const config = { files: [], paths: [], disabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: false, errorFiles: [], localFile: cfgFiles[1], hashes: {}, profileWarnings: [] };
     const profMap = new Map();
     let cfgRuntime = {};
     const addPlugin = p => { if (!config.paths.includes(p)) config.paths.push(p); };
@@ -409,12 +431,18 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
       track(file);
       let text;
       try { text = fs.readFileSync(file, 'utf8'); }
-      catch (e) { if (e.code !== 'ENOENT' || (idx === 1 && env.SQUAD_CONFIG)) { warn(`${rel(file)}: não foi possível ler (${e.code || e.message})`); config.profilesError = true; } continue; }
+      // A missing file only has no Perfis; one that exists but cannot be read leaves the configured Perfis as they are.
+      catch (e) { if (e.code !== 'ENOENT' || (idx === 1 && env.SQUAD_CONFIG)) warn(`${rel(file)}: não foi possível ler (${e.code || e.message})`); if (e.code !== 'ENOENT') { config.profilesError = true; config.errorFiles.push(file); } continue; }
+      config.hashes[file] = crypto.createHash('sha1').update(text).digest('hex');
       let data;
-      try { data = JSON.parse(text.replace(/^﻿/, '')); } catch (e) { warn(`${rel(file)}: JSON inválido, arquivo ignorado (${e.message})`); config.profilesError = true; continue; }
-      if (!isObj(data)) { warn(`${rel(file)}: deve ser um objeto JSON, arquivo ignorado`); config.profilesError = true; continue; }
+      try { data = JSON.parse(text.replace(/^﻿/, '')); } catch (e) { warn(`${rel(file)}: JSON inválido, arquivo ignorado (${e.message})`); config.profilesError = true; config.errorFiles.push(file); continue; }
+      if (!isObj(data)) { warn(`${rel(file)}: deve ser um objeto JSON, arquivo ignorado`); config.profilesError = true; config.errorFiles.push(file); continue; }
       config.files.push(file);
       const base = path.dirname(file);
+      // The schema's top-level errors other than unknown fields are reported by the checks below (plugins, runtime...), with their messages.
+      const errors = schemaValidate(SCHEMAS.config, data);
+      for (const e of errors) if (isUnknown(e) && (!/[.[]/.test(e.path) || /^plugins\.[^.[]+$/.test(e.path))) warn(`${rel(file)}: campo "${e.path}" desconhecido, ignorado`);
+      const pwarn = msg => { warn(msg); config.profileWarnings.push(msg); };
       if (data.plugins !== undefined) {
         if (!isObj(data.plugins)) warn(`${rel(file)}: "plugins" deve ser um objeto com "paths" e "disabled"`);
         else {
@@ -429,15 +457,15 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
           }
         }
       }
-      if (data.profiles !== undefined) readProfiles(data.profiles, file, base, profMap, config, warn);
+      if (data.profiles !== undefined) readProfiles(data.profiles, file, base, profMap, config, pwarn, errors);
       if (data.defaultProfile !== undefined) {
         const d = typeof data.defaultProfile === 'string' ? data.defaultProfile.trim() : '';
         if (d && d.length <= 100) { config.defaultProfile = d; config.defaultProfileFile = file; }
-        else warn(`${rel(file)}: "defaultProfile" deve ser a key de um Perfil da configuração ou o id de um Perfil`);
+        else pwarn(`${rel(file)}: "defaultProfile" deve ser a key de um Perfil da configuração ou o id de um Perfil`);
       }
       cfgRuntime = { ...cfgRuntime, ...validateRuntime(data.runtime, rel(file), warn) };
     }
-    config.profiles = [...profMap.values()].map(e => ({ key: e.key, ...e.fields, source: e.source, files: e.files }));
+    config.profiles = [...profMap.values()].map(e => ({ key: e.key, ...e.fields, source: e.source, files: e.files, ...(e.invalid.length ? { invalid: e.invalid } : {}) }));
     for (const p of String(env.SQUAD_PLUGINS || '').split(path.delimiter).map(s => s.trim()).filter(Boolean)) addPlugin(expand(p, cwd));
 
     /* plugins */
@@ -482,6 +510,15 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
       const dup = plugins.find(p => p.id === id);
       if (dup) { warn(`${label}: id ${id} repetido (já carregado de ${rel(dup.path)}); plugin ignorado`); continue; }
       tag = `[${id}]`;
+      const metaErrors = schemaValidate(SCHEMAS.plugin, meta);
+      for (const e of metaErrors) if (isUnknown(e) && !/[.[]/.test(e.path)) warn(at('squad-plugin.json', `campo "${e.path}" desconhecido, ignorado`));
+      // An item that passed the checks below still goes through its schema: unknown field = warning, anything else refuses it.
+      const schemaItem = (list, i) => {
+        const p = `${list}[${i}]`, errs = errorsUnder(metaErrors, p);
+        for (const e of errs) if (isUnknown(e)) warn(at('squad-plugin.json', `${e.path}: campo desconhecido, ignorado`));
+        const hard = errs.find(e => !isUnknown(e));
+        if (hard) throw new Error(formatError(hard));
+      };
       const plugin = { id, name: '', version: '', description: '', path: realRoot, categories: [], presets: [], avatars: [], themes: [], conventions: null, runtime: {} };
       try { plugin.name = str(meta.name, 80) || id; plugin.version = str(meta.version, 40); plugin.description = str(meta.description, 1000); }
       catch (e) { warn(at('squad-plugin.json', `name/version/description: ${e.message}`)); plugin.name = plugin.name || id; }
@@ -492,18 +529,19 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
         if (meta[k].length > max) warn(at('squad-plugin.json', `mais de ${max} itens em "${k}": os excedentes foram ignorados`));
         return meta[k].slice(0, max);
       };
-      for (const c of listOf('categories', LIMITS.categories)) {
-        try { const cat = validateCategory(c); if (plugin.categories.some(x => x.key === cat.key)) throw new Error(`categoria ${cat.key} repetida`); plugin.categories.push(cat); }
+      for (const [i, c] of listOf('categories', LIMITS.categories).entries()) {
+        try { const cat = validateCategory(c); schemaItem('categories', i); if (plugin.categories.some(x => x.key === cat.key)) throw new Error(`categoria ${cat.key} repetida`); plugin.categories.push(cat); }
         catch (e) { warn(at('squad-plugin.json', e.message)); }
       }
       let imageBytes = 0;
-      for (const a of listOf('avatars', LIMITS.avatars)) {
+      for (const [i, a] of listOf('avatars', LIMITS.avatars).entries()) {
         try {
           if (!isObj(a)) throw new Error('avatar deve ser um objeto');
           const key = String(a.key || '');
           if (!KEY_RE.test(key)) throw new Error(`key de avatar inválida: ${key.slice(0, 40)}`);
           if (plugin.avatars.some(x => x.key === `plugin:${id}/${key}`)) throw new Error(`avatar ${key} repetido`);
           if (typeof a.file !== 'string' || !a.file) throw new Error(`avatar ${key} sem "file"`);
+          schemaItem('avatars', i);
           let buf;
           try { buf = read(a.file, LIMITS.image, IMAGE_EXTS); } catch (e) { throw new Error(`${a.file}: ${e.message}`); }
           const mime = imageMime(buf);
@@ -513,9 +551,10 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
           plugin.avatars.push({ key: `plugin:${id}/${key}`, label: str(a.label, 60) || key.toUpperCase(), src: `data:${mime};base64,${buf.toString('base64')}` });
         } catch (e) { warn(at('squad-plugin.json', e.message)); }
       }
-      for (const t of listOf('themes', LIMITS.themes)) {
+      for (const [i, t] of listOf('themes', LIMITS.themes).entries()) {
         try {
           const theme = validateTheme(t, `${tag} squad-plugin.json`, warn);
+          schemaItem('themes', i);
           theme.key = `${id}/${theme.key}`;
           if (plugin.themes.some(x => x.key === theme.key)) throw new Error(`tema ${t.key} repetido`);
           plugin.themes.push(theme);
@@ -545,7 +584,12 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
           const { data, body } = parseFrontmatter(read(file, LIMITS.text, ['.md']).toString('utf8'));
           // A repeated name is not decided here: only the page knows ROLES and the built-in names, so every valid candidate goes
           // and the page keeps the first one it accepts (pluginPresets in src/app.js).
-          plugin.presets.push(validatePreset(data, body));
+          const preset = validatePreset(data, body);
+          const agentErrors = schemaValidate(SCHEMAS.agent, data);
+          for (const e of agentErrors) if (isUnknown(e)) warn(at(file, `campo "${e.path}" desconhecido, ignorado`));
+          const hard = agentErrors.find(e => !isUnknown(e));
+          if (hard) throw new Error(formatError(hard));
+          plugin.presets.push(preset);
         } catch (e) { warn(at(file, /agente ignorado$/.test(e.message) ? e.message : `${e.message}; agente ignorado`)); }
       }
       plugins.push(plugin);
@@ -557,7 +601,10 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
     cache = { sigs, result: { page, api, count: plugins.length } };
     return cache.result;
   }
-  return { load };
+  // invalidate(): the next load() rereads everything (the bridge calls it after writing a configuration file: the mtime may not move).
+  return { load, invalidate: () => { cache = null; } };
 }
 
-module.exports = { createPluginLoader, parseFrontmatter, LIMITS };
+// The constants the schemas repeat (tests/bridge.test.mjs checks that schemas/*.json match them).
+const CONSTANTS = { BUDGET_RE, PLUGIN_ID_RE, KEY_RE, CONV_ID_RE, NAME_RE, ROLE_RE, MODEL_RE, TOOLS, ICON_RE, AVATAR_REF_RE, PROFILE_KEY_RE, SLOTS, EFFORTS, CODEX_EFFORTS, ADAPTERS, PERMISSION_MODES, PROFILE_FIELDS, TELEMETRY_KEYS };
+module.exports = { createPluginLoader, parseFrontmatter, validateRuntime, LIMITS, CONSTANTS, SCHEMAS };

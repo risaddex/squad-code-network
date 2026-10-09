@@ -120,8 +120,11 @@ goes through a Perfil (row in `profiles`, outside the workspace): an instance of
 / `CODEX_HOME`), model/effort defaults, concurrency cap and Perfil reserva. Agents keep only `profileId`; `settings.runtime.
 forceProfileId` overrides them. Codex colleagues are called through the bridge's own MCP endpoint (`/mcp`, per-run token). Usage
 (tokens per run, `usage_daily`, 5h/7d windows) feeds Configurações > Perfis and the Painel. Perfis can also be declared in the
-local config (`profiles`/`defaultProfile`): synced as read-only `cfg-<key>` rows (removed when they leave the file, usage kept by
-id), and runs wait for a pending sync before picking a Perfil.
+local config (`profiles`/`defaultProfile`): synced as `cfg-<key>` rows (removed when they leave the file, usage kept by
+id), and runs wait for a pending sync before picking a Perfil. Editing, deleting or making default a config Perfil from the UI writes
+back to the file that declared it (highest precedence; one `configOp` queue, hash re-check, `.bak`, temp + rename, mode kept); an
+invalid item only freezes that Perfil. Config, plugin manifest and agent frontmatter are validated by `schemas/*.schema.json` through
+`schema.js` (dependency-free subset of JSON Schema; a test keeps schema patterns/enums equal to the code constants).
 
 **`src/app.js` (state, UI, orchestration).**
 - One persisted `state` object (localStorage key `squad-code.network.v2`, export/import as JSON). Served by the bridge, the database

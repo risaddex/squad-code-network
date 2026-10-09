@@ -3,7 +3,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync, realpathSync, symlinkSync, statSync, lstatSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -35,7 +35,7 @@ let server, token, nextPort = PORT + 1;
 async function startBridge(dataDir, port = nextPort++, extraEnv = {}) {
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js'), '--port', String(port)], {
     cwd: workdir,
-    env: { ...process.env, TEMP: tempRoot, TMP: tempRoot, TMPDIR: tempRoot, SQUAD_HOME: home, SQUAD_PROJECTS_DIR: projectsRoot, SQUAD_DATA_DIR: dataDir, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_CODEX_BIN: path.join(ROOT, 'tests', 'fake-codex.mjs'), FAKE_CODEX_LOG: codexLog, SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: emptyConfig, SQUAD_PLUGINS: '', ...extraEnv },
+    env: { ...process.env, TEMP: tempRoot, TMP: tempRoot, TMPDIR: tempRoot, SQUAD_HOME: home, SQUAD_PROJECTS_DIR: projectsRoot, SQUAD_DATA_DIR: dataDir, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_CODEX_BIN: path.join(ROOT, 'tests', 'fake-codex.mjs'), FAKE_CODEX_LOG: codexLog, SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: emptyConfig, SQUAD_CONFIG_SHARED: path.join(configRoot, 'no-shared.json'), SQUAD_PLUGINS: '', ...extraEnv },
   });
   let out = '';
   const tok = await new Promise((resolve, reject) => {
@@ -627,8 +627,8 @@ test('plugins from the local config and SQUAD_PLUGINS are loaded, validated and 
   assert.ok(!JSON.stringify(listed).includes('base64'));
   assert.deepEqual(listed.config.files, [cfg]);
   assert.deepEqual(listed.config.disabled, ['off']);
-  assert.deepEqual(listed.config.profiles, []); // no key: refused with a warning, and the configured Perfis stay as they are
-  assert.equal(listed.config.profilesError, true);
+  assert.deepEqual(listed.config.profiles, []); // no key: ignored with a warning; the other items would still sync
+  assert.equal(listed.config.profilesError, false);
   assert.match(listed.warnings.join('\n'), /profiles\[0\]: "key" ausente ou inválida/);
   assert.ok(listed.config.paths.includes(path.join(root, 'good')) && listed.config.paths.includes(path.join(root, 'envplugin')));
   assert.equal((await (await b.api('/api/health')).json()).plugins, 5);
@@ -1111,7 +1111,7 @@ test('codex session files: a symlink anywhere under CODEX_HOME/sessions is not f
   await b.stop();
 });
 
-test('Perfis da configuração: criados como cfg-<key>, só leitura na API, removidos ao sair, defaultProfile e reserva por key', async () => {
+test('Perfis da configuração: criados como cfg-<key>, removidos ao sair, defaultProfile e reserva por key', async () => {
   const root = tmp('squad-cfgpf-'); extraDirs.push(root);
   const shared = path.join(root, 'shared'), local = path.join(root, 'local');
   mkdirSync(path.join(shared, 'contas', 'work'), { recursive: true }); mkdirSync(path.join(local, 'pessoal'), { recursive: true });
@@ -1142,13 +1142,7 @@ test('Perfis da configuração: criados como cfg-<key>, só leitura na API, remo
   assert.match(body.configWarnings.join('\n'), /codex-x .*mesmo Adapter.*Ficou sem reserva/);
   assert.equal(byId['claude-default'].isDefault, false);
 
-  // Read-only through the API (409); test and refresh still work; a manual Perfil may use a config key as its reserve.
-  for (const [p, m] of [['', 'PUT'], ['', 'DELETE'], ['/default', 'POST']]) {
-    const res = await b.api(`/api/profiles/cfg-pessoal${p}`, { method: m, body: m === 'PUT' ? JSON.stringify({ concurrency: 4 }) : undefined });
-    assert.equal(res.status, 409, `${m} ${p}`);
-    assert.match((await res.json()).error, /squad\.local\.json/);
-  }
-  assert.equal((await b.api('/api/profiles/claude-default/default', { method: 'POST' })).status, 409); // the file chose the default
+  // Test still works; a manual Perfil may use a config key as its reserve (writing back to the file: its own test).
   assert.equal((await (await b.api('/api/profiles/cfg-trabalho/test', { method: 'POST' })).json()).ok, true);
   const manual = await newProfile(b, { name: 'Manual', adapter: 'claude', fallbackId: 'trabalho' });
   assert.equal(manual.fallbackId, 'cfg-trabalho');
@@ -1181,7 +1175,8 @@ test('Perfis da configuração: criados como cfg-<key>, só leitura na API, remo
   assert.equal(byId['cfg-trabalho'].isDefault, true);
   assert.equal(body.configDefault, '');
   const w = body.configWarnings.join('\n');
-  assert.match(w, /trabalho .*Teto de execuções.*Mantido como estava/);
+  assert.match(w, /squad\.local\.json: Perfil trabalho: concurrency: deve ser no máximo 10/);
+  assert.deepEqual(byId['cfg-trabalho'].configError.length, 1);
   assert.match(w, /defaultProfile.*nao-existe.*mantido/);
 
   // Leaving the configuration: removed (the default falls back to Claude (padrão)); usage stays under the id; coming back relinks it.
@@ -1218,7 +1213,8 @@ test('Perfis da configuração: squad.config.json + squad.local.json mesclados p
   const root = tmp('squad-cfgmerge-'); extraDirs.push(root);
   writeFileSync(path.join(root, 'squad.config.json'), JSON.stringify({
     profiles: [
-      { key: 'trabalho', name: 'Claude trabalho', adapter: 'claude', configDir: 'contas/work', model: 'sonnet', telemetry: { enabled: true, native: true, headers: { Authorization: 'OTEL_TOKEN' }, content: 'sim' } },
+      { key: 'trabalho', name: 'Claude trabalho', adapter: 'claude', configDir: 'contas/work', model: 'sonnet', telemetry: { enabled: true, native: true, headers: { Authorization: 'OTEL_TOKEN' } } },
+      { key: 'ruim', name: 'Ruim', adapter: 'claude', telemetry: { content: 'sim' } },
       { key: 'so-shared', name: 'Shared', adapter: 'codex', bin: './bin/codex' },
     ],
     defaultProfile: 'so-shared',
@@ -1241,7 +1237,9 @@ test('Perfis da configuração: squad.config.json + squad.local.json mesclados p
   const warned = out.warnings.join('\n');
   assert.match(warned, /campo "segredo" desconhecido/);
   assert.match(warned, /campo "telemetry\.headers" desconhecido/);
-  assert.match(warned, /"telemetry\.content" deve ser true ou false/);
+  assert.match(warned, /Perfil ruim: telemetry\.content: deve ser true ou false/);
+  assert.equal(byKey.ruim.invalid.length, 1); // an invalid field marks the item (kept as it was by the bridge)
+  assert.equal(byKey.ruim.name, undefined);
   assert.ok(!JSON.stringify(out.config).includes('OTEL_TOKEN'));
 });
 
@@ -1264,4 +1262,335 @@ test('Perfis da configuração: prontos antes da primeira execução (setup e re
   list = await profilesOf(b2);
   assert.ok(list.some(p => p.id === 'cfg-trabalho'));
   await b2.stop();
+});
+
+const readJson = f => JSON.parse(readFileSync(f, 'utf8'));
+test('Perfis da configuração: editar, tornar padrão e excluir gravam no arquivo de origem', async () => {
+  const root = tmp('squad-cfgwrite-'); extraDirs.push(root);
+  const shared = path.join(root, 'shared.json'), local = path.join(root, 'local.json');
+  writeFileSync(shared, JSON.stringify({ profiles: [{ key: 'dupla', name: 'Dupla', adapter: 'claude', model: 'sonnet' }] }, null, 4));
+  writeFileSync(local, JSON.stringify({
+    $schema: './schemas/squad.schema.json', plugins: { paths: [] },
+    profiles: [{ key: 'trabalho', name: 'Claude trabalho', adapter: 'claude', model: 'sonnet' }, { key: 'pessoal', name: 'Claude pessoal', adapter: 'claude' }, { key: 'dupla', concurrency: 3 }],
+  }));
+  const b = await setupBridge({ SQUAD_CONFIG: local, SQUAD_CONFIG_SHARED: shared });
+  const get = async () => (await (await b.api('/api/profiles')).json());
+  let body = await get();
+  assert.deepEqual(body.configWarnings, []); // $schema is accepted
+  assert.deepEqual(body.profiles.find(p => p.id === 'cfg-dupla').configFiles, ['shared.json', 'local.json']);
+  assert.equal(body.configDefaultTarget, 'local.json');
+  const put = (id, data) => b.api(`/api/profiles/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+
+  // Edit: only the changed fields go into that key's item, the rest of the file stays; .bak copy; 2 spaces + \n.
+  const before = readFileSync(local, 'utf8');
+  let res = await put('cfg-trabalho', { name: 'Claude trabalho', adapter: 'claude', model: 'opus', concurrency: 4, threshold: 90 });
+  assert.equal(res.status, 200, await res.clone().text());
+  let out = await res.json();
+  assert.deepEqual(out.changed.sort(), ['concurrency', 'model']);
+  assert.equal(out.file, 'local.json');
+  assert.deepEqual([out.profile.model, out.profile.concurrency], ['opus', 4]);
+  const text = readFileSync(local, 'utf8');
+  assert.ok(text.endsWith('\n') && text.includes('\n  "profiles": ['));
+  let data = JSON.parse(text);
+  assert.equal(data.$schema, './schemas/squad.schema.json'); assert.deepEqual(data.plugins, { paths: [] });
+  assert.deepEqual(data.profiles[0], { key: 'trabalho', name: 'Claude trabalho', adapter: 'claude', model: 'opus', concurrency: 4 });
+  assert.equal(readFileSync(local + '.bak', 'utf8'), before);
+  // Invalid values are refused before writing.
+  assert.equal((await put('cfg-trabalho', { concurrency: 99 })).status, 400);
+  assert.equal((await put('cfg-trabalho', { effort: 'minimal' })).status, 400);
+  assert.equal(readFileSync(local, 'utf8'), text);
+  // A key declared in two files: edits go to the one of highest precedence (local); the shared one is untouched.
+  const sharedText = readFileSync(shared, 'utf8');
+  assert.equal((await put('cfg-dupla', { concurrency: 5 })).status, 200);
+  assert.deepEqual(readJson(local).profiles[2], { key: 'dupla', concurrency: 5 });
+  assert.equal(readFileSync(shared, 'utf8'), sharedText);
+  // A file changed by hand since the bridge read it: 409; after a read (GET), it goes.
+  writeFileSync(local, readFileSync(local, 'utf8') + ' ');
+  res = await put('cfg-pessoal', { model: 'haiku' });
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /local\.json mudou desde a última leitura/);
+  await get();
+  assert.equal((await put('cfg-pessoal', { model: 'haiku' })).status, 200);
+
+  // Tornar padrão: no file declares defaultProfile, so it goes to the local one (SQUAD_CONFIG); a manual Perfil goes by id.
+  res = await b.api('/api/profiles/cfg-pessoal/default', { method: 'POST' });
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.equal(readJson(local).defaultProfile, 'pessoal');
+  body = await get();
+  assert.equal(body.profiles.find(p => p.isDefault).id, 'cfg-pessoal');
+  assert.equal(body.configDefault, 'local.json');
+  const manual = await newProfile(b, { name: 'Manual', adapter: 'claude' });
+  assert.equal((await b.api(`/api/profiles/${manual.id}/default`, { method: 'POST' })).status, 200);
+  assert.equal(readJson(local).defaultProfile, manual.id);
+  assert.equal((await get()).profiles.find(p => p.isDefault).id, manual.id);
+  // A Perfil created in the app stays in the database.
+  assert.equal(readJson(local).profiles.length, 3);
+
+  // Delete: removed from its file; refused for a key that another file also declares, and for the default.
+  res = await b.api('/api/profiles/cfg-dupla', { method: 'DELETE' });
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /também está declarado em shared\.json.*continuaria vindo de lá/);
+  assert.equal((await b.api('/api/profiles/cfg-pessoal/default', { method: 'POST' })).status, 200);
+  assert.equal((await b.api('/api/profiles/cfg-pessoal', { method: 'DELETE' })).status, 409);
+  res = await b.api('/api/profiles/cfg-trabalho', { method: 'DELETE' });
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.deepEqual(readJson(local).profiles.map(p => p.key), ['pessoal', 'dupla']);
+  assert.equal((await get()).profiles.some(p => p.id === 'cfg-trabalho'), false);
+  await b.stop();
+});
+
+test('Perfis da configuração: item inválido não trava os outros; o Perfil fica como estava e o aviso cita arquivo, key e campo', async () => {
+  const root = tmp('squad-cfgitem-'); extraDirs.push(root);
+  const cfg = path.join(root, 'squad.local.json');
+  writeFileSync(cfg, JSON.stringify({ profiles: [{ key: 'ok1', name: 'Ok 1', adapter: 'claude' }, { key: 'ruim', name: 'Ruim', adapter: 'claude', model: 'sonnet' }] }));
+  const b = await setupBridge({ SQUAD_CONFIG: cfg });
+  const get = async () => (await (await b.api('/api/profiles')).json());
+  let body = await get();
+  assert.deepEqual(body.profiles.filter(p => p.source === 'config').map(p => p.id).sort(), ['cfg-ok1', 'cfg-ruim']);
+  writeFileSync(cfg, JSON.stringify({ profiles: [
+    { key: 'Bad Key', name: 'X', adapter: 'claude' },
+    { key: 'ok1', name: 'Ok 1', adapter: 'claude', model: 'opus' },
+    { key: 'ruim', name: 'Ruim 2', adapter: 'claude', effort: 'turbo' },
+    { key: 'nova', name: 'Nova', adapter: 'gemini' },
+    { key: 'mais', name: 'Mais', adapter: 'claude' },
+  ] }));
+  body = await get();
+  const byId = Object.fromEntries(body.profiles.map(p => [p.id, p]));
+  assert.equal(byId['cfg-ok1'].model, 'opus'); // the others sync
+  assert.ok(byId['cfg-mais']);
+  assert.deepEqual([byId['cfg-ruim'].name, byId['cfg-ruim'].model], ['Ruim', 'sonnet']); // left as it was, not removed
+  assert.match(byId['cfg-ruim'].configError.join('\n'), /squad\.local\.json: Perfil ruim: effort: valor "turbo" não aceito/);
+  assert.equal(byId['cfg-nova'], undefined); // not created
+  const w = body.configWarnings.join('\n');
+  assert.match(w, /profiles\[0\]: "key" ausente ou inválida \(Bad Key/);
+  assert.match(w, /Perfil nova: adapter: valor "gemini" não aceito/);
+  // Writing to an invalid item is refused until the file is fixed.
+  const res = await b.api('/api/profiles/cfg-ruim', { method: 'PUT', body: JSON.stringify({ model: 'opus' }) });
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /formato inválido/);
+  await b.stop();
+});
+
+test('schemas: patterns e enums iguais às constantes do código; o validador cobre o subconjunto usado', () => {
+  const req = createRequire(import.meta.url);
+  const { CONSTANTS: C, SCHEMAS } = req('../plugins.js');
+  const { validate, formatError } = req('../schema.js');
+  const pat = node => node.pattern ?? node.anyOf?.find(x => x.pattern)?.pattern;
+  const same = (node, re, label) => assert.equal(pat(node), re.source, label);
+  const cfg = SCHEMAS.config, prof = cfg.$defs.profile.properties, plugin = SCHEMAS.plugin, agent = SCHEMAS.agent.properties;
+  same(prof.key, C.PROFILE_KEY_RE, 'profile.key'); same(prof.model, C.MODEL_RE, 'profile.model');
+  assert.deepEqual(prof.adapter.enum, C.ADAPTERS);
+  assert.deepEqual(new Set(prof.effort.enum), new Set(['', ...C.EFFORTS, ...C.CODEX_EFFORTS]));
+  assert.deepEqual(Object.keys(prof).sort(), ['key', ...C.PROFILE_FIELDS].sort());
+  assert.deepEqual(Object.keys(prof.telemetry.properties), C.TELEMETRY_KEYS);
+  for (const rt of [cfg.$defs.runtime, plugin.$defs.runtime]) {
+    assert.deepEqual(rt.properties.permissionMode.enum, C.PERMISSION_MODES);
+    assert.deepEqual(rt.properties.effort.enum, ['', ...C.EFFORTS]);
+    same(rt.properties.model, C.MODEL_RE, 'runtime.model');
+  }
+  assert.deepEqual(cfg.$defs.runtime, plugin.$defs.runtime);
+  same(plugin.properties.id, C.PLUGIN_ID_RE, 'plugin.id');
+  for (const d of ['category', 'avatar', 'theme']) same(plugin.$defs[d].properties.key, C.KEY_RE, `${d}.key`);
+  same(plugin.$defs.category.properties.before, C.KEY_RE, 'category.before'); same(plugin.$defs.category.properties.icon, C.ICON_RE, 'category.icon');
+  same(agent.name, C.NAME_RE, 'agent.name'); same(agent.role, C.ROLE_RE, 'agent.role'); same(agent.category, C.KEY_RE, 'agent.category');
+  same(agent.icon, C.ICON_RE, 'agent.icon'); same(agent.model, C.MODEL_RE, 'agent.model'); assert.deepEqual(agent.tools.items.enum, C.TOOLS, 'agent.tools'); assert.equal(agent.tools.maxItems, C.TOOLS.length, 'agent.tools.maxItems');
+  same(agent.avatar, C.AVATAR_REF_RE, 'agent.avatar'); same(agent.conventions.properties.subsets.items, C.CONV_ID_RE, 'agent.conventions.subsets');
+  assert.deepEqual(agent.slot.enum, C.SLOTS); assert.deepEqual(agent.effort.enum, ['', ...C.EFFORTS]);
+  assert.deepEqual(req('../db.js').ADAPTERS, C.ADAPTERS);
+  for (const f of ['squad.schema.json', 'squad-plugin.schema.json', 'squad-agent.schema.json']) assert.equal(JSON.parse(readFileSync(path.join(ROOT, 'schemas', f), 'utf8')).$schema, 'https://json-schema.org/draft/2020-12/schema');
+
+  // Validator: paths, $ref, required, unknown fields, ranges, types, oneOf.
+  const errs = validate(cfg, { $schema: 'x', foo: 1, profiles: [{ name: 'a' }, { key: 'k', effort: 'x', concurrency: 0, telemetry: { enabled: 'sim', z: 1 } }], runtime: { timeoutSec: 5 } }).map(formatError);
+  assert.deepEqual(errs, [
+    'foo: campo desconhecido', 'profiles[0].key: campo obrigatório ausente', 'profiles[1].effort: valor "x" não aceito (use "", "low", "medium", "high", "xhigh", "max", "minimal", "ultra")',
+    'profiles[1].concurrency: deve ser no mínimo 1', 'profiles[1].telemetry.enabled: deve ser true ou false', 'profiles[1].telemetry.z: campo desconhecido', 'runtime.timeoutSec: deve ser no mínimo 10',
+  ]);
+  const one = { oneOf: [{ type: 'string', maxLength: 2 }, { type: 'integer' }] };
+  assert.deepEqual(validate(one, 'ab'), []); assert.deepEqual(validate(one, 3), []);
+  assert.match(formatError(validate(one, 'abc')[0]), /até 2 caracteres/);
+  assert.deepEqual(validate({ type: 'array', maxItems: 1, items: { type: 'string', pattern: '^a' } }, ['b', 'a']).map(formatError), ['deve ter até 1 itens', '[0]: valor "b" fora do formato ^a']);
+});
+
+test('schemas no carregador: campo desconhecido no manifesto e no frontmatter é aviso; erro de schema recusa o item', () => {
+  const { createPluginLoader } = createRequire(import.meta.url)('../plugins.js');
+  const root = tmp('squad-schemaplugin-'); extraDirs.push(root);
+  writeTree(path.join(root, 'pk'), {
+    'squad-plugin.json': { $schema: '../schemas/squad-plugin.schema.json', id: 'pk', extra: 1, categories: [{ key: 'c1', label: 'C', color: 'red' }, { key: 'c2', label: 5 }], themes: [{ key: 't1', label: 'T', ui: { '--bg': '#000' }, mood: 'x' }] },
+    'agents/AAA.md': '---\nname: AAA\nslot: prd\nrole: po\nspecialty: 2024\ncolor: red\n---\nPRD.\n',
+    'agents/BBB.md': '---\nname: BBB\nslot: prd\nrole: po\nhellos:\n  - oi\nconventions:\n  template: x\n  extra: y\n---\n',
+  });
+  const cfg = path.join(root, 'cfg.json');
+  writeFileSync(cfg, JSON.stringify({ $schema: './schemas/squad.schema.json', plugins: { paths: ['pk'], extra: 1 }, other: true }));
+  const out = createPluginLoader({ root, home: root, env: { SQUAD_CONFIG: cfg }, cwd: root }).load().api;
+  const w = out.warnings.join('\n');
+  assert.match(w, /cfg\.json: campo "other" desconhecido, ignorado/);
+  assert.match(w, /cfg\.json: campo "plugins.extra" desconhecido, ignorado/);
+  assert.ok(!/\$schema/.test(w));
+  assert.match(w, /\[pk\] squad-plugin\.json: campo "extra" desconhecido, ignorado/);
+  assert.match(w, /categories\[0\]\.color: campo desconhecido, ignorado/);
+  assert.match(w, /\[pk\] squad-plugin\.json: categories\[1\]\.label: deve ser texto/);
+  assert.match(w, /themes\[0\]\.mood: campo desconhecido/);
+  assert.match(w, /\[pk\] agents\/AAA\.md: campo "color" desconhecido, ignorado/);
+  assert.match(w, /\[pk\] agents\/BBB\.md: conventions\.extra não é aceito/); // the existing check speaks first
+  const pk = out.plugins[0];
+  assert.deepEqual(pk.categories.map(c => c.key), ['c1']);
+  assert.deepEqual(pk.themes.map(t => t.key), ['pk/t1']);
+  assert.deepEqual(pk.presets.map(p => [p.name, p.specialty]), [['AAA', '2024']]);
+});
+
+test('Perfis da configuração (gravação): mudança entre a leitura e a escrita, symlink, .bak como link e permissões', async () => {
+  const root = tmp('squad-cfgsafe-'); extraDirs.push(root);
+  const realDir = path.join(root, 'real'), linkDir = path.join(root, 'links');
+  mkdirSync(realDir); mkdirSync(linkDir);
+  const real = path.join(realDir, 'target.json'), link = path.join(linkDir, 'local.json'), victim = path.join(root, 'victim.txt');
+  writeFileSync(real, JSON.stringify({ profiles: [{ key: 'a', name: 'Perfil A', adapter: 'claude' }] }));
+  chmodSync(real, 0o640);
+  writeFileSync(victim, 'não mexer');
+  let links = true;
+  try { symlinkSync(real, link); symlinkSync(victim, real + '.bak'); } catch { links = false; }
+  const cfg = links ? link : real;
+  const b = await setupBridge({ SQUAD_CONFIG: cfg, SQUAD_TEST_CONFIG_WRITE_PAUSE_MS: '400' });
+  const put = data => b.api('/api/profiles/cfg-a', { method: 'PUT', body: JSON.stringify(data) });
+  await profilesOf(b);
+
+  // A change between the read and the write: refused, the outside change stays.
+  const pending = put({ model: 'opus' });
+  await new Promise(r => setTimeout(r, 150));
+  const outside = JSON.stringify({ profiles: [{ key: 'a', name: 'Perfil A', adapter: 'claude', model: 'haiku' }] });
+  writeFileSync(real, outside);
+  const res = await pending;
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /mudou desde a última leitura/);
+  assert.equal(readFileSync(real, 'utf8'), outside);
+
+  // After a read it goes: written at the link's target (the link stays a link), .bak replaced (the victim it pointed to untouched),
+  // the original mode kept.
+  await profilesOf(b);
+  assert.equal((await put({ model: 'opus' })).status, 200);
+  assert.equal(readJson(real).profiles[0].model, 'opus');
+  assert.equal(statSync(real).mode & 0o777, 0o640);
+  assert.equal(readFileSync(real + '.bak', 'utf8'), outside);
+  assert.equal(lstatSync(real + '.bak').isSymbolicLink(), false);
+  assert.equal(statSync(real + '.bak').mode & 0o777, 0o640);
+  if (links) {
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(readFileSync(victim, 'utf8'), 'não mexer');
+    assert.equal(existsSync(link + '.bak'), false);
+  }
+  assert.deepEqual(readdirSync(realDir).filter(f => f.endsWith('.tmp')), []);
+  await b.stop();
+});
+
+test('Perfis da configuração (gravação): arquivo novo 0600 e operações concorrentes na mesma fila', async () => {
+  const root = tmp('squad-cfgops-'); extraDirs.push(root);
+  const shared = path.join(root, 'shared.json'), local = path.join(root, 'novo', 'local.json');
+  writeFileSync(shared, JSON.stringify({ profiles: [{ key: 'a', name: 'Perfil A', adapter: 'claude' }, { key: 'b', name: 'Perfil B', adapter: 'claude' }] }));
+  const b = await setupBridge({ SQUAD_CONFIG: local, SQUAD_CONFIG_SHARED: shared });
+  await profilesOf(b);
+  // "Tornar padrão" with no defaultProfile anywhere: the local file is created, 0600.
+  assert.equal((await b.api('/api/profiles/cfg-b/default', { method: 'POST' })).status, 200);
+  assert.deepEqual(readJson(local), { defaultProfile: 'b' });
+  if (process.platform !== 'win32') assert.equal(statSync(local).mode & 0o777, 0o600);
+  // Default and delete of the same configured Perfil at the same time: one after the other, never both.
+  const [d, x] = await Promise.all([b.api('/api/profiles/cfg-a/default', { method: 'POST' }), b.api('/api/profiles/cfg-a', { method: 'DELETE' })]);
+  assert.ok((d.status === 200 && x.status === 409) || (x.status === 200 && d.status === 404), `${d.status} ${x.status}`);
+  let list = await profilesOf(b);
+  if (d.status === 200) { assert.equal(list.find(p => p.isDefault).id, 'cfg-a'); assert.equal(readJson(local).defaultProfile, 'a'); }
+  else { assert.equal(list.some(p => p.id === 'cfg-a'), false); assert.equal(readJson(local).defaultProfile, 'b'); }
+  // The same with a Perfil of the database (the configuration declares a default, so it is written there): defaultProfile never
+  // ends up pointing to an id that no longer exists, and the effective default cannot be deleted.
+  const m = await newProfile(b, { name: 'Manual', adapter: 'claude' });
+  const [d2, x2] = await Promise.all([b.api(`/api/profiles/${m.id}/default`, { method: 'POST' }), b.api(`/api/profiles/${m.id}`, { method: 'DELETE' })]);
+  assert.ok((d2.status === 200 && x2.status === 409) || (x2.status === 200 && d2.status === 404), `${d2.status} ${x2.status}`);
+  list = await profilesOf(b);
+  const def = readJson(local).defaultProfile;
+  assert.ok(list.some(p => p.id === def || p.id === `cfg-${def}`), `defaultProfile ${def}`);
+  assert.equal(list.filter(p => p.isDefault).length, 1);
+  await b.stop();
+});
+
+test('Perfis da configuração (gravação): telemetry por chave, tipos conferidos antes e caminhos relativos', async () => {
+  const root = tmp('squad-cfgfields-'); extraDirs.push(root);
+  mkdirSync(path.join(root, 'contas', 'x'), { recursive: true });
+  const shared = path.join(root, 'shared.json'), local = path.join(root, 'local.json');
+  writeFileSync(shared, JSON.stringify({ profiles: [{ key: 'a', name: 'Perfil A', adapter: 'claude', telemetry: { enabled: true } }] }));
+  writeFileSync(local, JSON.stringify({ profiles: [{ key: 'a', model: 'sonnet' }] }));
+  const b = await setupBridge({ SQUAD_CONFIG: local, SQUAD_CONFIG_SHARED: shared });
+  const put = data => b.api('/api/profiles/cfg-a', { method: 'PUT', body: JSON.stringify(data) });
+  await profilesOf(b);
+  // Telemetry: only the switch that changed goes into the item of the file of highest precedence (enabled, from shared.json, stays there).
+  let res = await put({ name: 'Perfil A', adapter: 'claude', telemetry: { enabled: true, native: true, content: false } });
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.deepEqual(readJson(local).profiles[0], { key: 'a', model: 'sonnet', telemetry: { native: true } });
+  assert.deepEqual((await res.json()).profile.telemetry, { enabled: true, native: true, content: false });
+  res = await put({ telemetry: { enabled: false, native: true, content: false } });
+  assert.deepEqual(readJson(local).profiles[0].telemetry, { native: true, enabled: false });
+  assert.equal(readJson(shared).profiles[0].telemetry.enabled, true);
+  // Types are checked before anything is normalized: null, numbers as text, unknown telemetry switches.
+  const before = readFileSync(local, 'utf8');
+  for (const bad of [{ bin: null }, { concurrency: '3' }, { configDir: 5 }, { ignoreUserConfig: 'sim' }, { telemetry: { enabled: 'sim' } }, { telemetry: { headers: {} } }]) {
+    res = await put(bad);
+    assert.equal(res.status, 400, JSON.stringify(bad));
+  }
+  assert.equal(readFileSync(local, 'utf8'), before);
+  // A relative path is checked against the folder of the file written and kept as the person wrote it.
+  res = await put({ configDir: 'contas/x' });
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.equal((await res.json()).profile.configDir, realpathSync.native(path.join(root, 'contas', 'x')));
+  assert.equal(readJson(local).profiles[0].configDir, 'contas/x');
+  res = await put({ configDir: 'contas/nao-existe' });
+  assert.equal(res.status, 400);
+  assert.equal(readJson(local).profiles[0].configDir, 'contas/x');
+  // Unchanged values (the form sends everything back): nothing is written.
+  const cur = (await profilesOf(b)).find(p => p.id === 'cfg-a');
+  const text = readFileSync(local, 'utf8');
+  res = await put({ name: cur.name, adapter: cur.adapter, bin: cur.bin, configDir: cur.configDir, model: cur.model, effort: cur.effort, concurrency: cur.concurrency, threshold: cur.threshold, fallbackId: cur.fallbackId, ignoreUserConfig: cur.ignoreUserConfig, telemetry: cur.telemetry });
+  assert.deepEqual((await res.json()).changed, []);
+  assert.equal(readFileSync(local, 'utf8'), text);
+  await b.stop();
+});
+
+test('Perfis da configuração (gravação): com um arquivo inválido nada é gravado (409 citando o arquivo)', async () => {
+  const root = tmp('squad-cfgbroken-'); extraDirs.push(root);
+  const shared = path.join(root, 'shared.json'), local = path.join(root, 'local.json');
+  writeFileSync(shared, JSON.stringify({ profiles: [{ key: 's', name: 'Perfil S', adapter: 'claude' }] }));
+  writeFileSync(local, JSON.stringify({ profiles: [{ key: 'a', name: 'Perfil A', adapter: 'claude' }] }));
+  const b = await setupBridge({ SQUAD_CONFIG: local, SQUAD_CONFIG_SHARED: shared });
+  await profilesOf(b);
+  writeFileSync(shared, '{ "profiles": [');
+  const list = await profilesOf(b); // the sync is blocked: both stay
+  assert.ok(list.some(p => p.id === 'cfg-a') && list.some(p => p.id === 'cfg-s'));
+  const text = readFileSync(local, 'utf8');
+  const manual = await newProfile(b, { name: 'Manual', adapter: 'claude' });
+  for (const [p, m, body] of [['cfg-a', 'DELETE'], ['cfg-a', 'PUT', { model: 'opus' }], ['cfg-a/default', 'POST'], [`${manual.id}/default`, 'POST']]) {
+    const res = await b.api(`/api/profiles/${p}`, { method: m, body: body ? JSON.stringify(body) : undefined });
+    if (p.startsWith('pf-')) { assert.equal(res.status, 200, `${m} ${p}`); continue; } // no defaultProfile declared: the database only
+    assert.equal(res.status, 409, `${m} ${p}`);
+    assert.match((await res.json()).error, /shared\.json tem erro/);
+  }
+  assert.equal(readFileSync(local, 'utf8'), text);
+  assert.ok((await profilesOf(b)).some(p => p.id === 'cfg-a'));
+  await b.stop();
+});
+
+test('schemas: maxBudgetUsd igual ao código e $ref circular vira erro', () => {
+  const req = createRequire(import.meta.url);
+  const { CONSTANTS: C, SCHEMAS, validateRuntime } = req('../plugins.js');
+  const { validate } = req('../schema.js');
+  for (const s of [SCHEMAS.config, SCHEMAS.plugin]) {
+    const node = s.$defs.runtime.properties.maxBudgetUsd;
+    assert.equal(node.anyOf.find(x => x.pattern).pattern, C.BUDGET_RE.source);
+    for (const v of [null, '', 0.5, 1000, 1000.0001, 0, -1, 0.00001, '1', '0.5', '.5', '1000', '1000.0', '1000.0000', '1000.5', '0', '0.0000', '0.0001', '01', '1e2', '0x10', ' 5', '-3', 'abc', '12.34567', '0.' + '0'.repeat(400) + '1', true, [], {}]) {
+      const code = Object.hasOwn(validateRuntime({ maxBudgetUsd: v }, 'x', () => {}), 'maxBudgetUsd');
+      const schema = validate(s, { runtime: { maxBudgetUsd: v } }).length === 0 || validate(s, { id: 'pk', runtime: { maxBudgetUsd: v } }).length === 0;
+      assert.equal(schema, code, `maxBudgetUsd ${JSON.stringify(v)}`);
+    }
+  }
+  assert.deepEqual(validate({ $ref: '#' }, 1).map(e => e.keyword), ['$ref']);
+  assert.deepEqual(validate({ $defs: { a: { $ref: '#/$defs/b' }, b: { $ref: '#/$defs/a' } }, $ref: '#/$defs/a' }, {}).map(e => e.keyword), ['$ref']);
+  const tree = { $defs: { n: { type: 'object', properties: { c: { $ref: '#/$defs/n' } } } }, $ref: '#/$defs/n' };
+  let v = {}; for (let i = 0; i < 10; i++) v = { c: v };
+  assert.deepEqual(validate(tree, v), []);
+  v = {}; for (let i = 0; i < 200; i++) v = { c: v };
+  assert.match(validate(tree, v)[0].message, /profunda demais/);
 });

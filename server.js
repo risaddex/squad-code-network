@@ -16,6 +16,7 @@
  *   SQUAD_PROJECTS_DIR root of the per-project folders (default: ./projects next to this file)
  *   SQUAD_DATA_DIR    folder of the SQLite database, squad.db (default: ./data next to this file)
  *   SQUAD_CONFIG      local configuration file used instead of ./squad.local.json (plugins.js, docs/plans/plugins-conteudo.md)
+ *   SQUAD_CONFIG_SHARED  shared configuration file used instead of ./squad.config.json
  *   SQUAD_PLUGINS       extra plugin folders, separated by the platform's path delimiter
  */
 const http = require('node:http');
@@ -85,9 +86,9 @@ function needStore() {
 }
 
 const PERMISSION_MODES = ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'];
-const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+// Effort lists shared with plugins.js and schemas/squad.schema.json (one source, checked by the tests).
+const { EFFORTS, CODEX_EFFORTS } = require('./plugins.js').CONSTANTS;
 // Codex reasoning levels (model_reasoning_effort); `max`/`ultra` only reach models that list them (models_cache.json).
-const CODEX_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const ALL_EFFORTS = [...new Set([...EFFORTS, ...CODEX_EFFORTS])];
 const CLAUDE_MODELS = ['opus', 'sonnet', 'haiku'];
 const CODEX_MODELS = ['gpt-5.5'];
@@ -267,6 +268,12 @@ async function profileStatus(p) {
 }
 async function profileView(p) {
   const view = { ...p, status: await profileStatus(p), windows: windowsOf(p.id), active: activeOf(p.id), activeCalls: callsOf(p.id) };
+  if (p.source === 'config') {
+    // configFiles: every file that declares it (lowest precedence first; the last one is where edits go); configError: left as it was.
+    const entry = cfgProfiles.cfg?.profiles.find(e => `cfg-${e.key}` === p.id);
+    view.configFiles = (entry?.files || [p.sourceFile]).map(f => path.basename(f));
+    view.configError = cfgProfiles.errors.get(p.id) || [];
+  }
   // Codex: the models and levels of this Perfil's own account folder (adapters.codex reads the default CODEX_HOME).
   if (p.adapter === 'codex') view.modelEfforts = codexModels(codexHome(p)) || {};
   return view;
@@ -301,7 +308,7 @@ function codexEffort(effort, model, home) {
   return levels && levels.includes(effort) ? effort : 'xhigh';
 }
 
-const PROFILE_FIELDS = ['name', 'adapter', 'bin', 'configDir', 'model', 'effort', 'concurrency', 'fallbackId', 'threshold', 'ignoreUserConfig', 'telemetry'];
+const PROFILE_FIELDS = require('./plugins.js').CONSTANTS.PROFILE_FIELDS;
 /** Checks a Perfil sent by the page (a PUT may send only some fields: the rest comes from `current`). */
 async function validateProfile(body, current = null) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Perfil inválido.');
@@ -355,12 +362,15 @@ function checkReserve(p, ref) {
    table. A file that could not be read or a malformed list: nothing changes. defaultFile: the configuration chose the default. */
 // sig: signature of the last configuration applied without errors; pending: the one being applied (run = its promise, which runs
 // await before they take a slot). A failed sync leaves sig as it was, so the next read tries again.
-const cfgProfiles = { sig: null, pending: null, warnings: [], defaultFile: '', run: Promise.resolve() };
+// cfg: the configuration as last read (hashes: sha1 of each file then; a write refuses a file changed since); errors: id → messages
+// of a configured Perfil left as it was (invalid item in the file, or validation).
+const cfgProfiles = { sig: null, pending: null, warnings: [], defaultFile: '', run: Promise.resolve(), cfg: null, errors: new Map() };
 // `before`: a promise the sync waits for, chained synchronously so runs already wait on it (afterOpen: "Codex (padrão)").
 function syncConfigProfiles(before = null) {
   if (before) cfgProfiles.run = cfgProfiles.run.then(() => before);
   if (!store) return cfgProfiles.run;
   const cfg = loadPlugins().api.config;
+  cfgProfiles.cfg = cfg;
   const sig = JSON.stringify([cfg.profilesError, cfg.profiles, cfg.defaultProfile, cfg.defaultProfileFile]);
   if (sig === cfgProfiles.sig || sig === cfgProfiles.pending) return cfgProfiles.run;
   cfgProfiles.pending = sig;
@@ -379,14 +389,16 @@ async function applyConfigProfiles(cfg) {
     cfgProfiles.warnings = warnings;
     return true;
   }
-  const declared = new Set(cfg.profiles.map(e => `cfg-${e.key}`)), valid = [];
+  const declared = new Set(cfg.profiles.map(e => `cfg-${e.key}`)), valid = [], errors = new Map();
   for (const e of cfg.profiles) {
-    const { key, source, files, fallbackId, ...fields } = e, id = `cfg-${key}`;
+    const { key, source, files, fallbackId, invalid, ...fields } = e, id = `cfg-${key}`;
+    // Invalid item in the file (plugins.js already warned, with file, key and field): the row stays as it was, or is not created.
+    if (invalid) { errors.set(id, invalid); continue; }
     try {
       if (fallbackId !== undefined && typeof fallbackId !== 'string') throw new Error('"fallbackId" deve ser texto (id ou key de um Perfil).');
       const p = await validateProfile({ ...fields, fallbackId: '' });
       valid.push({ ...p, id, key, source, fallbackRef: (fallbackId || '').trim() });
-    } catch (err) { warnings.push(`Perfil ${key} (${file(source)}): ${err.message} ${store?.getProfile(id) ? 'Mantido como estava.' : 'Não criado.'}`); }
+    } catch (err) { const m = `Perfil ${key} (${file(source)}): ${err.message} ${store?.getProfile(id) ? 'Mantido como estava.' : 'Não criado.'}`; warnings.push(m); errors.set(id, [m]); }
   }
   if (!store) return false;
   let defaultFile = '', failed = false;
@@ -396,7 +408,7 @@ async function applyConfigProfiles(cfg) {
     const ok = [];
     for (const p of valid) {
       try { store.upsertConfigProfile(p, p.source); ok.push(p); }
-      catch (err) { failed = true; warnings.push(`Perfil ${p.key} (${file(p.source)}): ${err.message}`); }
+      catch (err) { failed = true; const m = `Perfil ${p.key} (${file(p.source)}): ${err.message}`; warnings.push(m); errors.set(p.id, [m]); }
     }
     for (const p of ok) if (p.fallbackRef) {
       try { store.setProfileFallback(p.id, checkReserve(p, p.fallbackRef)); }
@@ -410,9 +422,202 @@ async function applyConfigProfiles(cfg) {
   });
   cfgProfiles.defaultFile = defaultFile;
   cfgProfiles.warnings = warnings;
+  cfgProfiles.errors = errors;
   if (warnings.length) console.warn(`Perfis da configuração: ${warnings.join(' | ')}`);
   return !failed;
 }
+/* ---------- writing a configured Perfil back to its file ----------
+   PUT, DELETE and "Tornar padrão" of a configured Perfil change the file it came from (the one of highest precedence that declares
+   its key; defaultProfile: the file that declares it, or the local one), never the table: the sync that follows brings it in.
+   configOp: one operation at a time, whole (read, validation, "is it the default?", write and the sync after it), so two requests
+   on the same Perfil cannot interleave. writeConfigFile: the text is read and checked against the hash the bridge last read
+   (`expected`); after the async validation it is read again and checked once more right before the write, which is synchronous from
+   there to the rename (no await between the last check and the rename). A symlinked file is written at its real path, in the real
+   folder. Temp files have random names, are created exclusively ('wx') with the original file's mode (0600 for a new file), and the
+   .bak is written the same way (temp + rename: an existing .bak link is replaced, never followed) with the text that was checked. */
+const { validate: schemaValidate, formatError } = require('./schema.js');
+const CONFIG_SCHEMA = require('./plugins.js').SCHEMAS.config;
+const sha1 = text => crypto.createHash('sha1').update(text).digest('hex');
+const conflict = msg => Object.assign(new Error(msg), { status: 409 });
+const badRequest = msg => Object.assign(new Error(msg), { status: 400 });
+const isPlain = v => !!v && typeof v === 'object' && !Array.isArray(v);
+// Tests only: a pause between the first read and the write, to change the file in between.
+const WRITE_PAUSE_MS = Number(process.env.SQUAD_TEST_CONFIG_WRITE_PAUSE_MS) || 0;
+let cfgQueue = Promise.resolve();
+function configOp(fn) {
+  const job = cfgQueue.then(fn);
+  cfgQueue = job.catch(() => {});
+  return job;
+}
+/** The path really written: a symlinked configuration file is written at its target. */
+function realConfigPath(file) {
+  try { if (fs.lstatSync(file).isSymbolicLink()) return fs.realpathSync(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  return file;
+}
+const readText = file => { try { return fs.readFileSync(file, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
+/** Writes `text` to `dest` through an exclusive temp file in the same folder (mode `mode`), then renames it over `dest`. */
+// owner: {uid, gid} of the original file, kept when the system lets us (the group usually; EPERM and the like are ignored).
+function writeExclusive(dest, text, mode, owner = null) {
+  const tmp = path.join(path.dirname(dest), `.${path.basename(dest)}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+  const fd = fs.openSync(tmp, 'wx', mode);
+  try {
+    fs.writeFileSync(fd, text, 'utf8'); fs.fchmodSync(fd, mode);
+    if (owner) { try { fs.fchownSync(fd, owner.uid, owner.gid); } catch (e) { if (!['EPERM', 'EINVAL', 'ENOSYS', 'ENOTSUP'].includes(e.code)) throw e; } }
+    fs.fsyncSync(fd);
+  } catch (e) { fs.closeSync(fd); fs.rmSync(tmp, { force: true }); throw e; }
+  fs.closeSync(fd);
+  try { fs.renameSync(tmp, dest); } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
+}
+/** Reads, mutates (`mutate(data, name)` may be async and throw) and writes one configuration file. Runs inside configOp. */
+async function writeConfigFile(file, mutate) {
+  const name = path.basename(file), real = realConfigPath(file);
+  const expected = cfgProfiles.cfg?.hashes?.[file] ?? null;
+  const changed = () => conflict(`${name} mudou desde a última leitura do bridge. Recarregue a página e tente de novo.`);
+  const text = readText(real);
+  if ((text === null ? null : sha1(text)) !== expected) throw changed();
+  let data = {};
+  if (text !== null) {
+    try { data = JSON.parse(text.replace(/^﻿/, '')); } catch (e) { throw conflict(`${name} tem JSON inválido (${e.message}): corrija o arquivo antes.`); }
+    if (!isPlain(data)) throw conflict(`${name} deve ser um objeto JSON: corrija o arquivo antes.`);
+  }
+  await mutate(data, name);
+  if (WRITE_PAUSE_MS) await new Promise(r => setTimeout(r, WRITE_PAUSE_MS));
+  const out = JSON.stringify(data, null, 2) + '\n';
+  await fsp.mkdir(path.dirname(real), { recursive: true });
+  // From here on, synchronous: the last check and the rename with nothing in between.
+  const now = readText(real);
+  if ((now === null ? null : sha1(now)) !== expected) throw changed();
+  let mode = 0o600, backup = null, owner = null;
+  if (now !== null) {
+    const st = fs.statSync(real);
+    mode = st.mode & 0o777; owner = { uid: st.uid, gid: st.gid };
+    backup = real + '.bak';
+    writeExclusive(backup, now, mode, owner);
+  }
+  writeExclusive(real, out, mode, owner);
+  if (cfgProfiles.cfg) cfgProfiles.cfg.hashes[file] = sha1(out);
+  pluginLoader.invalidate();
+  console.log(`Configuração gravada: ${real}${backup ? ` (cópia em ${path.basename(backup)})` : ''}`);
+  return { file: real, backup };
+}
+/** A configuration with a file-level error does not sync, so nothing written now would reach the table: refused before writing. */
+function configWritable() {
+  const cfg = cfgProfiles.cfg;
+  if (cfg?.profilesError) {
+    const files = (cfg.errorFiles || []).map(f => path.basename(f)).join(', ') || 'a configuração';
+    throw conflict(`${files} tem erro (veja os avisos): os Perfis da configuração não sincronizam até ele ser corrigido. Corrija o arquivo e recarregue a página.`);
+  }
+}
+/** The configuration entry of a `cfg-<key>` Perfil, or a 409 that says why it cannot be written. */
+function configEntry(current) {
+  configWritable();
+  const key = current.id.slice(4), entry = cfgProfiles.cfg?.profiles.find(e => e.key === key);
+  if (!entry) throw conflict(`O Perfil "${current.name}" não está mais na configuração. Recarregue a página.`);
+  if (entry.invalid) throw conflict(`O item do Perfil "${current.name}" em ${path.basename(entry.source)} tem formato inválido: corrija o arquivo e recarregue a página.`);
+  return entry;
+}
+/** The Perfil as it is now (inside configOp, after the operations before it). */
+function currentProfile(pid) {
+  const p = getProfile(pid);
+  if (!p) throw Object.assign(new Error('Perfil não encontrado.'), { status: 404 });
+  return p;
+}
+function profileItemOf(data, key, name) {
+  const item = Array.isArray(data.profiles) ? data.profiles.find(x => isPlain(x) && x.key === key) : null;
+  if (!item) throw conflict(`O Perfil ${key} não está mais em ${name}. Recarregue a página.`);
+  return item;
+}
+// Paths of a Perfil in a file: `~` and relative ones against the file's folder (plugins.js does the same when reading).
+const looksLikePath = v => /[\\/]|^~|^\./.test(v);
+function expandFrom(dir, p) {
+  if (p === '~') return HOME;
+  if (/^~[\\/]/.test(p)) return path.join(HOME, p.slice(2));
+  return path.resolve(dir, p);
+}
+const BODY_TYPES = { name: 'string', adapter: 'string', bin: 'string', configDir: 'string', model: 'string', effort: 'string', fallbackId: 'string', concurrency: 'integer', threshold: 'integer', ignoreUserConfig: 'boolean', telemetry: 'object' };
+/** Types first (null, numbers as text...): nothing is coerced into the file. */
+function checkBodyTypes(body) {
+  if (!isPlain(body)) throw badRequest('Perfil inválido.');
+  for (const [k, t] of Object.entries(BODY_TYPES)) {
+    if (body[k] === undefined) continue;
+    const v = body[k];
+    const ok = t === 'integer' ? Number.isInteger(v) : t === 'object' ? isPlain(v) && Object.entries(v).every(([tk, tv]) => ['enabled', 'native', 'content'].includes(tk) && typeof tv === 'boolean') : typeof v === t;
+    if (!ok) throw badRequest(`Campo ${k}: ${t === 'integer' ? 'deve ser um número inteiro' : t === 'object' ? 'deve ser um objeto {enabled, native, content} com true ou false' : t === 'boolean' ? 'deve ser true ou false' : 'deve ser texto'}.`);
+  }
+}
+/* Edit: the changes are what the person changed against the effective Perfil (paths compared after resolving them against the
+   target file's folder; telemetry switch by switch); they are merged into that file's item as written (telemetry: only the changed
+   switches, into the item's own object). The item that will be persisted goes through the schema, and the Perfil that will result
+   (the entry merged with the changes) through validateProfile and the reserve rules, before writing. */
+async function editConfigProfile(pid, body) {
+  checkBodyTypes(body);
+  const current = currentProfile(pid);
+  const entry = configEntry(current), key = entry.key, target = entry.files.at(-1), dir = path.dirname(target);
+  if (body.adapter !== undefined && body.adapter !== current.adapter) throw badRequest('O Adapter de um Perfil não muda depois de criado.');
+  const write = {}, effective = {};
+  for (const k of PROFILE_FIELDS) {
+    if (body[k] === undefined || k === 'adapter') continue;
+    const v = typeof body[k] === 'string' ? body[k].trim() : body[k];
+    if (k === 'bin' || k === 'configDir') {
+      const resolved = v && (k === 'configDir' || looksLikePath(v)) ? expandFrom(dir, v) : v;
+      const same = k === 'configDir' ? (resolved ? longPath(resolved) : '') === current.configDir : resolved === current.bin;
+      if (!same) { write[k] = v; effective[k] = resolved; }
+    } else if (k === 'telemetry') {
+      const delta = Object.fromEntries(Object.entries(v).filter(([t, on]) => on !== !!current.telemetry?.[t]));
+      if (Object.keys(delta).length) { write.telemetry = delta; effective.telemetry = { ...current.telemetry, ...delta }; }
+    } else if (k === 'fallbackId') {
+      const id = v ? checkReserve(current, v) : '';
+      if (id !== (current.fallbackId || '')) { write.fallbackId = id && getProfile(id)?.source === 'config' ? id.slice(4) : id; effective.fallbackId = id; }
+    } else if (v !== current[k]) { write[k] = v; effective[k] = v; }
+  }
+  const changed = Object.keys(write);
+  if (!changed.length) return { ok: true, profile: await profileView(current), file: path.basename(target), changed };
+  const { key: _k, source: _s, files: _f, invalid: _i, ...fields } = entry;
+  const merged = { ...fields, ...effective, fallbackId: '' };
+  const p = await validateProfile(merged);
+  if (effective.fallbackId) checkReserve({ ...p, id: current.id }, effective.fallbackId);
+  if (listProfiles().some(x => x.id !== current.id && x.name === p.name)) throw conflict('Já existe um Perfil com esse nome.');
+  await writeConfigFile(target, (data, name) => {
+    const item = profileItemOf(data, key, name);
+    const next = { ...item, ...write, ...(write.telemetry ? { telemetry: { ...(isPlain(item.telemetry) ? item.telemetry : {}), ...write.telemetry } } : {}) };
+    const bad = schemaValidate(CONFIG_SCHEMA.$defs.profile, next, CONFIG_SCHEMA).find(e => e.keyword !== 'additionalProperties');
+    if (bad) throw badRequest(`Valor inválido para ${name}: ${formatError(bad)}`);
+    Object.assign(item, next);
+  });
+  await syncConfigProfiles();
+  const refused = cfgProfiles.errors.get(current.id);
+  if (refused?.length) throw badRequest(`Gravado em ${path.basename(target)}, mas a sincronização recusou o Perfil: ${refused.join(' ')}`);
+  // The table must now hold what was written (the effective values): otherwise say so instead of answering ok.
+  const saved = getProfile(current.id);
+  const expect = { ...effective, ...(effective.configDir !== undefined ? { configDir: effective.configDir ? longPath(effective.configDir) : '' } : {}) };
+  const off = saved ? Object.keys(expect).filter(k => JSON.stringify(k === 'telemetry' ? { ...saved.telemetry } : saved[k]) !== JSON.stringify(k === 'telemetry' ? { ...saved.telemetry, ...expect.telemetry } : expect[k])) : ['perfil'];
+  if (off.length) throw Object.assign(new Error(`Gravado em ${path.basename(target)}, mas o Perfil no banco não ficou com ${off.join(', ')}. Recarregue a página e confira o arquivo.`), { status: 500 });
+  return { ok: true, profile: await profileView(saved), file: path.basename(target), changed };
+}
+async function deleteConfigProfile(pid) {
+  const current = currentProfile(pid);
+  const entry = configEntry(current), key = entry.key, target = entry.files.at(-1), cfg = cfgProfiles.cfg;
+  if (entry.files.length > 1) {
+    const others = entry.files.slice(0, -1).map(f => path.basename(f)).join(', ');
+    throw conflict(`O Perfil "${current.name}" também está declarado em ${others}: removê-lo de ${path.basename(target)} não o tira da configuração, ele continuaria vindo de lá. Remova o item de ${others} primeiro.`);
+  }
+  if (current.isDefault || cfg.defaultProfile === key || cfg.defaultProfile === current.id) throw conflict('O Perfil padrão não pode ser excluído. Torne outro Perfil padrão antes.');
+  await writeConfigFile(target, (data, name) => { profileItemOf(data, key, name); data.profiles = data.profiles.filter(x => !(isPlain(x) && x.key === key)); });
+  await syncConfigProfiles();
+  if (getProfile(current.id)) throw Object.assign(new Error(`Removido de ${path.basename(target)}, mas o Perfil continua no banco (a sincronização não o tirou). Recarregue a página e confira a configuração.`), { status: 500 });
+  return { ok: true, file: path.basename(target) };
+}
+/** "Tornar padrão" through the configuration: defaultProfile in the file that declares it, or in the local file. */
+async function defaultInConfig(pid) {
+  configWritable();
+  const current = currentProfile(pid), cfg = cfgProfiles.cfg, target = cfg.defaultProfileFile || cfg.localFile;
+  const value = current.source === 'config' ? configEntry(current).key : current.id;
+  await writeConfigFile(target, data => { data.defaultProfile = value; });
+  await syncConfigProfiles();
+  if (!getProfile(current.id)?.isDefault) throw Object.assign(new Error(`Gravado em ${path.basename(target)}, mas a sincronização não tornou ${current.name} o Perfil padrão.`), { status: 500 });
+  return { ok: true, profile: await profileView(getProfile(current.id)), file: path.basename(target) };
+}
+
 /** Plugins + configuration as the page/API get them, with the warnings of the configured Perfis appended. */
 async function pluginsWithProfiles() {
   await syncConfigProfiles();
@@ -1319,7 +1524,7 @@ async function handle(req, res) {
     }
     if (url.pathname === '/api/profiles' && req.method === 'GET') {
       await syncConfigProfiles();
-      return json(res, 200, { ok: true, profiles: await Promise.all(listProfiles().map(profileView)), adapters: adaptersCatalog(), configDefault: cfgProfiles.defaultFile ? path.basename(cfgProfiles.defaultFile) : '', configWarnings: cfgProfiles.warnings });
+      return json(res, 200, { ok: true, profiles: await Promise.all(listProfiles().map(profileView)), adapters: adaptersCatalog(), configDefault: cfgProfiles.defaultFile ? path.basename(cfgProfiles.defaultFile) : '', configDefaultTarget: cfgProfiles.cfg ? path.basename(cfgProfiles.cfg.defaultProfileFile || cfgProfiles.cfg.localFile) : '', configDefaultDeclared: !!cfgProfiles.cfg?.defaultProfile, configWarnings: [...(cfgProfiles.cfg?.profileWarnings || []), ...cfgProfiles.warnings] });
     }
     if (url.pathname === '/api/profiles' && req.method === 'POST') {
       needStore();
@@ -1330,20 +1535,35 @@ async function handle(req, res) {
       const pid = decodeURIComponent(parts[2]);
       const current = getProfile(pid);
       if (!current) return fail(res, 404, 'Perfil não encontrado.');
-      // A Perfil of the configuration is changed in its file: only reading, testing and refreshing its windows go through here.
-      const fromFile = current.source === 'config' ? path.basename(current.sourceFile) || 'configuração' : '';
-      if (fromFile && !parts[3] && (req.method === 'PUT' || req.method === 'DELETE')) return fail(res, 409, `O Perfil "${current.name}" vem de ${fromFile}: edite o arquivo e recarregue a página.`);
-      if (parts[3] === 'default' && req.method === 'POST') {
-        if (cfgProfiles.defaultFile) return fail(res, 409, `O Perfil padrão vem de "defaultProfile" em ${path.basename(cfgProfiles.defaultFile)}: edite o arquivo e recarregue a página.`);
-        if (fromFile) return fail(res, 409, `O Perfil "${current.name}" vem de ${fromFile}: para torná-lo padrão use "defaultProfile" no arquivo e recarregue a página.`);
-      }
+      // A Perfil of the configuration is changed in its file (editConfigProfile, deleteConfigProfile); the default goes to the file
+      // whenever the configuration declares one or the Perfil comes from it (defaultInConfig).
+      if (current.source === 'config' && !parts[3] && req.method === 'PUT') { needStore(); const body = await readBody(req); return json(res, 200, await configOp(() => editConfigProfile(pid, body))); }
+      if (current.source === 'config' && !parts[3] && req.method === 'DELETE') { needStore(); return json(res, 200, await configOp(() => deleteConfigProfile(pid))); }
+
+      // Perfis of the database go through the same queue: a "tornar padrão" written to the configuration and the deletion of that
+      // same Perfil never interleave (defaultProfile pointing to an id that no longer exists).
       if (!parts[3] && req.method === 'PUT') {
         needStore();
-        const p = await validateProfile(await readBody(req), current);
-        return json(res, 200, { ok: true, profile: await profileView(needStore().updateProfile(pid, p)) });
+        const body = await readBody(req);
+        return json(res, 200, await configOp(async () => { const p = await validateProfile(body, currentProfile(pid)); return { ok: true, profile: await profileView(needStore().updateProfile(pid, p)) }; }));
       }
-      if (!parts[3] && req.method === 'DELETE') return json(res, 200, needStore().deleteProfile(pid));
-      if (parts[3] === 'default' && req.method === 'POST') return json(res, 200, { ok: true, profile: await profileView(needStore().setDefaultProfile(pid)) });
+      if (!parts[3] && req.method === 'DELETE') {
+        needStore();
+        return json(res, 200, await configOp(() => {
+          const p = currentProfile(pid), cfg = cfgProfiles.cfg;
+          if (p.isDefault || (cfg?.defaultProfile && cfg.defaultProfile === pid)) throw conflict('O Perfil padrão não pode ser excluído. Torne outro Perfil padrão antes.');
+          return needStore().deleteProfile(pid);
+        }));
+      }
+      // The default goes to the configuration when the Perfil comes from it or the configuration declares one (decided in the queue).
+      if (parts[3] === 'default' && req.method === 'POST') {
+        needStore();
+        return json(res, 200, await configOp(async () => {
+          const p = currentProfile(pid);
+          if (p.source === 'config' || cfgProfiles.cfg?.defaultProfile) return defaultInConfig(pid);
+          return { ok: true, profile: await profileView(needStore().setDefaultProfile(p.id)) };
+        }));
+      }
       if (parts[3] === 'test' && req.method === 'POST') {
         const status = await profileStatus(current);
         return json(res, 200, { ok: !!status.version && status.configDirOk, status });

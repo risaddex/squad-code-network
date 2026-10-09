@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "squad.schema.json",
+  "title": "Configuração local do SQUAD/CODE",
+  "description": "squad.config.json (versionável) e squad.local.json (desta máquina): plugins, padrões de execução e Perfis. O local vence o compartilhado. Segredos nunca entram aqui, só nomes de variáveis de ambiente.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Caminho deste schema, para o editor validar o arquivo (ex.: ./schemas/squad.schema.json)."
+    },
+    "plugins": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Plugins de conteúdo.",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Pastas de Plugins. Relativas à pasta deste arquivo; ~ = home. Concatenadas entre os arquivos."
+        },
+        "disabled": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Ids de Plugins desligados (o último arquivo que declara vence)."
+        }
+      }
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtime"
+    },
+    "profiles": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/profile"
+      },
+      "description": "Perfis declarados, mesclados por key entre os arquivos (o posterior sobrescreve campo a campo). Viram os Perfis cfg-<key>."
+    },
+    "defaultProfile": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "description": "Perfil padrão: key de um Perfil desta configuração ou id de um Perfil existente."
+    }
+  },
+  "$defs": {
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Padrões de execução (as chaves de DEFAULT_RUNTIME do app). Valem para workspaces novos e campos vazios; nunca sobrescrevem o que a pessoa salvou.",
+      "properties": {
+        "permissionMode": {
+          "enum": [
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "manual",
+            "dontAsk",
+            "plan"
+          ],
+          "description": "Modo de permissão do Claude Code."
+        },
+        "model": {
+          "type": "string",
+          "description": "Modelo padrão (alias ou id). Vazio = padrão da CLI.",
+          "anyOf": [
+            {
+              "maxLength": 0
+            },
+            {
+              "pattern": "^[A-Za-z0-9._\\-\\[\\]]{1,80}$"
+            }
+          ]
+        },
+        "effort": {
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "description": "Esforço padrão. Vazio = padrão do modelo."
+        },
+        "maxBudgetUsd": {
+          "description": "Teto de custo por execução em USD: número maior que 0 e até 1000, ou o mesmo como texto decimal simples com até 4 casas (sem sinal, expoente ou espaços). \"\" ou null = sem teto.",
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "maxLength": 0
+            },
+            {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1000
+            },
+            {
+              "type": "string",
+              "pattern": "^(?:[1-9][0-9]{0,2}(?:\\.[0-9]{1,4})?|0\\.(?=[0-9]{0,3}[1-9])[0-9]{1,4}|1000(?:\\.0{1,4})?)$"
+            }
+          ]
+        },
+        "timeoutSec": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 7200,
+          "description": "Tempo máximo de uma execução, em segundos."
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Execuções simultâneas (teto global)."
+        },
+        "restrictTools": {
+          "type": "boolean",
+          "description": "Usar só as ferramentas do agente (--tools)."
+        },
+        "addDirs": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Pastas extras (--add-dir), lista ou texto separado por vírgula."
+        },
+        "extraAllowedTools": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Ferramentas extras permitidas, lista ou texto separado por vírgula."
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false,
+      "description": "Um Perfil: instância de um Adapter com executável e pasta da conta. Mesmos campos de POST /api/profiles, mais key.",
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,40}$",
+          "description": "Identificador do Perfil na configuração (id no banco: cfg-<key>). Minúsculas, números e hífen."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "Nome mostrado no app, único entre os Perfis."
+        },
+        "adapter": {
+          "enum": [
+            "claude",
+            "codex"
+          ],
+          "description": "Tipo de CLI: claude (claude -p) ou codex (codex exec)."
+        },
+        "bin": {
+          "type": "string",
+          "maxLength": 400,
+          "description": "Executável: nome no PATH ou caminho (relativo à pasta deste arquivo, ou com ~). Vazio = padrão do bridge."
+        },
+        "configDir": {
+          "type": "string",
+          "maxLength": 400,
+          "description": "Pasta da conta (CLAUDE_CONFIG_DIR / CODEX_HOME): relativa à pasta deste arquivo, absoluta ou com ~. Vazio = a padrão."
+        },
+        "model": {
+          "type": "string",
+          "description": "Modelo padrão do Perfil. Vazio = padrão da CLI.",
+          "anyOf": [
+            {
+              "maxLength": 0
+            },
+            {
+              "pattern": "^[A-Za-z0-9._\\-\\[\\]]{1,80}$"
+            }
+          ]
+        },
+        "effort": {
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "minimal",
+            "ultra"
+          ],
+          "description": "Esforço padrão. Claude: low..max; Codex: minimal..ultra."
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Teto de execuções simultâneas do Perfil."
+        },
+        "fallbackId": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Perfil reserva: key de outro Perfil desta configuração ou id de um Perfil, do mesmo Adapter."
+        },
+        "threshold": {
+          "type": "integer",
+          "minimum": 50,
+          "maximum": 100,
+          "description": "Limiar (%) da Janela de uso a partir do qual a reserva assume."
+        },
+        "ignoreUserConfig": {
+          "type": "boolean",
+          "description": "Codex: --ignore-user-config (padrão true)."
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Telemetria deste Perfil (o destino e os headers são do bridge, por nome de variável).",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Trace OTLP do bridge por execução."
+            },
+            "native": {
+              "type": "boolean",
+              "description": "Telemetria nativa da CLI."
+            },
+            "content": {
+              "type": "boolean",
+              "description": "Incluir prompt e resposta."
+            }
+          }
+        }
+      }
+    }
+  }
+}

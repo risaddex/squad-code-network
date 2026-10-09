@@ -250,6 +250,7 @@ A lista completa está no [guia](docs/GUIA.md#-controles).
 | `SQUAD_PROJECTS_DIR` | `./projects` | Raiz das pastas de trabalho dos agentes |
 | `SQUAD_DATA_DIR` | `./data` | Pasta do banco SQLite (`squad.db`) |
 | `SQUAD_CONFIG` | `./squad.local.json` | Arquivo de configuração local usado no lugar do `squad.local.json` |
+| `SQUAD_CONFIG_SHARED` | `./squad.config.json` | Arquivo usado no lugar do `squad.config.json` (testes) |
 | `SQUAD_PLUGINS` | (vazio) | Pastas de plugins extras, separadas por `:` (`;` no Windows) |
 | `SQUAD_CODEX_BIN` | `codex` | Executável do Codex usado pelos Perfis Codex sem executável próprio |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | (vazio) | Destino OTLP/HTTP dos traces quando Configurações > Telemetria não define um |
@@ -337,6 +338,7 @@ para o local):
 
 ```json
 {
+  "$schema": "./schemas/squad.schema.json",
   "plugins": {
     "paths": ["../meus-plugins/acme", "~/squad-plugins/pessoal"],
     "disabled": []
@@ -368,8 +370,11 @@ padrão. Segredos nunca entram aqui: só nomes de variáveis de ambiente.
 }
 ```
 
-Eles viram os Perfis `cfg-<key>` no banco, somente leitura no app (edite o arquivo e recarregue a página); entre
-`squad.config.json` e `squad.local.json` a mescla é por `key`, campo a campo. Perfil que sai do arquivo sai do banco.
+Eles viram os Perfis `cfg-<key>` no banco; entre `squad.config.json` e `squad.local.json` a mescla é por `key`, campo a
+campo, e Perfil que sai do arquivo sai do banco. Editar, Tornar padrão e Excluir na aba Perfis gravam de volta no arquivo
+(só os campos alterados, com cópia `.bak`). Um item com formato inválido não trava os outros: ele fica como estava e o aviso
+aparece no card. O `$schema` aponta para `schemas/squad.schema.json` (o manifesto do plugin tem `schemas/squad-plugin.schema.json`
+e o frontmatter dos agentes, `schemas/squad-agent.schema.json`), e o editor passa a validar e completar os campos.
 
 Depois de editar um plugin, basta recarregar a página. Os plugins carregados e os avisos (arquivo recusado, valor
 inválido) aparecem no log do bridge, em Configurações > Plugins e em `GET /api/plugins`. Formato completo e regras:

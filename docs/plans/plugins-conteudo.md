@@ -16,13 +16,14 @@ upstream mais um carregador genérico; o conteúdo específico de uma empresa vi
 ## Configuração
 
 Ordem (o último vence campo a campo; `plugins.paths` é concatenado sem repetir; `plugins.disabled` vale o do último arquivo que o declara; `profiles` são mesclados por `key`):
-1. `squad.config.json` (raiz do app, opcional; o upstream não tem)
+1. `squad.config.json` (raiz do app, opcional; o upstream não tem); `SQUAD_CONFIG_SHARED=<arquivo>` o substitui (testes)
 2. `squad.local.json` (raiz do app, git-ignored)
 3. `SQUAD_CONFIG=<arquivo>` (substitui o item 2; usado nos testes)
 4. `SQUAD_PLUGINS=<dir>[:<dir>...]` (separador `path.delimiter`), soma aos `plugins.paths`
 
 ```json
 {
+  "$schema": "./schemas/squad.schema.json",
   "plugins": {
     "paths": ["../minha-empresa-squad/plugin", "~/squad-plugins/pessoal"],
     "disabled": ["pessoal"]
@@ -48,8 +49,8 @@ Ordem (o último vence campo a campo; `plugins.paths` é concatenado sem repetir
 
 Cada item de `profiles` usa **os mesmos campos de `POST /api/profiles`** mais `key`:
 `key, name, adapter (claude|codex), bin, configDir, model, effort, concurrency, fallbackId, threshold, ignoreUserConfig,
-telemetry {enabled, native, content}`. Campo desconhecido: aviso e ignorado. Em `telemetry` só passam `enabled`, `native` e
-`content` booleanos (outra chave ou tipo: aviso e ignorada); headers de telemetria são configuração do bridge, nunca do Perfil. O diretório da conta é `configDir` (o mesmo nome da
+telemetry {enabled, native, content}` (formato em `schemas/squad.schema.json`, `$defs.profile`). Campo desconhecido: aviso e
+ignorado (inclusive dentro de `telemetry`); headers de telemetria são configuração do bridge, nunca do Perfil. O diretório da conta é `configDir` (o mesmo nome da
 API; vira a coluna `config_dir` e chega ao processo como `CLAUDE_CONFIG_DIR` / `CODEX_HOME`).
 
 - `key`: `/^[a-z0-9][a-z0-9-]{0,40}$/`, única no arquivo. O Perfil fica no banco com o id estável `cfg-<key>`.
@@ -75,18 +76,94 @@ termina sem erro de gravação (ex.: nome já usado por um Perfil manual); senã
   Perfil padrão (regra existente). Se ele era o padrão, "Claude (padrão)" (ou o primeiro que sobrar) assume. `usage_daily` e as
   Janelas de uso ficam pelo id: se a `key` voltar, o mesmo `cfg-<key>` religa o histórico (uma reserva manual apontada para ele
   não volta).
-- Perfil declarado mas inválido: a linha fica como estava (ou não é criada) e vai um aviso.
-- Configuração inválida (arquivo ilegível, JSON inválido, `profiles` que não é lista, item sem `key` válida ou repetida): nada
-  muda nos Perfis de configuração (não apaga por erro) e vai um aviso.
+- Trava parcial: cada item vale por si. Item sem `key` válida (ou que não é objeto): aviso e ignorado. Item com `key` válida e
+  campo inválido no schema (tipo, enum, faixa, formato), repetido no mesmo arquivo ou acima de 50 Perfis: marcado `invalid` (aviso
+  com arquivo, key e campo, ex. `squad.local.json: Perfil ruim: effort: valor "turbo" não aceito (...)`); o `cfg-<key>` existente
+  fica como estava (nem removido, nem alterado) e, se não existe, não é criado. O mesmo vale quando `validateProfile` recusa o
+  Perfil mesclado (ex.: `configDir` inexistente). Os demais itens sincronizam normalmente. `GET /api/profiles` traz em cada Perfil
+  de configuração `configError` (mensagens) e `configFiles` (arquivos que o declaram, do de menor precedência para o de maior).
+- Configuração inválida no nível do arquivo (ilegível, JSON inválido, não é objeto, `profiles` que não é lista): nada muda nos
+  Perfis de configuração (não apaga por erro) e vai um aviso.
 - `defaultProfile` desconhecido: aviso, o padrão atual fica.
-- Avisos: em `warnings` de `#squad-plugins` / `GET /api/plugins` e em `configWarnings` de `GET /api/profiles`, que também traz
-  `configDefault` (nome do arquivo quando o `defaultProfile` está valendo, senão `''`). Cada Perfil traz `source` e `sourceFile`.
-- Rotas: `PUT`/`DELETE /api/profiles/cfg-*` e `POST .../default` de um Perfil da configuração respondem 409 (mensagem cita o
-  arquivo); com `defaultProfile` valendo, `POST .../default` de qualquer Perfil também responde 409. `test` e `refresh` seguem.
-- UI (Configurações > Perfis): selo com o nome do arquivo de origem (caminho no `title`), sem Editar/Excluir/Tornar padrão, dica
-  "edite o arquivo e recarregue a página"; Testar e Atualizar uso continuam. Avisos da configuração aparecem acima da lista.
-- `GET /api/plugins.config` traz `profiles` já mesclados (`{key, ...campos, source, files}`), `defaultProfile`,
-  `defaultProfileFile` e `profilesError`.
+- Avisos: em `warnings` de `#squad-plugins` / `GET /api/plugins` e em `configWarnings` de `GET /api/profiles` (os do carregador sobre
+  `profiles`/`defaultProfile` mais os da sincronização), que também traz `configDefault` (nome do arquivo quando o
+  `defaultProfile` está valendo, senão `''`), `configDefaultDeclared` e `configDefaultTarget` (arquivo onde "Tornar padrão"
+  grava). Cada Perfil traz `source` e `sourceFile`.
+- `GET /api/plugins.config` traz `profiles` já mesclados (`{key, ...campos, source, files, invalid?}`), `defaultProfile`,
+  `defaultProfileFile`, `profilesError`, `localFile`, `hashes` e `profileWarnings`.
+
+### Gravar no arquivo de origem
+
+Perfis criados pela tela continuam no banco. Um Perfil de configuração é alterado no arquivo, nunca na tabela (a sincronização
+que vem em seguida traz a mudança):
+- `PUT /api/profiles/cfg-<key>`: primeiro os tipos do corpo (texto, inteiro, booleano, `telemetry` só com
+  `enabled/native/content` booleanos; `null` ou `"3"` = 400, nada é convertido). As mudanças são o que difere do Perfil efetivo:
+  `bin`/`configDir` comparados depois de resolvidos contra a pasta do arquivo de destino (relativos e `~` valem como na leitura) e
+  gravados como a pessoa escreveu; `telemetry` chave a chave, e só as chaves que mudaram entram no objeto `telemetry` do próprio
+  item (as herdadas de outro arquivo não são copiadas); a reserva que é Perfil de configuração vai como `key`. Vão **só os campos
+  alterados**, no item daquela `key` do arquivo de maior precedência que a declara (o local vence o compartilhado), mantendo o resto
+  do arquivo. Antes de gravar: o item exato que será persistido passa pelo schema e o Perfil que vai resultar (a entrada mesclada
+  com as mudanças) passa por `validateProfile` e pelas regras de reserva; nome já usado = 409, troca de Adapter = 400. Se a
+  sincronização depois da escrita recusar o Perfil, a resposta é 400 dizendo que gravou e por que foi recusado. Sem mudança, nada é
+  gravado. Responde `{profile, file, changed}`.
+- `POST /api/profiles/:id/default`: quando o Perfil vem da configuração ou a configuração declara `defaultProfile`, grava
+  `defaultProfile` (a `key`, ou o id de um Perfil do banco) no arquivo que o declara, ou no local (`squad.local.json`, ou o
+  arquivo de `SQUAD_CONFIG`) se nenhum declara; o arquivo é criado se não existir. Sem nada disso continua só no banco.
+- `DELETE /api/profiles/cfg-<key>`: remove o item do arquivo. Recusado (409) se a `key` também está num arquivo de menor
+  precedência (ele continuaria vindo de lá; a mensagem diz de onde) ou se é o Perfil padrão.
+- Item com formato inválido (`invalid`): `PUT`/`DELETE`/padrão respondem 409 até o arquivo ser corrigido.
+- Uma operação por vez, inteira (`configOp`): releitura, validação (inclusive "é o padrão?"), escrita e a sincronização depois
+  dela; duas requisições sobre o mesmo Perfil (ex.: tornar padrão e excluir) nunca se intercalam. PUT, DELETE e "tornar padrão" de
+  Perfis do banco passam pela mesma fila (a decisão de gravar o padrão no arquivo é tomada dentro dela), e excluir o Perfil que é o
+  padrão efetivo (no banco ou em `defaultProfile`) é recusado lá dentro.
+- Configuração com erro no nível do arquivo (`profilesError`, arquivos em `config.errorFiles`): PUT, DELETE e "tornar padrão" que
+  gravariam na configuração respondem 409 citando o arquivo antes de escrever qualquer coisa (a sincronização estaria travada).
+- Depois de gravar e sincronizar, o banco é conferido: DELETE = o Perfil sumiu; PUT = os valores efetivos alterados estão lá;
+  padrão = o Perfil é o padrão. Se não bateu, a resposta é erro (500) dizendo que gravou e o que não foi aplicado.
+- Escrita (`writeConfigFile`): o texto é lido e conferido contra o sha1 da última leitura do bridge (`config.hashes`); depois da
+  validação assíncrona ele é lido e conferido de novo, e daí até o `rename` tudo é síncrono (nenhum `await` entre a última
+  conferência e a troca). Mudou = 409 e nada é escrito; depois de uma leitura (recarregar a página) a edição passa.
+- Arquivo que é link simbólico: grava no destino real (`realpath`), na pasta do destino; o link continua link.
+- Temporários com nome aleatório, criados com `wx` (exclusivo) no modo do arquivo original (`stat.mode`; arquivo novo: `0600`),
+  `fsync` e `rename`; dono e grupo do original são repassados com `fchown` quando o sistema deixa (EPERM e afins são ignorados:
+  na prática o grupo). A cópia `.bak` (com o texto conferido) é escrita do mesmo jeito: um `.bak` existente que seja link é
+  substituído, nunca seguido. JSON com 2 espaços + `\n`. Depois de gravar: `invalidate()` do carregador e nova sincronização.
+- Teste: `SQUAD_TEST_CONFIG_WRITE_PAUSE_MS` põe uma pausa entre a primeira leitura e a escrita (só para simular uma edição no meio).
+- Um arquivo de configuração que não existe só não tem Perfis (os dele saem); um que existe e não pode ser lido não muda nada.
+
+#### Riscos residuais
+
+Sem lock do sistema operacional (o Node não tem `flock`/`openat` portáveis), três janelas continuam abertas:
+- **Escritor externo entre a última conferência e o `rename`.** A releitura com sha1 e o `rename` são síncronos e seguidos, mas um
+  editor que salve exatamente nesse intervalo (microssegundos) é sobrescrito. Mitigação: o `.bak` guarda o texto conferido e,
+  em qualquer outro momento da operação, a mudança dá 409 sem escrever nada.
+- **Troca do symlink durante a operação.** O destino é resolvido (`realpath`) no início; se o link for trocado para outro arquivo
+  depois disso, a escrita vai para o destino antigo (o conteúdo do novo nunca é lido nem sobrescrito). A conferência por hash do
+  destino antigo continua valendo, e a próxima leitura do bridge segue o link novo.
+- **Dono, grupo e ACL.** O modo (`stat.mode`) é preservado e o grupo é repassado com `fchown` quando permitido; o dono só se o
+  processo tiver permissão (normalmente não) e ACLs/atributos estendidos não são copiados, porque o arquivo é substituído por
+  `rename`. Quem depende de ACL no arquivo de configuração deve reaplicá-la ou editar o arquivo à mão.
+- UI: o Perfil de configuração tem Editar (o formulário avisa "salvar grava em <arquivo>" e o botão diz "Salvar em <arquivo>"),
+  Tornar padrão e Excluir com confirmação em linha que cita o arquivo; Excluir some quando a `key` está em mais de um arquivo.
+  Item inválido: selo "FORMATO INVÁLIDO NO ARQUIVO", as mensagens no card e só Testar/Atualizar uso.
+
+### JSON Schema
+
+`schemas/squad.schema.json` (configuração: `$schema`, `plugins` {`paths`, `disabled`}, `runtime`, `profiles`, `defaultProfile`),
+`schemas/squad-plugin.schema.json` (manifesto, só campos de conteúdo) e `schemas/squad-agent.schema.json` (frontmatter de `agents/*.md`, para referência
+e validação), draft 2020-12, descrições em pt-BR, patterns e enums iguais às constantes de `plugins.js` (`CONSTANTS`; um teste
+compara). Nos arquivos, `"$schema": "./schemas/squad.schema.json"` (caminho relativo ao arquivo) liga a validação no editor; o
+bridge aceita a chave. `schema.js` é um validador sem dependências do subconjunto usado (`type`, `properties`, `required`,
+`additionalProperties`, `items`, `enum`, `const`, `pattern`, `minimum`/`maximum`, `minLength`/`maxLength`, `minItems`/`maxItems`,
+`exclusiveMinimum`/`exclusiveMaximum`, `$ref` local com detecção de ciclo e limite de 64 refs aninhadas (erro de validação, não
+estouro de pilha), `oneOf`/`anyOf`), com erros por caminho (`profiles[1].effort: ...`). Uso em `plugins.js`: campo desconhecido = aviso e
+ignorado (configuração, manifesto, itens, frontmatter); outro erro de schema recusa o item (Perfil, categoria, avatar, tema,
+agente) com o caminho do campo. As checagens semânticas continuam e falam primeiro (realpath, assinatura de imagem, limites,
+cores, chaves reservadas); os erros de `runtime` e de `plugins.paths`/`plugins.disabled`/`defaultProfile` seguem com as mensagens de antes.
+`runtime.maxBudgetUsd` é igual no código e no schema: número maior que 0 e até 1000, ou o mesmo como texto decimal simples com até
+4 casas (`BUDGET_RE`: sem sinal, expoente, hexadecimal, espaços ou ponto inicial; `0.0000` fica de fora pelo lookahead),
+`""`/`null` = sem teto. Os dois schemas repetem a mesma definição de
+`runtime` (o `$ref` é só local); um teste confere que são iguais e que o schema aceita exatamente o que `validateRuntime` aceita.
 
 ## Formato do Plugin
 
