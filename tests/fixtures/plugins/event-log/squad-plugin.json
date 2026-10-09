@@ -1,0 +1,1 @@
+{ "id": "event-log", "name": "Event log", "version": "1.0.0", "description": "Plugin de teste: guarda em memória cada evento que recebe (rota GET /log).", "server": "server.mjs", "capabilities": ["run.content"] }

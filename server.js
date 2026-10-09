@@ -19,6 +19,8 @@
  *   SQUAD_CONFIG_SHARED  shared configuration file used instead of ./squad.config.json
  *   SQUAD_PLUGINS       extra plugin folders, separated by the platform's path delimiter
  *   SQUAD_PLUGIN_REGISTER_TIMEOUT_MS  time limit of a plugin's register(ctx) (default 10000; tests)
+ *   SQUAD_PLUGIN_HOOK_TIMEOUT_MS      time limit of one event handler / run:beforeSpawn handler (default: plugins.hookTimeoutMs, 3000; tests)
+ *   SQUAD_PLUGIN_BEFORESPAWN_BUDGET_MS  total time of the run:beforeSpawn handlers of one run (default 5000; tests)
  */
 const http = require('node:http');
 const fs = require('node:fs');
@@ -106,6 +108,7 @@ const MAX_EVENTS = 5000;
 const MAX_BODY = 2 * 1024 * 1024;
 
 const runs = new Map();
+let shuttingDown = false; // set by shutdown(): no run is spawned from then on
 let maxConcurrent = 2;
 // Version probes (binVersion): `<bin> --version` once per resolved executable while it answers; a probe in flight is shared and a
 // failure is kept for PROBE_RETRY_MS, as is the PATH lookup per name, so the first GET of many Perfis on one executable is one probe.
@@ -154,7 +157,7 @@ function tokenOk(req, url) {
 
 // Plugins with code (plugin-host.js, docs/plans/plugins.md): found now (read-only), imported only once the port is ours (listen
 // callback below). With none, `pending` stays false and nothing here costs a thing.
-const pluginHost = require('./plugin-host.js').createPluginHost({ getDiscovery: () => loadPlugins().discovery, dataRoot: DATA_DIR, http: { readBody, json, fail }, maxBody: MAX_BODY });
+const pluginHost = require('./plugin-host.js').createPluginHost({ getDiscovery: () => loadPlugins().discovery, dataRoot: DATA_DIR, http: { readBody, json, fail }, maxBody: MAX_BODY, getRegistry: () => registry });
 
 /** Resolve an executable name to a full path (Windows needs to know .exe vs .cmd). */
 function resolveBin(bin) {
@@ -257,8 +260,11 @@ const missingAdapter = p => `O Adapter "${p.adapter}" do Perfil "${p.name}" não
 let windowsWarned = 0;
 function recordWindows(profileId, windows, source) {
   if (!store || !windows) return false;
-  try { store.saveWindows(profileId, windows); return true; }
+  try { store.saveWindows(profileId, windows); }
   catch (e) { if (windowsWarned++ < 3) console.warn(`Janelas de uso do Perfil ${profileId} (${source}) não gravadas: ${e.message}`); return false; }
+  // profile:usage for the plugins: what was seen, where from, and whether the Perfil is now over its threshold.
+  pluginHost.emit('profile:usage', () => { const p = getProfile(profileId); return { profileId, adapter: p?.adapter ?? null, windows: JSON.parse(JSON.stringify(windows)), source, overThreshold: p ? overLimit(p) : false }; });
+  return true;
 }
 
 /* ---------- Perfis (profiles) ---------- */
@@ -305,7 +311,7 @@ async function profileStatus(p) {
   return { resolved: info.resolved, version: info.version, configDirOk, error: error || null };
 }
 async function profileView(p) {
-  const view = { ...p, status: await profileStatus(p), windows: windowsOf(p.id), active: activeOf(p.id), activeCalls: callsOf(p.id) };
+  const view = { ...p, status: await profileStatus(p), windows: windowsOf(p.id), active: activeOf(p.id), activeCalls: callsOf(p.id), adapterSource: registry.get(p.adapter)?.source ?? null };
   if (p.source === 'config') {
     // configFiles: every file that declares it (lowest precedence first; the last one is where edits go); configError: left as it was.
     const entry = cfgProfiles.cfg?.profiles.find(e => `cfg-${e.key}` === p.id);
@@ -317,7 +323,7 @@ async function profileView(p) {
   return view;
 }
 
-function adaptersCatalog() { return Object.fromEntries(registry.kinds().map(k => [k, registry.get(k).catalog()])); }
+function adaptersCatalog() { return Object.fromEntries(registry.kinds().map(k => [k, { ...registry.get(k).catalog(), adapterSource: registry.get(k).source }])); }
 
 const PROFILE_FIELDS = require('./plugins.js').CONSTANTS.PROFILE_FIELDS;
 /** Checks a Perfil sent by the page (a PUT may send only some fields: the rest comes from `current`). */
@@ -742,6 +748,8 @@ function sendTrace(run, exit) {
 }
 /** The CLIs' own telemetry (Perfil telemetry.native): the Adapter decides how it reaches its CLI (env vars, -c flags...). */
 function nativeTelemetry(run, impl, profile, env, args, warn) {
+  // An Adapter of a plugin never gets the OTLP headers (they carry secrets): the person is told instead.
+  if (impl.builtin === false) { if (profile.telemetry?.enabled && profile.telemetry.native) warn(`Telemetria nativa não é entregue a Adapters de plugin (${impl.source}): o Perfil "${profile.name}" a pediu e ela foi ignorada.`); return; }
   const cfg = telemetryConfig();
   if (!impl.nativeTelemetry || !profile.telemetry?.enabled || !profile.telemetry.native || !cfg.endpoint) return;
   impl.nativeTelemetry(run, profile, { env, args, warn, base: otlpBase(cfg.endpoint), cfg, content: !!profile.telemetry.content, headers: telemetryHeaders(cfg), attrs: squadAttrs(run) });
@@ -757,6 +765,9 @@ function pushEvent(run, event) {
   for (const res of run.clients) res.write(line);
   persistEvent(run, event);
   observe(run, event);
+  // stream_event only reaches the handlers that asked ({partial: true}, with run.content); nothing is built without a listener.
+  const seq = ++run.evSeq;
+  if (pluginHost.listens('run:event')) pluginHost.emit('run:event', () => ({ runId: run.id, seq, at: new Date().toISOString(), event }));
 }
 
 /* What the bridge learns from the stream: tool spans (telemetry), the model, the Adapter's usage windows; a Chamado's text also goes to
@@ -770,11 +781,11 @@ function observe(run, event) {
   if (event.type === 'system' && event.subtype === 'init' && typeof event.model === 'string' && event.model) run.seenModel = event.model;
   if (run.impl?.onEvent) {
     // Hot path of every event: an Adapter that throws never breaks the stream (warned once per run).
-    try { const seen = run.impl.onEvent(run, event); if (seen?.windows) recordWindows(run.profileId, seen.windows, 'event'); }
+    try { const seen = run.impl.onEvent(run.adapterRun || run, event); if (seen?.windows) recordWindows(run.profileId, seen.windows, 'event'); }
     catch (e) { if (!run.onEventWarned) { run.onEventWarned = true; console.warn(`Adapter ${run.adapter}: onEvent falhou (execução ${run.id}): ${e.message}`); } }
   }
   if (run.parent && event.type === 'assistant' && !event.parent_tool_use_id && run.parent.status === 'running') {
-    pushEvent(run.parent, { ...event, parent_tool_use_id: run.toolUseId || run.parent.translator?.openCall() || null });
+    pushEvent(run.parent, { ...structuredClone(event), parent_tool_use_id: run.toolUseId || run.parent.translator?.openCall() || null });
   }
 }
 /* Run history (db.js): events go to the database in small batches. Partial text deltas are not kept (the console never shows
@@ -866,6 +877,17 @@ function validateAgents(value) {
   return entries.length ? { agents: out, meta } : null;
 }
 
+const MIN_ENV_RE = /^(PATH|HOME|USER|LOGNAME|LANG|LANGUAGE|LC_[A-Z_]+|TMPDIR|TEMP|TMP|SHELL|TERM|SystemRoot|ComSpec|PATHEXT|USERPROFILE|APPDATA|LOCALAPPDATA|WINDIR)$/i;
+/** What an Adapter of a plugin sees of a run: no parent, events, files, clients or other Perfis, and no prompt of the colleagues. */
+function pluginOptsView(opts) {
+  const { agents, agentMeta, ...rest } = opts;
+  return { ...rest, agents: agents ? Object.fromEntries(Object.entries(agents).map(([k, a]) => { const { prompt, ...others } = a; return [k, others]; })) : null };
+}
+function pluginRunView(run, effort) {
+  const view = { id: run.id, kind: run.meta.kind, label: run.label, parentRunId: run.parentRunId, effort: effort || '', profile: run.profile, cwd: run.cwd, startedAt: run.startedAt, opts: pluginOptsView(run.opts) };
+  for (const k of ['model', 'seenModel', 'result', 'endedAt', 'translator', 'status']) Object.defineProperty(view, k, { enumerable: true, get: () => run[k] });
+  return view;
+}
 const mcpTokens = new Map(); // sha256(token) → run (Codex runs with squad colleagues)
 const bearerHash = t => crypto.createHash('sha256').update(String(t)).digest('hex');
 
@@ -914,7 +936,10 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
   const warnings = [];
   const warn = message => warnings.push(message);
   const { model, effort } = impl.resolveModelEffort({ opts, profile, model: opts.model || profile.model || '', effort: opts.effort || profile.effort || '', warn });
-  const env = { ...process.env, ...(opts.projectRun ? { GIT_CEILING_DIRECTORIES: gitCeiling() } : {}) };
+  // An Adapter of a plugin gets a minimal environment (PATH, HOME, locale, temp folders... plus what its manifest declares in `env`);
+  // the bridge's own variables (tokens, API keys) stay behind. The built-ins keep the whole environment.
+  const base = impl.builtin === false ? Object.fromEntries(Object.entries(process.env).filter(([k]) => MIN_ENV_RE.test(k) || (impl.envNames || []).includes(k))) : process.env;
+  const env = { ...base, ...(opts.projectRun ? { GIT_CEILING_DIRECTORIES: gitCeiling() } : {}) };
   // Only what the Perfil decides reaches the child: inherited telemetry switches (OTEL_*, CLAUDE_CODE_ENABLE_TELEMETRY,
   // OTEL_LOG_USER_PROMPTS…) are dropped here and nativeTelemetry sets them again when the Perfil turns them on.
   for (const k of Object.keys(env)) if (INHERITED_TELEMETRY.test(k)) delete env[k];
@@ -925,9 +950,32 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
     // Without a database yet (direct API use before the setup), the run still works but stays out of the history.
     meta: dbModule.runMeta(body.meta), project: typeof body.options?.project === 'string' ? body.options.project.slice(0, 80) : '', persist: !!store, saved: 0, pending: [], flushTimer: null,
     profile, impl, profileId: profile.id, profileName: profile.name, adapter, model, opts, prompt, parent, toolUseId: internal.toolUseId || null, rootRunId: parent ? parent.rootRunId : id,
-    parentRunId: parent ? parent.id : null, children: new Set(), toolSpans: profile.telemetry?.enabled ? new Map() : null, translator: null, files: [],
+    parentRunId: parent ? parent.id : null, children: new Set(), evSeq: 0, toolSpans: profile.telemetry?.enabled ? new Map() : null, translator: null, files: [],
   };
   run.done = new Promise(resolve => { run.resolveDone = resolve; });
+  if (impl.builtin === false) run.adapterRun = pluginRunView(run, effort);
+  const forAdapter = run.adapterRun || run;
+
+  // run:beforeSpawn (plugins with run.mutate): after the slot was taken, before anything exists to undo (no temp files, no process, not in
+  // `runs`, not in the history), so a veto leaves nothing behind and the caller's `release` gives the slot back. Only with a plugin that
+  // listens, so without one there is no extra await. parentAlive below stays synchronous with the spawn.
+  // Not for the usage probe of a Perfil (internal.exact / kind 'probe'): it is the bridge's own housekeeping, not an agent's run.
+  let pluginNotes = [];
+  if (!internal.exact && run.meta.kind !== 'probe' && pluginHost.listens('run:beforeSpawn')) {
+    const hook = await pluginHost.beforeSpawn({ runId: id, parentRunId: run.parentRunId, isCall: !!parent, kind: run.meta.kind, project: run.project, projectId: run.meta.projectId, agentId: run.meta.agentId, featureId: run.meta.featureId,
+      profile: { id: profile.id, name: profile.name, adapter }, model: model || '', effort: effort || '', tools: opts.tools, permissionMode: opts.permissionMode ?? null, cwd: opts.cwd,
+      promptChars: prompt.length, hasSystemPrompt: !!systemPrompt.trim(), agentSlugs: Object.keys(opts.agents || {}), prompt, systemPrompt });
+    pluginNotes = hook.notes;
+    if (hook.appendSystem) {
+      // The addition is never dropped silently: it is the base that gives way to the 100k limit, and the run says so.
+      const extra = hook.appendSystem.slice(0, 100000);
+      if (extra.length < hook.appendSystem.length) warn(`Os acréscimos dos plugins passaram de 100000 caracteres e foram cortados em ${hook.appendSystem.length - extra.length}.`);
+      const base = systemPrompt.slice(0, Math.max(0, 100000 - extra.length - 2));
+      if (base.length < systemPrompt.length) warn(`O system prompt base foi cortado em ${systemPrompt.length - base.length} caracteres para caber o acréscimo dos plugins (limite de 100000).`);
+      systemPrompt = [base, extra].filter(Boolean).join('\n\n');
+    }
+  }
+  if (shuttingDown) throw Object.assign(new Error('O bridge está encerrando.'), { status: 503 });
 
   // `files` is filled by the Adapter as it writes: whatever fails before the child owns them (prepare, telemetry, spawn, a dead
   // caller) removes them here.
@@ -935,12 +983,13 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
   const dropFiles = () => { for (const f of files) fsp.rm(f.path, { force: true }).catch(() => {}); };
   let prep, child;
   try {
-    prep = await impl.prepare({ id, run, opts, profile, model, effort, prompt, systemPrompt, env, warn, tmpDir: TMP_DIR, files });
+    prep = await impl.prepare({ id, run: forAdapter, opts: impl.builtin === false ? forAdapter.opts : opts, profile, model, effort, prompt, systemPrompt, env, warn, tmpDir: TMP_DIR, files });
     for (const f of prep.files || []) if (!files.includes(f)) files.push(f);
     if (prep.model !== undefined) run.model = prep.model;
     run.translator = prep.translator || null;
     nativeTelemetry(run, impl, profile, env, prep.args, warn);
     prep.args.push(...(prep.tail || [])); // after the telemetry flags (codex ends its argv with "-": the prompt comes on stdin)
+    if (shuttingDown) throw Object.assign(new Error('O bridge está encerrando.'), { status: 503 });
     // A Chamado never outlives its caller: checked again here, with no await before the spawn and parent.children.add below.
     if (parent && !parentAlive(parent)) throw Object.assign(new Error('A execução que fez o Chamado já terminou ou foi cancelada.'), { status: 409 });
     child = spawnBin(resolved, prep.args, { cwd: opts.cwd, windowsHide: true, detached: !IS_WIN, env, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -951,8 +1000,12 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
   if (parent) parent.children.add(run);
   runs.set(id, run);
   if (run.persist) try { store.insertRun(run); } catch (e) { run.persist = false; console.warn(`Histórico da execução ${id} não gravado: ${e.message}`); }
+  // Before the first event, so an observer sees run:start ahead of every run:event of the run.
+  pluginHost.emit('run:start', () => ({ runId: id, parentRunId: run.parentRunId, rootRunId: run.rootRunId, kind: run.meta.kind, label: run.label, project: run.project, projectId: run.meta.projectId, agentId: run.meta.agentId, featureId: run.meta.featureId,
+    profileId: profile.id, profileName: profile.name, adapter, model: run.model || null, cwd: run.cwd, pid: child.pid, startedAt: run.startedAt, fallbackFrom: fallbackFrom || null, prompt, systemPrompt }));
   pushEvent(run, { type: 'bridge', subtype: 'spawned', pid: child.pid, cwd: opts.cwd, args: run.args, at: run.startedAt, adapter });
   pushEvent(run, { type: 'bridge', subtype: 'profile', profileId: profile.id, name: profile.name, adapter, ...(fallbackFrom ? { fallbackFrom } : {}) });
+  for (const n of pluginNotes) pushEvent(run, { type: 'bridge', subtype: 'plugin', plugin: n.plugin, message: `plugin ${n.plugin} acrescentou ${n.chars} caracteres ao system prompt${n.cut ? ` (cortado de ${n.cut} pelo teto de 20000 por plugin)` : ''}` });
   for (const message of warnings) pushEvent(run, { type: 'bridge', subtype: 'warning', message });
 
   run.timer = setTimeout(() => { run.timedOut = true; pushEvent(run, { type: 'bridge', subtype: 'timeout', timeoutSec: opts.timeoutSec }); killTree(child); }, opts.timeoutSec * 1000);
@@ -961,7 +1014,7 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
     let evt; try { evt = JSON.parse(line); } catch { evt = null; }
     if (!evt || typeof evt !== 'object') return pushEvent(run, { type: 'raw', text: line.slice(0, 4000) });
     if (run.translator) { for (const e of run.translator.feed(evt)) pushEvent(run, e); return; }
-    if (evt.type === 'result') run.result = evt;
+    if (evt.type === 'result') run.result = structuredClone(evt); // a copy: what the stream and the plugins hold is not what the bridge keeps
     pushEvent(run, evt);
   };
   let buffer = '';
@@ -977,7 +1030,7 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
   let stderrTail = '';
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk).slice(-4000); pushEvent(run, { type: 'stderr', text: chunk.slice(0, 4000) }); });
-  child.on('error', err => { stderrTail += err.message; });
+  child.on('error', err => { stderrTail += err.message; run.spawnFailed = true; });
   child.on('close', code => {
     run.closing = true;
     clearTimeout(run.timer);
@@ -986,9 +1039,9 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
     for (const c of run.children) if (c.status === 'running') { c.cancelled = true; killTree(c.child); }
     run.endedAt = new Date().toISOString();
     let fin = {};
-    try { fin = impl.finish(run, { code, durationMs: Date.parse(run.endedAt) - Date.parse(run.startedAt) }) || {}; }
+    try { fin = impl.finish(forAdapter, { code, durationMs: Date.parse(run.endedAt) - Date.parse(run.startedAt) }) || {}; }
     catch (e) { console.warn(`Adapter ${adapter}: finish falhou: ${e.message}`); pushEvent(run, { type: 'bridge', subtype: 'warning', message: `O Adapter ${adapter} falhou ao encerrar a execução: ${String(e.message).slice(0, 500)}` }); }
-    if (fin.result) { run.result = fin.result; pushEvent(run, run.result); }
+    if (fin.result) { run.result = fin.result; pushEvent(run, structuredClone(fin.result)); }
     recordWindows(profile.id, fin.windows, 'session');
     const usage = fin.usage ?? null, model = fin.model || run.seenModel || run.model || null;
     const r = run.result || {};
@@ -1005,6 +1058,10 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
     pushEvent(run, exit);
     if (run.persist) try { store.finishRun(run, exit); } catch (e) { console.warn(`Histórico da execução ${id} não finalizado: ${e.message}`); }
     try { sendTrace(run, exit); } catch {}
+    // error: the text for run.content, the code (cancelled|timeout|spawn|exit|agent-error) for the rest (see plugin-host.js stripFinish).
+    const errorCode = !isError ? null : run.cancelled ? 'cancelled' : run.timedOut ? 'timeout' : run.spawnFailed ? 'spawn' : code !== 0 ? 'exit' : 'agent-error';
+    pluginHost.emit('run:finish', () => ({ runId: id, parentRunId: run.parentRunId, kind: run.meta.kind, profileId: profile.id, adapter, model: exit.model ?? null, status: run.status, isError, error: exit.error, errorCode, code, costUsd: exit.costUsd,
+      durationMs: exit.durationMs ?? (Date.parse(run.endedAt) - Date.parse(run.startedAt)), numTurns: exit.numTurns, usage, sessionId: exit.sessionId }));
     for (const res of run.clients) res.end();
     run.clients.clear();
     for (const f of run.files) fsp.rm(f.path, { force: true }).catch(() => {});
@@ -1154,6 +1211,11 @@ function memoryTag() {
 }
 
 /* ---------- http ---------- */
+/** workspace:saved for the plugins: only when something changed, and never with the workspace itself. */
+function workspaceSaved(saved, setup) {
+  if (!saved || saved.conflict || saved.unchanged || !saved.changes) return;
+  pluginHost.emit('workspace:saved', { rev: saved.rev, savedAt: saved.savedAt, changes: saved.changes, setup });
+}
 async function serveIndex(res) {
   if (pluginHost.pending) await pluginHost.ready;
   const file = path.join(ROOT, 'index.html');
@@ -1204,7 +1266,7 @@ async function handle(req, res) {
       if (info.version) engines.claude = true;
       const live = info.version ? { adapter: 'claude', ...info } : usable;
       if (!info.version && live) info = { ...info, version: live.version };
-      return json(res, 200, { ok: true, bridge: 'squad-code', claudeVersion: info.version, claudePath: info.resolved, claudeError: info.error, engines, engineAdapter: live?.adapter || null, enginePath: live?.resolved || null, defaultCwd: process.cwd(), projectsDir: longPath(PROJECTS_DIR), home: HOME, platform: process.platform, activeRuns: activeCount(), maxConcurrent, dbReady: !setupNeeded(), dbPath: store?.file || DB_FILE, profiles: listProfiles().length, plugins: pluginsOn(pluginsBody(activeContent(loadPlugins()))) });
+      return json(res, 200, { ok: true, bridge: 'squad-code', claudeVersion: info.version, claudePath: info.resolved, claudeError: info.error, engines, engineAdapter: live?.adapter || null, enginePath: live?.resolved || null, defaultCwd: process.cwd(), projectsDir: longPath(PROJECTS_DIR), home: HOME, platform: process.platform, adapterSources: Object.fromEntries(registry.kinds().map(k => [k, registry.get(k).source])), activeRuns: activeCount(), maxConcurrent, dbReady: !setupNeeded(), dbPath: store?.file || DB_FILE, profiles: listProfiles().length, plugins: pluginsOn(pluginsBody(activeContent(loadPlugins()))) });
     }
     // Every plugin (content without the avatars' data URLs, and the state of its code), plus the configuration they came from.
     if (req.method === 'GET' && url.pathname === '/api/plugins') return json(res, 200, pluginsBody(await pluginsWithProfiles()));
@@ -1217,6 +1279,7 @@ async function handle(req, res) {
       if (!store) { openDb(); await afterOpen(); }
       const saved = store.syncWorkspace(body, '', false);
       console.log(`Banco de dados criado: ${store.file}`);
+      workspaceSaved(saved, true);
       return json(res, 201, saved);
     }
     if (req.method === 'POST' && url.pathname === '/api/config') {
@@ -1278,6 +1341,7 @@ async function handle(req, res) {
         // The first workspace only comes through /api/setup, chosen by the person.
         if (setupNeeded()) return fail(res, 503, 'Nenhum banco de dados ainda. Crie um na tela inicial do SQUAD/CODE.');
         const saved = store.syncWorkspace(await readBody(req, MAX_WORKSPACE), url.searchParams.get('base') || '', url.searchParams.get('force') === '1');
+        workspaceSaved(saved, false);
         return json(res, saved.conflict ? 409 : 200, saved);
       }
     }
@@ -1372,6 +1436,7 @@ async function handle(req, res) {
 const server = http.createServer((req, res) => { handle(req, res).catch(err => { try { fail(res, 500, err.message); } catch {} }); });
 
 function shutdown() {
+  shuttingDown = true;
   for (const run of runs.values()) { if (run.child) { run.cancelled = true; killTree(run.child); } flushRun(run); }
   try { fs.rmSync(TMP_DIR, { recursive: true, force: true }); } catch {}
   server.close();

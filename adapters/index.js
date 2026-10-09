@@ -3,7 +3,7 @@
  * Registry of Adapters (ADR 0004, docs/plans/plugins.md). server.js asks it for everything that depends on the engine behind a Perfil
  * (executable, models and levels, argv, event translation, usage windows, settings.json), so no engine name is hard-coded there.
  * Every Adapter module is `module.exports = host => adapter`; `host` is what the bridge lends it (paths, helpers, recordWindows).
- * The built-ins (claude, codex) are loaded here; others come through register() (plugins, later phase).
+ * The built-ins (claude, codex) are loaded here; others come through register() (plugins), which returns the undo function.
  */
 const BUILTIN = ['claude', 'codex'];
 const KIND_RE = /^[a-z][a-z0-9-]{0,39}$/;
@@ -27,15 +27,19 @@ function validateAdapter(impl) {
 function createRegistry(host) {
   const map = new Map(); // insertion order = display order (built-ins first)
   const builtinKinds = [];
-  function add(impl, builtin, override) {
+  function add(impl, builtin, override, extra = {}) {
     validateAdapter(impl);
     if (map.has(impl.kind) && override !== true) throw new Error(`Adapter ${impl.kind} já registrado (use override para substituí-lo).`);
     // `builtin` marks what shipped with the bridge: an override of a built-in is not one, though builtinKinds() still lists the kind.
-    map.set(impl.kind, { ...impl, builtin });
+    const prev = map.get(impl.kind), entry = { ...impl, builtin, source: builtin ? 'builtin' : (typeof extra.source === 'string' ? extra.source : 'plugin'), envNames: builtin ? [] : [...(extra.env || [])] };
+    map.set(impl.kind, entry);
+    // undo (a plugin's registration that has to be taken back): the kind goes away, or the entry it replaced (a built-in) comes back.
+    // Does nothing when something else has been registered over this entry since.
+    return () => { if (map.get(impl.kind) !== entry) return; if (prev) map.set(impl.kind, prev); else map.delete(impl.kind); };
   }
   for (const kind of BUILTIN) { add(require(`./${kind}.js`)(host), true, false); builtinKinds.push(kind); }
   return {
-    register: (impl, { override = false } = {}) => add(impl, false, override),
+    register: (impl, { override = false, source, env } = {}) => add(impl, false, override, { source, env }),
     get: kind => map.get(kind) || null,
     has: kind => map.has(kind),
     kinds: () => [...map.keys()],

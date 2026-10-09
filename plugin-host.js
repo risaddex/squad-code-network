@@ -8,6 +8,9 @@
  *  - createPluginHost(): after the port is ours (server.js listen callback) imports the enabled `server` plugins in order and calls
  *    register(ctx). An error in one plugin never reaches the others or the core: its registrations are undone and dependents are off.
  *    Routes live under /api/plugins/<id>/ and are served by the core's handle() after token, Host and Origin checks.
+ *  - Events: observers (run:start, run:event, run:finish, profile:usage, workspace:saved) are read-only: a queue per plugin drained by
+ *    setImmediate, a time limit per handler, a circuit breaker after 20 failures in a row. run:beforeSpawn is the one hook that can
+ *    change a run (veto, appendSystem); handlers run in series within a total budget, fail-open unless the plugin is failClosed.
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -18,6 +21,12 @@ const { validate: schemaValidate } = require('./schema.js');
 
 const SETTINGS_MAX = 16 * 1024;
 const DISPOSE_MS = 1000;
+const QUEUE_MAX = 1000;       // pending events per plugin; past it the oldest is dropped (and counted)
+const BREAKER_AT = 20;        // consecutive failures of one handler that silence it
+const LOG_FAILS = 3;          // failures of a handler logged before it goes quiet
+const SPAWN_BUDGET_MS = 5000; // all the run:beforeSpawn handlers of one run together
+const APPEND_MAX = 20000;     // appendSystem, per plugin
+const CONTENT_KEYS = ['prompt', 'systemPrompt']; // only for plugins granted run.content (S-L9)
 const SEGMENT_RE = /^(?:(?!\.{1,2}$)[A-Za-z0-9._~-]+|:[A-Za-z_][A-Za-z0-9_]*)$/;
 const RESERVED_PARAMS = ['__proto__', 'constructor', 'prototype'];
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
@@ -34,7 +43,39 @@ function deepFreeze(v) {
   if (v && typeof v === 'object' && !Object.isFrozen(v)) { Object.freeze(v); for (const k of Object.keys(v)) deepFreeze(v[k]); }
   return v;
 }
-const denied = cap => Object.assign(new Error(`Capacidade "${cap}" não concedida`), { denied: true });
+/**
+ * run:event for a plugin without run.content: a projection by whitelist, never the text, inputs, results, stderr, raw lines, args or cwd.
+ * tool_use keeps only the tool's name, tool_result only whether it failed and its size in bytes, exit the outcome and the counters.
+ */
+function projectRunEvent(p) {
+  const e = p.event && typeof p.event === 'object' ? p.event : {};
+  const out = { runId: p.runId, seq: p.seq, at: p.at, type: typeof e.type === 'string' ? e.type : '', subtype: typeof e.subtype === 'string' ? e.subtype : null, parentToolUseId: typeof e.parent_tool_use_id === 'string' ? e.parent_tool_use_id : null };
+  const blocks = Array.isArray(e.message?.content) ? e.message.content : [];
+  const use = blocks.find(b => b?.type === 'tool_use');
+  if (use) out.toolName = String(use.name ?? '').slice(0, 100);
+  if (e.type === 'user') {
+    const results = blocks.filter(b => b?.type === 'tool_result');
+    if (results.length) { out.isError = results.some(b => b.is_error === true); out.bytes = results.reduce((n, b) => n + Buffer.byteLength(typeof b.content === 'string' ? b.content : JSON.stringify(b.content ?? ''), 'utf8'), 0); }
+  }
+  if (e.type === 'exit') Object.assign(out, { status: e.status ?? null, code: e.code ?? null, isError: !!e.isError, costUsd: e.costUsd ?? null, numTurns: e.numTurns ?? null, usage: e.usage ?? null });
+  return out;
+}
+/** run:finish without run.content: the error is only a code (the text may quote the agent's output) and there is no sessionId. */
+function stripFinish(p) {
+  const out = withoutContent(p);
+  const copy = { ...out, error: p.errorCode ?? null };
+  delete copy.errorCode; delete copy.sessionId;
+  return copy;
+}
+const STRIP = { 'run:event': projectRunEvent, 'run:finish': stripFinish };
+/** The payload without the fields that need run.content (the same object when it has none). */
+function withoutContent(p) {
+  if (!CONTENT_KEYS.some(k => k in p)) return p;
+  const copy = { ...p };
+  for (const k of CONTENT_KEYS) delete copy[k];
+  return copy;
+}
+const denied = (cap, raw) => Object.assign(new Error(raw ? cap : `Capacidade "${cap}" não concedida`), { denied: true });
 
 /** A signature of the plugins with code discovery found and of what the configuration says, to tell when a restart is needed (content is reread live). */
 function signature(disc) {
@@ -48,13 +89,17 @@ function signature(disc) {
  * getDiscovery() → { plugins, config, warnings }: the `discovery` of plugins.js' load() (cached; rereads when a file changed). The first
  * call is the start's snapshot: the code that runs is that list, and view().restartRequired says when the files no longer match it.
  * host.pending is true from load() until every plugin has been tried; host.ready is the promise to await meanwhile.
+ * getRegistry() → the Adapter registry (adapters/index.js), for ctx.registerAdapter.
  */
-function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process.env, log = console }) {
+function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process.env, log = console, getRegistry = null }) {
   const start = getDiscovery();
   const startSig = signature(start);
   const cfg = start.config || { enabled: [], entries: {}, hookTimeoutMs: CONSTANTS.PLUGIN_HOOK_TIMEOUT_MS };
   const registerMs = Number(env.SQUAD_PLUGIN_REGISTER_TIMEOUT_MS) || 10000;
   const budgetMs = Number(env.SQUAD_PLUGIN_LOAD_BUDGET_MS) || 30000; // all the register() calls together
+  const hookMs = Number(env.SQUAD_PLUGIN_HOOK_TIMEOUT_MS) || cfg.hookTimeoutMs || CONSTANTS.PLUGIN_HOOK_TIMEOUT_MS; // one event handler / one beforeSpawn handler
+  const spawnBudgetMs = Number(env.SQUAD_PLUGIN_BEFORESPAWN_BUDGET_MS) || SPAWN_BUDGET_MS;
+  const byEvent = new Map(); // event → [handler] of the plugins that are loaded, in plugin order
   const recs = new Map();  // key (the id, or id@folder for a second folder with the same id) → record
   const byId = new Map();  // id → the record that answers to it (the one that is not refused, else the first)
   let order = [];
@@ -68,7 +113,7 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
     return {
       ...p, status: p.status || (p.hasCode ? 'disabled' : 'data'), error: p.error || '',
       entry, caps: { asked, granted, missing: asked.filter(c => !granted.includes(c)) },
-      routes: [], events: [], adapters: [], disposers: [], api: undefined, ctx: null, frozen: false,
+      routes: [], events: [], adapters: [], undoAdapters: [], overrides: [], disposers: [], api: undefined, ctx: null, frozen: false, queue: null,
     };
   }
   for (const p of start.plugins) {
@@ -90,7 +135,15 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
   const all = () => [...recs.values()];
   const hasDisposers = () => host.pending || all().some(r => r.disposers.length);
 
+  function unsubscribe(r) {
+    for (const [event, list] of byEvent) { const keep = list.filter(h => h.r !== r); if (keep.length) byEvent.set(event, keep); else byEvent.delete(event); }
+    if (r.queue) r.queue.items.length = 0;
+  }
   function undo(r) {
+    unsubscribe(r);
+    // The Adapters it registered go away (a built-in it replaced comes back), the newest first.
+    for (const fn of r.undoAdapters.reverse()) { try { fn(); } catch (e) { log.warn(`[plugin ${r.id}] não foi possível desfazer um Adapter: ${e.message}`); } }
+    r.undoAdapters = []; r.overrides = [];
     r.routes = []; r.events = []; r.adapters = [];
     const fns = r.disposers; r.disposers = [];
     return Promise.allSettled(fns.map(fn => withTimeout(Promise.resolve().then(fn), DISPOSE_MS, 'onDispose passou de 1 s')));
@@ -121,12 +174,32 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
         if (r.routes.some(x => x.key === key)) throw new Error(`Rota ${method} ${subpath} já registrada.`);
         r.routes.push({ key, method, segs, label: `${method} /api/plugins/${id}${subpath === '/' ? '/' : subpath}`, handler });
       },
-      on(event, fn) {
+      on(event, fn, opts) {
         open('on');
         if (!CONSTANTS.PLUGIN_EVENTS.includes(event)) throw new Error(`Evento desconhecido: ${String(event).slice(0, 40)} (use ${CONSTANTS.PLUGIN_EVENTS.join(', ')}).`);
         if (typeof fn !== 'function') throw new Error('on: o handler deve ser uma função.');
         if (event === 'run:beforeSpawn') need('run.mutate');
-        r.events.push({ event, fn });
+        if (opts?.partial === true) need('run.content'); // stream_event carries the text as it is written
+        // partial: true takes the stream_event lines too (run:event only). Failures and drops are counted per handler.
+        r.events.push({ r, event, fn, partial: opts?.partial === true, fails: 0, tripped: false, dropped: 0 });
+      },
+      registerAdapter(kind, impl) {
+        open('registerAdapter');
+        need('adapter');
+        const registry = getRegistry?.();
+        if (!registry) throw new Error('registerAdapter: o registro de Adapters não está disponível.');
+        if (typeof kind !== 'string' || !impl || typeof impl !== 'object' || impl.kind !== kind) throw new Error(`registerAdapter: o kind "${String(kind).slice(0, 40)}" deve ser igual ao "kind" do Adapter.`);
+        // Replacing claude or codex is a separate grant; anything else already registered (by another plugin) is refused by the registry.
+        const builtin = registry.builtinKinds().includes(kind);
+        if (builtin) {
+          need('adapter.override');
+          // Only what shipped with the bridge can be replaced: a second override (another plugin, or a repeat) is refused as a denial.
+          const cur = registry.get(kind);
+          if (cur && cur.builtin === false) throw denied(`adapter.override: o Adapter "${kind}" já foi substituído (${cur.source}); só o embutido pode ser sobrescrito`, true);
+        }
+        r.undoAdapters.push(registry.register(impl, { override: builtin, source: `plugin:${id}`, env: r.manifest.env }));
+        r.adapters.push(kind);
+        if (builtin) r.overrides.push(kind);
       },
       settings() { return settings; },
       dataDir() { const dir = path.join(dataRoot, 'plugins', id); fs.mkdirSync(dir, { recursive: true }); return dir; },
@@ -189,6 +262,8 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
       if (host.closing) { await fail('disabled', new Error('bridge encerrando')); r.api = undefined; return; }
       Object.freeze(made.ctx);
       r.status = 'active'; r.error = '';
+      for (const kind of r.overrides) log.log(`Adapter "${kind}" substituído pelo plugin ${r.id}.`);
+      for (const h of r.events) { const list = byEvent.get(h.event); if (list) list.push(h); else byEvent.set(h.event, [h]); }
     } catch (e) {
       r.frozen = true;
       await fail(e.denied ? 'denied' : 'error', e);
@@ -214,6 +289,104 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
       finally { host.pending = false; }
     })();
     return host.ready;
+  };
+
+  /* ---------- events ---------- */
+  // Observers are read-only (the payload is shared and frozen at its top level, not cloned) and never slow the run down: emit() only
+  // queues, a drain per plugin calls the handlers later (setImmediate), in the order the events came. A queue holds QUEUE_MAX events;
+  // past that the oldest goes (counted per handler). A handler gets hookMs; a failure or timeout is logged (the first few), and
+  // BREAKER_AT failures in a row open the circuit: that handler is not called again until the next start.
+  const logOnce = (h, text) => log.warn(`[plugin ${h.r.id}]`, text);
+  function failed(h, e) {
+    h.fails++;
+    if (h.fails <= LOG_FAILS) logOnce(h, `${h.event}: ${e?.message || e}`);
+    if (h.fails >= BREAKER_AT && !h.tripped) { h.tripped = true; logOnce(h, `disjuntor aberto em ${h.event}: ${BREAKER_AT} falhas seguidas; o plugin ${h.r.id} não recebe mais esse evento até o próximo start`); }
+  }
+  async function drain(r) {
+    const q = r.queue;
+    try {
+      while (q.items.length) {
+        const { h, view } = q.items.shift();
+        if (h.tripped || r.status !== 'active') continue;
+        try {
+          const out = h.fn(view);
+          if (out && typeof out.then === 'function') await withTimeout(out, hookMs, `passou de ${hookMs} ms (tempo limite)`);
+          h.fails = 0;
+        } catch (e) { failed(h, e); }
+        if (q.items.length) await new Promise(res => setImmediate(res)); // never hog the loop with a long queue
+      }
+    } finally { q.draining = false; }
+  }
+  /** Under pressure the first to go is a run:event (a stream_event before any other), then the oldest of what is left. */
+  function dropOne(q) {
+    const isStream = x => (x.view.event?.type ?? x.view.type) === 'stream_event';
+    let i = q.items.findIndex(x => x.h.event === 'run:event' && isStream(x));
+    if (i < 0) i = q.items.findIndex(x => x.h.event === 'run:event');
+    return q.items.splice(i < 0 ? 0 : i, 1)[0];
+  }
+  host.listens = event => (byEvent.get(event)?.length || 0) > 0;
+  /**
+   * emit(event, payload | () => payload): returns at once. A function is only called when someone listens (once for all of them).
+   * Each plugin gets its own deep-frozen structuredClone (a live object of the core never reaches a plugin), and without run.content
+   * only the projection / the payload without prompt and systemPrompt. Never throws.
+   */
+  host.emit = function emit(event, payload) {
+    const list = byEvent.get(event);
+    if (!list || event === 'run:beforeSpawn') return;
+    try {
+      let built = false;
+      const views = new Map();
+      for (const h of list) {
+        if (h.tripped) continue;
+        if (!built) { if (typeof payload === 'function') payload = payload(); built = true; }
+        if (event === 'run:event' && !h.partial && payload.event?.type === 'stream_event') continue;
+        let view = views.get(h.r);
+        if (!view) { view = deepFreeze(structuredClone(h.r.caps.granted.includes('run.content') ? payload : (STRIP[event] || withoutContent)(payload))); views.set(h.r, view); }
+        const q = h.r.queue ||= { items: [], draining: false };
+        q.items.push({ h, view });
+        if (q.items.length > QUEUE_MAX) {
+          const old = dropOne(q);
+          old.h.dropped++;
+          if (old.h.dropped === 1 || old.h.dropped % 1000 === 0) logOnce(old.h, `${old.h.event}: fila cheia (${QUEUE_MAX}); ${old.h.dropped} evento(s) descartado(s)`);
+        }
+        if (!q.draining) { q.draining = true; setImmediate(() => drain(h.r).catch(e => { q.draining = false; log.warn(`Plugins: drenagem de ${h.r.id} falhou: ${e?.message || e}`); })); }
+      }
+    } catch (e) { log.warn(`Plugins: emit ${event} falhou: ${e.message}`); }
+  };
+  const blocked = (r, why) => Object.assign(new Error(`Execução bloqueada pelo plugin ${r.id}: ${String(why).replace(/\s+/g, ' ').slice(0, 300)}`), { status: 403 });
+  /**
+   * run:beforeSpawn: the handlers of the plugins that asked for run.mutate, one after the other in plugin order, within spawnBudgetMs
+   * in all. → { appendSystem, notes: [{plugin, chars, cut}] } (the pieces, up to 20k each, joined by a blank line) or throws a 403: the
+   * first veto wins. Each handler gets its own deep-frozen copy of the payload. A handler that throws (reading its answer included) or
+   * runs out of time (or of the shared budget) is skipped, unless its plugin is failClosed: then the run is blocked.
+   */
+  host.beforeSpawn = async function beforeSpawn(payload) {
+    const list = byEvent.get('run:beforeSpawn');
+    if (!list) return { appendSystem: '', notes: [] };
+    const started = performance.now(), pieces = [], notes = [];
+    for (const h of list) {
+      const r = h.r;
+      if (r.status !== 'active') continue;
+      const left = spawnBudgetMs - (performance.now() - started);
+      const trouble = why => { log.warn(`[plugin ${r.id}]`, `run:beforeSpawn: ${why}`); if (r.entry.failClosed) throw blocked(r, `falhou (${why})`); };
+      if (left <= 0) { trouble(`orçamento total de ${spawnBudgetMs} ms esgotado pelos plugins anteriores (tempo limite)`); continue; }
+      let block = null, append;
+      try {
+        const out = h.fn(deepFreeze(structuredClone(r.caps.granted.includes('run.content') ? payload : withoutContent(payload))));
+        const ms = Math.min(hookMs, Math.ceil(left));
+        const res = out && typeof out.then === 'function' ? await withTimeout(out, ms, `passou de ${ms} ms (tempo limite${ms < hookMs ? ', orçamento total' : ''})`) : out;
+        if (res && typeof res === 'object') { // the answer is read here, once: a getter that throws is the plugin's failure
+          const b = res.block, reason = res.reason, a = res.appendSystem;
+          if (b) block = typeof b === 'string' ? b : (typeof reason === 'string' && reason) || 'sem motivo informado';
+          append = a;
+        }
+      } catch (e) { trouble(e?.message || String(e)); continue; }
+      if (block) throw blocked(r, block);
+      if (append === undefined) continue;
+      if (typeof append !== 'string') { log.warn(`[plugin ${r.id}]`, 'run:beforeSpawn: appendSystem deve ser texto; ignorado'); continue; }
+      if (append) { pieces.push(append.slice(0, APPEND_MAX)); notes.push({ plugin: r.id, chars: Math.min(append.length, APPEND_MAX), cut: append.length > APPEND_MAX ? append.length : 0 }); }
+    }
+    return { appendSystem: pieces.join('\n\n'), notes };
   };
 
   host.has = id => byId.has(id);
@@ -269,6 +442,8 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
     id: r.id, name: r.name, version: r.version, description: r.description, path: r.dir, hasCode: r.hasCode, status: r.status, error: r.error,
     source: r.source === 'home' ? 'home' : 'config', requires: [...r.manifest.requires], env: [...r.manifest.env], capabilities: { asked: [...r.caps.asked], granted: [...r.caps.granted], missing: [...r.caps.missing] },
     routes: r.routes.map(x => x.label), events: [...new Set(r.events.map(e => e.event))], adapters: [...r.adapters], warnings: [...r.warnings],
+    // observers (only for a plugin with event handlers): one entry per handler, with what the dispatcher counted.
+    ...(r.events.some(e => e.event !== 'run:beforeSpawn') ? { observers: r.events.filter(e => e.event !== 'run:beforeSpawn').map(h => ({ event: h.event, dropped: h.dropped, failures: h.fails, tripped: h.tripped })) } : {}),
   });
   host.list = () => all().map(viewOf);
   /**

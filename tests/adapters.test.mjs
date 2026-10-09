@@ -578,3 +578,23 @@ test('a launch that fails after the Adapter wrote its temp files removes them (s
   assert.deepEqual(readdirSync(bridgeTmp[0]).filter(n => /\.(system\.md|settings\.json|agents\.json)$/.test(n)), []);
   assert.equal((await (await b.api('/api/health')).json()).activeRuns, 0);
 });
+
+test('registry: register devolve o undo (plugins, passo 7): tira o kind novo, restaura o embutido sobrescrito e não pisa em quem veio depois', () => {
+  const reg = createRegistry(hostFor());
+  const builtin = reg.get('claude');
+  const undoNew = reg.register(fakeAdapter('x-echo'));
+  assert.equal(typeof undoNew, 'function');
+  undoNew();
+  assert.deepEqual(reg.kinds(), ['claude', 'codex']);
+  undoNew(); // repetido: sem efeito
+  const undoOver = reg.register(fakeAdapter('claude', { label: 'Do plugin' }), { override: true });
+  assert.equal(reg.get('claude').label, 'Do plugin');
+  undoOver();
+  assert.equal(reg.get('claude'), builtin, 'o embutido volta tal como era');
+  assert.equal(reg.get('claude').builtin, true);
+  // quem sobrescreveu por cima do primeiro: desfazer o primeiro não derruba o segundo
+  const first = reg.register(fakeAdapter('claude', { label: 'primeiro' }), { override: true });
+  reg.register(fakeAdapter('claude', { label: 'segundo' }), { override: true });
+  first();
+  assert.equal(reg.get('claude').label, 'segundo');
+});
