@@ -129,11 +129,11 @@ const TEMPLATE_AVATARS_V1={ZERO:['avatar-greyman'],'ABELHA-RAINHA':['avatar-moth
    nothing changes. Plugin text is escaped (E) wherever it is rendered, like the built-in catalog. */
 // Limits and ids shared with plugins.js (docs/plans/plugins-conteudo.md, "Limites efetivos"): text over a limit refuses the item with a
 // warning, never cut. They follow what normalizeWorkspace keeps of an agent (specialty 40, description 1200, soul 1200, 8 greetings
-// of 300, prompt 20000), so nothing a plugin gives is lost on reload.
-function pluginLimits(){return pluginLimits.v||(pluginLimits.v={key:/^[a-z0-9][a-z0-9_-]{0,40}$/,convId:/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/,name:/^[A-Z0-9][A-Z0-9-]{1,23}$/,tool:/^[A-Za-z][A-Za-z0-9_]*$/,cssVar:/^--[a-z0-9-]{1,40}$/,reserved:['__proto__','constructor','prototype'],
+// of 300, prompt 20000, tools of TOOLS, a subset's content 8000), so nothing a plugin gives is lost on reload. `tools` is TOOLS itself.
+function pluginLimits(){return pluginLimits.v||(pluginLimits.v={key:/^[a-z0-9][a-z0-9_-]{0,40}$/,convId:/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/,name:/^[A-Z0-9][A-Z0-9-]{1,23}$/,tools:['Read','Glob','Grep','Edit','Write','Bash','WebFetch','WebSearch','NotebookEdit'],cssVar:/^--[a-z0-9-]{1,40}$/,reserved:['__proto__','constructor','prototype'],
  plugin:{name:80,version:40,description:1000,path:4096},category:{label:60,icon:40,description:500,before:41},avatar:{label:60},theme:{label:60,vars:200},
- preset:{slot:20,category:41,role:40,specialty:40,icon:40,model:80,effort:10,avatar:81,description:1000,style:16000,soul:1200,hello:300,hellos:8,tools:30,template:80,subsets:20},
- conv:{name:60,label:60,icon:40,group:81,tags:300,desc:300,summary:300,content:20000}});}
+ preset:{slot:20,category:41,role:40,specialty:40,icon:40,model:80,effort:10,avatar:81,description:1000,style:16000,soul:1200,hello:300,hellos:8,template:80,subsets:20},
+ conv:{name:60,label:60,icon:40,group:81,tags:300,desc:300,summary:300,content:20000,subset:8000}});}
 function readPlugins(){
  if(readPlugins.v)return readPlugins.v;
  let raw=null;try{const el=document.getElementById('squad-plugins');raw=el?JSON.parse(el.textContent):null;}catch{raw=null;}
@@ -156,7 +156,7 @@ function readPlugins(){
    return{key,label:T(c.label,L.category.label,'label'),icon:T(c.icon,L.category.icon,'ícone'),description:T(c.description,L.category.description,'descrição'),before};});
   pk.declared=arr(p.presets).length; // for Plugins: agents refused here count as ignored
   pk.presets=each(arr(p.presets).slice(0,200),`${W}: agente`,x=>{const P=L.preset,name=T(x.name,24,'nome');
-   const tools=Array.isArray(x.tools)?x.tools:null;if(tools&&(tools.length>P.tools||!tools.every(t=>typeof t==='string'&&L.tool.test(t))))throw Error(`${name}: tools deve ter até ${P.tools} nomes de ferramenta`);
+   const tools=Array.isArray(x.tools)?x.tools:null;if(tools&&!tools.every((t,i)=>L.tools.includes(t)&&tools.indexOf(t)===i))throw Error(`${name}: tools aceita só ${L.tools.join(', ')}, sem repetir`);
    const hellos=arr(x.hellos);if(hellos.length>P.hellos)throw Error(`${name}: até ${P.hellos} saudações`);
    const conv=obj(x.conv)?{template:T(x.conv.template,P.template,'conventions.template'),subsets:arr(x.conv.subsets)}:null;
    if(conv&&(conv.subsets.length>P.subsets||!conv.subsets.every(s=>typeof s==='string'&&L.convId.test(s))))throw Error(`${name}: conventions.subsets deve ter até ${P.subsets} ids`);
@@ -230,7 +230,9 @@ function squadThemeBoot(){
 }
 // Names that belong to the built-in catalog (template photos, souls, each specialty's default agent), taken before any plugin merge.
 function builtinPresetNames(){if(!builtinPresetNames.v)builtinPresetNames.v=new Set([...Object.keys(TEMPLATE_AVATARS),...Object.keys(AGENT_SOULS),...Object.values(ROLES).map(r=>r.name)]);return builtinPresetNames.v;}
-/* Accepted plugin presets (validated once): a valid unique codename, a role of ROLES, a slot whose seat fits the role. */
+/* Accepted plugin presets (validated once): a valid unique codename, a role of ROLES, a slot whose seat fits the role, instructions within
+   20000. The bridge sends every candidate (repeated names too): a name is taken only by a preset that passed every check, so a later
+   plugin's usable preset with the same name still enters. */
 function pluginPresets(){
  if(pluginPresets.v)return pluginPresets.v;const list=[],names=new Set(builtinPresetNames()),SLOT_ROLE={commander:'commander',adr:'architect',prd:'po'};
  for(const pk of readPlugins().plugins)for(const p of pk.presets){
@@ -241,6 +243,7 @@ function pluginPresets(){
   if(!['commander','adr','prd','operator'].includes(p.slot)){pluginWarn(`${where} ignorado: posição (slot) "${p.slot}" inválida.`);continue;}
   if(SLOT_ROLE[p.slot]&&SLOT_ROLE[p.slot]!==p.role){pluginWarn(`${where} ignorado: a posição ${p.slot} pede o role ${SLOT_ROLE[p.slot]}.`);continue;}
   if(p.slot==='operator'&&p.role==='commander'){pluginWarn(`${where} ignorado: um comandante não pode ser operador.`);continue;}
+  if(presetPrompt(p).length>20000){pluginWarn(`${where} ignorado: instruções (especialidade + corpo) maiores que 20000 caracteres.`);continue;}
   names.add(p.name);list.push(p);
  }
  return pluginPresets.v=list;
@@ -263,7 +266,7 @@ function mergePluginCatalog(){
   for(const g of c.groups)item(`${tag}: grupo`,()=>{if(!g||!id(g.key))throw Error('key inválida');if(CONVENTION_GROUPS.some(x=>x.key===g.key))throw Error(`"${g.key}" já existe; mantido o original`);
    const label=text(g.label,C.label,'label'),icon=text(g.icon,C.icon,'icon');CONVENTION_GROUPS.push({key:g.key,label:label||g.key,icon:icon||'book'});});
   for(const s of c.subsets)item(`${tag}: subset ${String(s?.key||'').slice(0,80)}`,()=>{if(!s||!id(s.key)||typeof s.content!=='string')throw Error('sem key válida ou conteúdo');if(CONVENTION_SUBSETS.some(x=>x.key===s.key))throw Error('já existe; mantido o original');
-   const v={key:s.key,name:text(s.name,C.name,'name')||s.key,group:text(s.group,C.group,'group'),icon:text(s.icon,C.icon,'icon')||'book',tags:text(s.tags,C.tags,'tags'),desc:text(s.desc,C.desc,'desc'),content:text(s.content,C.content,'content')};CONVENTION_SUBSETS.push(v);});
+   const v={key:s.key,name:text(s.name,C.name,'name')||s.key,group:text(s.group,C.group,'group'),icon:text(s.icon,C.icon,'icon')||'book',tags:text(s.tags,C.tags,'tags'),desc:text(s.desc,C.desc,'desc'),content:text(s.content,C.subset,'content')};CONVENTION_SUBSETS.push(v);});
   for(const [family,f] of Object.entries(c.families)){
    if(!Object.hasOwn(CONVENTION_FAMILIES,family)||L.reserved.includes(family)){pluginWarn(`${tag}: família "${family.slice(0,80)}" desconhecida; templates ignorados.`);continue;}
    const fam=CONVENTION_FAMILIES[family];
@@ -471,7 +474,7 @@ function deskSelectHTML(a){
 Object.assign(SCOPES,{mobile:'Mobile',pm:'Gestão de projeto',designer:'Design / UX',devops:'Infraestrutura / DevOps',security:'Segurança',data:'Dados / Pipelines',docs:'Documentação'});
 
 const STATUS={backlog:'A fazer',blocked:'Bloqueada',ready:'Pronta',running:'Em execução',review:'Em revisão',done:'Concluída'};
-const TOOLS=['Read','Glob','Grep','Edit','Write','Bash','WebFetch','WebSearch','NotebookEdit'];
+const TOOLS=[...pluginLimits().tools];
 const TOOL_INFO={Read:'Leitura de arquivos',Glob:'Busca por arquivos',Grep:'Busca por conteúdo',Edit:'Edição de arquivos',Write:'Criação de arquivos',Bash:'Comandos de terminal',WebFetch:'Buscar páginas web',WebSearch:'Pesquisa na web',NotebookEdit:'Editar notebooks'};
 const PERMISSION_MODES={acceptEdits:'acceptEdits / edita arquivos, nega o resto',plan:'plan / somente leitura e planejamento',auto:'auto / classificador decide',dontAsk:'dontAsk / nega o que exigiria aprovação',manual:'manual / padrão (headless nega prompts)',bypassPermissions:'bypassPermissions / SEM VERIFICAÇÕES'};
 const EFFORTS=['','low','medium','high','xhigh','max'];
@@ -3068,7 +3071,6 @@ function mergePluginPresets(){
   if(p.specialty)preset.specialty=p.specialty;if(p.description)preset.description=p.description;if(p.style)preset.style=p.style;
   if(/^[A-Za-z0-9._\-\[\]]{1,80}$/.test(p.model))preset.model=p.model;if(p.effort&&EFFORTS.includes(p.effort))preset.effort=p.effort;if(p.tools)preset.tools=[...p.tools];
   if(p.conv)preset.conv={...(p.conv.template?{template:p.conv.template}:{}),subsets:[...p.conv.subsets]};
-  if(presetPrompt(preset).length>20000){pluginWarn(`Agente ${p.name} ignorado: instruções (especialidade + corpo) maiores que 20000 caracteres.`);continue;}
   if(p.slot!=='operator'){AGENT_PRESETS[p.slot].push(preset);continue;}
   let cat=p.category&&OP_CATEGORIES.find(c=>c.key===p.category);
   if(!cat){if(p.category)pluginWarn(`Agente ${p.name}: categoria "${p.category}" não existe; entrou na categoria da especialidade.`);cat=OP_CATEGORIES.find(c=>c.roles.includes(p.role))||OP_CATEGORIES.find(c=>c.key==='outros')||OP_CATEGORIES.at(-1);}
@@ -3078,6 +3080,9 @@ function mergePluginPresets(){
 mergePluginPresets();
 AGENT_PRESETS.op=OP_CATEGORIES.flatMap(c=>c.presets);
 const opCategoryOf=role=>OP_CATEGORIES.find(c=>c.roles.includes(role))?.key||'outros';
+// Operator category of an agent: the one holding its template preset (kept across renames in `template`) while the role still matches it,
+// so an agent recruited from a plugin category stays there; otherwise the category of its role.
+const agentCategory=a=>{if(!a)return'';const p=agentTemplateOf(a),c=p&&p.role===a.role&&OP_CATEGORIES.find(x=>x.presets.includes(p));return c?c.key:opCategoryOf(a.role);};
 // Declared (hoisted): migrateCatalogAgents uses it right after the catalog. The coding style lives in the DIRETRIZES (style-* subsets), never here.
 function presetPrompt(p){return ROLES[p.role].prompt+(p.style?' '+p.style:'')+(p.specialty?` Especialização: ${p.specialty}. Prefira os padrões, as ferramentas e as boas práticas dessa stack.`:'');}
 // SOUL of an agent: its template's soul (catalog codename), or the generic one. Declared (hoisted): used by normalizeWorkspace at load.
@@ -3174,14 +3179,14 @@ function pickOptions(slot,index){
  const cat=slot==='op'?OP_CATEGORIES.find(c=>c.key===ui.squadPick?.cat):null;
  if(slot==='op'&&!cat){
   const free=a=>slotFits('op',a)&&!taken.has(a.id);
-  for(const c of OP_CATEGORIES){const extra=state.agents.filter(a=>c.roles.includes(a.role)&&free(a)&&!c.presets.some(p=>p.name===a.name));if(!c.presets.length&&!extra.length)continue;
+  for(const c of OP_CATEGORIES){const extra=state.agents.filter(a=>agentCategory(a)===c.key&&free(a)&&!c.presets.some(p=>p.name===a.name));if(!c.presets.length&&!extra.length)continue;
    const subs=c.presets.map((p,i)=>i===0?'Generalista':p.specialty||ROLES[p.role].label);
    items.push({kind:'category',cat:c.key,name:c.label.toUpperCase(),icon:c.icon,photo:'',role:`${c.presets.length+extra.length} ${c.presets.length+extra.length===1?'AGENTE':'AGENTES'} NESTA CATEGORIA`,description:c.description+(subs.length?` Opções: ${subs.join(', ')}.`:''),tag:'CATEGORIA',prompt:''});}
-  const cursor=Math.max(0,items.findIndex(it=>it.cat===opCategoryOf(agentById(current)?.role)));
+  const cursor=Math.max(0,items.findIndex(it=>it.cat===agentCategory(agentById(current))));
   return{items,cursor,current};
  }
  for(const [pi,p] of (cat?cat.presets:AGENT_PRESETS[slot]).entries()){const a=state.agents.find(x=>x.name===p.name);names.add(p.name);if(a&&!slotFits(slot,a))continue;if(a&&taken.has(a.id)){if(cat&&pi===0)items.push({kind:'taken',agentId:a.id,name:p.name,photo:portrait(a),icon:agentIcon(a),role:'GENERALISTA / '+ROLES[p.role].label,description:a.description,tag:'GENERALISTA · JÁ NESTA SQUAD',prompt:a.prompt});continue;}items.push({kind:a?'agent':'preset',preset:p,agentId:a?.id||'',name:p.name,photo:a?portrait(a):autoPortrait({name:p.name,role:p.role}),icon:a?agentIcon(a):p.icon,role:cat&&pi===0?'GENERALISTA / '+ROLES[p.role].label:p.specialty?ROLES[p.role].label+' / '+p.specialty:ROLES[p.role].label,description:a?.description||p.description||ROLES[p.role].description,tag:(cat&&pi===0?'GENERALISTA · ':'')+(a?'NO WORKSPACE':'PRÉ-PRONTO'),prompt:a?a.prompt:presetPrompt(p),conv:conventionLabel(a||{conventions:defaultConventions({role:p.role,specialty:p.specialty,icon:p.icon,name:p.name},p.conv)})});}
- for(const a of state.agents)if(!names.has(a.name)&&slotFits(slot,a)&&!taken.has(a.id)&&(!cat||cat.roles.includes(a.role))&&!(retiredPresetName(a.name,a.role)&&a.id!==current))items.push({kind:'agent',agentId:a.id,name:a.name,photo:portrait(a),icon:agentIcon(a),role:roleLabel(a),description:a.description,tag:'NO WORKSPACE',prompt:a.prompt,conv:conventionLabel(a)});
+ for(const a of state.agents)if(!names.has(a.name)&&slotFits(slot,a)&&!taken.has(a.id)&&(!cat||agentCategory(a)===cat.key)&&!(retiredPresetName(a.name,a.role)&&a.id!==current))items.push({kind:'agent',agentId:a.id,name:a.name,photo:portrait(a),icon:agentIcon(a),role:roleLabel(a),description:a.description,tag:'NO WORKSPACE',prompt:a.prompt,conv:conventionLabel(a)});
  items.push({kind:'custom',name:'CUSTOMIZADO',icon:'sparkle',role:cat?cat.label+' / novo agente':SQUAD_SLOTS[slot].label,description:'Crie um agente do zero no estúdio: codinome, especialidade, instruções e ferramentas. Ele entra direto nesta posição.',tag:'NOVO AGENTE'});
  const cursor=Math.max(0,items.findIndex(it=>it.agentId&&it.agentId===current));
  return{items,cursor,current};
@@ -3232,7 +3237,7 @@ function clickPickItem(i){
 }
 // Specialty card inside the sliding strip (step 1 of the operator pop-up).
 function opCategoryItemHTML(it,i){
- const def=OP_CATEGORIES.find(c=>c.key===it.cat),chips=(def?.presets||[]).map((p,k)=>k===0?'Generalista':p.specialty||ROLES[p.role].label),cur=agentById(ui.squadPick?.index>=0?squadDraft()?.operatorIds[ui.squadPick.index]:''),isCur=cur&&opCategoryOf(cur.role)===it.cat;
+ const def=OP_CATEGORIES.find(c=>c.key===it.cat),chips=(def?.presets||[]).map((p,k)=>k===0?'Generalista':p.specialty||ROLES[p.role].label),cur=agentById(ui.squadPick?.index>=0?squadDraft()?.operatorIds[ui.squadPick.index]:''),isCur=cur&&agentCategory(cur)===it.cat;
  return`<button type="button" class="sq-item category" data-action="sq-cursor" data-i="${i}" aria-label="${E(it.name)}">${isCur?'<em class="sq-cat-now">ATUAL</em>':''}<span class="sq-cat-medal">${icon(it.icon)}</span><strong>${E(it.name)}</strong><small>${E(it.role)}</small><span class="sq-cat-chips">${chips.slice(0,4).map(t=>`<i>${E(t)}</i>`).join('')}${chips.length>4?`<i>+${chips.length-4}</i>`:''}</span></button>`;
 }
 function toggleOpCategory(key){

@@ -77,7 +77,7 @@ specialty: Triagem de demandas
 icon: flow
 model: opus
 effort: high
-tools: [Read, Glob, Grep]
+tools: [Read, Glob, Grep]      # só nomes de TOOLS do app, sem repetir
 avatar: raiser                 # key embutida (avatar-raiser ou raiser) ou key de avatar do plugin
 description: Organiza e prioriza as demandas...
 soul: Controlador calmo e criterioso...
@@ -145,8 +145,8 @@ Chaves desconhecidas são ignoradas.
 No topo de `app.js` (function declarations, antes de qualquer seed/normalize), `readPlugins()` lê `#squad-plugins`
 (ausente/inválido = `{plugins:[],runtime:{},warnings:[]}`, demo `file://` incluído) e, **antes** de o catálogo ser usado:
 - `AGENT_PRESETS[slot]` (commander/adr/prd) recebe os presets; operadores entram na categoria `category`
-  (categorias novas inseridas antes de `before`, default `'outros'`, ou no fim). Nome repetido = preset ignorado
-  (aviso no console e na aba Plugins).
+  (categorias novas inseridas antes de `before`, default `'outros'`, ou no fim). Nome repetido: vale o primeiro preset que o app
+  aceita (role, slot, tamanho das instruções); os outros são ignorados com aviso no console e na aba Plugins.
 - `AGENT_SOULS[name] = {soul, hellos}` quando o preset traz soul.
 - `TEMPLATE_AVATARS[name]` = key resolvida do avatar; `PORTRAITS[plugin:...] = src` e o avatar entra em `AVATARS`
   (aparece no seletor de foto).
@@ -188,6 +188,17 @@ Conteúdo específico de uma empresa vive num plugin fora do repositório; o nú
   famílias com `Object.hasOwn(CONVENTION_FAMILIES, …)`, roles com `Object.hasOwn(ROLES, …)` e avatares com
   `Object.hasOwn(PORTRAITS, …)`; nomes de preset (`/^[A-Z0-9][A-Z0-9-]{1,23}$/`) nunca colidem com chaves do protótipo.
 
+- Revisão do Codex (PR #1):
+  - Nome repetido não é mais reservado no bridge (ele não conhece `ROLES` nem os nomes embutidos): todo preset válido vai para a
+    página, e `pluginPresets` só reserva o nome depois de todas as checagens (role, slot × role, instruções até 20000). Um preset
+    recusado pelo app num plugin anterior não tira mais o lugar de um utilizável de mesmo nome num plugin posterior.
+  - `tools` aceita só nomes de `TOOLS` (a lista do app, que `normalizeWorkspace` usa; no app `TOOLS` vem de `pluginLimits().tools`),
+    sem repetir; outro nome recusa o agente com aviso, em vez de sumir no primeiro reload.
+  - `content` de subset de plugin vai até 8000 (o que o workspace guarda); acima disso o subset é recusado com aviso.
+  - Categoria de um agente recrutado (`agentCategory`): a categoria do seu preset de origem (`template`, já persistido) enquanto o role
+    for o do preset; senão a do role. O Squad Studio usa isso para marcar ATUAL, posicionar o cursor e listar o agente, então um agente
+    vindo de uma categoria de plugin (`roles: []`) continua nela.
+
 ### Limites efetivos (bridge `plugins.js` e app `pluginLimits()`, iguais nas duas pontas)
 
 Texto acima do limite **recusa o item** com aviso (bridge e app), nunca é cortado. Os limites dos agentes seguem o que
@@ -203,11 +214,12 @@ Texto acima do limite **recusa o item** com aviso (bridge e app), nunca é corta
 | Preset | `specialty` / `description` / `soul` | 40 / 1000 / 1200 |
 | Preset | `hellos` | até 8, cada uma até 300 |
 | Preset | corpo (`style`) | 16000; no app, instruções finais (`presetPrompt`) até 20000, senão o preset é recusado |
-| Preset | `tools` | até 30 nomes `/^[A-Za-z][A-Za-z0-9_]*$/` |
+| Preset | `tools` | só nomes de `TOOLS` (`Read, Glob, Grep, Edit, Write, Bash, WebFetch, WebSearch, NotebookEdit`), sem repetir |
 | Preset | `conventions.template` / `conventions.subsets` | 80 / até 20 ids de diretriz |
 | Avatar | `key` / `label` | `KEY_RE` acima / 60; imagem ≤ 1 MB, total ≤ 12 MB |
 | Tema | `key` / `label` | `KEY_RE` acima / 60; até 200 variáveis `--[a-z0-9-]{1,40}` |
 | Diretrizes | ids (família, template, subset, grupo) | `/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/`, fora as chaves reservadas |
 | Diretrizes | `name` / `label` / `icon` / `group` | 60 / 60 / 40 / 81 |
-| Diretrizes | `tags` / `desc` / `summary` / `content` | 300 / 300 / 300 / 20000 |
+| Diretrizes | `tags` / `desc` / `summary` | 300 / 300 / 300 |
+| Diretrizes | `content` | template 20000 (vira a `base` do agente); subset 8000 (o que `normalizeWorkspace` guarda de um subset) |
 

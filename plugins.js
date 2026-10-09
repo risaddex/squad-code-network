@@ -17,17 +17,20 @@ const CONV_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/;
 // Keys that would reach Object's prototype in a map (frontmatter keys, conventions families, ids): always refused.
 const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 // Text limits shared with the page (readPlugins/pluginLimits in src/app.js): over the limit the item is refused with a warning.
-// Agent fields follow what normalizeWorkspace keeps (specialty 40, soul 1200, 8 greetings of 300, prompt 20000).
+// Agent fields follow what normalizeWorkspace keeps (specialty 40, soul 1200, 8 greetings of 300, prompt 20000, tools of TOOLS);
+// DIRETRIZES too: a template's content becomes an agent's base (20000), a subset's content is kept up to 8000.
 const TEXT = {
   preset: { specialty: 40, description: 1000, soul: 1200, hello: 300, hellos: 8, style: 16000, subsets: 20 },
   conv: { name: 60, label: 60, icon: 40, group: 81, tags: 300, desc: 300, summary: 300, content: 20000 },
 };
+const SUBSET_TEXT = { ...TEXT.conv, content: 8000 };
+// The tools an agent can have: TOOLS in src/app.js (pluginLimits().tools); normalizeWorkspace drops any other name.
+const TOOLS = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', 'WebFetch', 'WebSearch', 'NotebookEdit'];
 const NAME_RE = /^[A-Z0-9][A-Z0-9-]{1,23}$/;
 const SLOTS = ['commander', 'adr', 'prd', 'operator'];
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const PERMISSION_MODES = ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'];
 const MODEL_RE = /^[A-Za-z0-9._\-\[\]]{1,80}$/;
-const TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_]*$/;
 const ICON_RE = /^[a-z0-9-]{1,40}$/;
 const AVATAR_REF_RE = /^[A-Za-z0-9][A-Za-z0-9:/_-]{0,80}$/;
 const CSS_VAR_RE = /^--[a-z0-9-]{1,40}$/;
@@ -262,7 +265,10 @@ function validatePreset(data, body) {
   if (avatar && !AVATAR_REF_RE.test(avatar)) throw new Error(`avatar inválido: ${avatar}`);
   let tools = null;
   if (data.tools !== undefined) {
-    if (!Array.isArray(data.tools) || data.tools.length > 30 || !data.tools.every(t => typeof t === 'string' && TOOL_NAME_RE.test(t))) throw new Error('tools deve ser uma lista de nomes de ferramenta (até 30)');
+    if (!Array.isArray(data.tools) || !data.tools.every(t => typeof t === 'string')) throw new Error(`tools deve ser uma lista com nomes de ${TOOLS.join(', ')}`);
+    const unknown = data.tools.find(t => !TOOLS.includes(t)), twice = data.tools.find((t, i) => data.tools.indexOf(t) !== i);
+    if (unknown !== undefined) throw new Error(`tools: ferramenta desconhecida: ${unknown.slice(0, 40)} (aceitas: ${TOOLS.join(', ')})`);
+    if (twice !== undefined) throw new Error(`tools: ferramenta repetida: ${twice}`);
     tools = [...data.tools];
   }
   let hellos = [];
@@ -293,7 +299,7 @@ function validateConventions(c, where, warn) {
   const out = { families: {}, subsets: [], groups: [] };
   const okKey = k => typeof k === 'string' && CONV_ID_RE.test(k) && !RESERVED_KEYS.has(k);
   // Text within TEXT.conv (or the item is refused); `content`/`label` are required by the caller.
-  const fits = (o, fields) => { for (const f of fields) { const v = o[f]; if (v !== undefined && (typeof v !== 'string' || v.length > TEXT.conv[f])) return `${f} deve ser texto de até ${TEXT.conv[f]} caracteres`; } return ''; };
+  const fits = (o, fields, max = TEXT.conv) => { for (const f of fields) { const v = o[f]; if (v !== undefined && (typeof v !== 'string' || v.length > max[f])) return `${f} deve ser texto de até ${max[f]} caracteres`; } return ''; };
   if (c.families !== undefined) {
     if (!isObj(c.families)) warn(`${where}: "families" deve ser um objeto`);
     else for (const [fam, def] of Object.entries(c.families)) {
@@ -314,7 +320,7 @@ function validateConventions(c, where, warn) {
     out[list] = c[list].filter(s => {
       const ok = isObj(s) && okKey(s.key) && typeof s[need] === 'string';
       if (!ok) { warn(`${where}: item inválido em ${list} (precisa de key e ${need})`); return false; }
-      const bad = fits(s, list === 'subsets' ? ['name', 'group', 'icon', 'tags', 'desc', 'content'] : ['label', 'icon']);
+      const bad = list === 'subsets' ? fits(s, ['name', 'group', 'icon', 'tags', 'desc', 'content'], SUBSET_TEXT) : fits(s, ['label', 'icon']);
       if (bad) warn(`${where}: ${list === 'subsets' ? 'subset' : 'grupo'} ${s.key} ignorado: ${bad}`);
       return !bad;
     });
@@ -383,7 +389,7 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
     for (const p of String(env.SQUAD_PLUGINS || '').split(path.delimiter).map(s => s.trim()).filter(Boolean)) addPlugin(expand(p, cwd));
 
     /* plugins */
-    const plugins = [], names = new Map(); // preset name → plugin id
+    const plugins = [];
     let dirs = config.paths;
     if (dirs.length > LIMITS.plugins) { warn(`mais de ${LIMITS.plugins} plugins configurados: os excedentes foram ignorados`); dirs = dirs.slice(0, LIMITS.plugins); }
     for (const dir of dirs) {
@@ -485,11 +491,9 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
         const file = `agents/${f}`;
         try {
           const { data, body } = parseFrontmatter(read(file, LIMITS.text, ['.md']).toString('utf8'));
-          const preset = validatePreset(data, body);
-          const owner = names.get(preset.name);
-          if (owner) throw new Error(`nome ${preset.name} repetido (já definido no plugin ${owner}); agente ignorado`);
-          names.set(preset.name, id);
-          plugin.presets.push(preset);
+          // A repeated name is not decided here: only the page knows ROLES and the built-in names, so every valid candidate goes
+          // and the page keeps the first one it accepts (pluginPresets in src/app.js).
+          plugin.presets.push(validatePreset(data, body));
         } catch (e) { warn(at(file, /agente ignorado$/.test(e.message) ? e.message : `${e.message}; agente ignorado`)); }
       }
       plugins.push(plugin);

@@ -549,13 +549,15 @@ test('plugins from the local config and SQUAD_PLUGINS are loaded, validated and 
     'avatars/vec.svg': '<svg/>',
     'avatars/fake.png': 'not an image',
     'conventions.json': { families: { backend: { templates: [{ key: 'acme-java', name: 'Acme Java', content: '# Regras' }, { key: 'no-content' }] }, constructor: { templates: [{ key: 'proto-tpl', content: 'x' }] } },
-      subsets: [{ key: 'acme-sub', name: 'S', content: 'c', group: 'style' }, { key: 'huge-sub', content: 'x'.repeat(20001) }, { key: 'prototype', content: 'x' }], groups: [] },
+      subsets: [{ key: 'acme-sub', name: 'S', content: 'c', group: 'style' }, { key: 'huge-sub', content: 'x'.repeat(8001) }, { key: 'max-sub', content: 'x'.repeat(8000) }, { key: 'prototype', content: 'x' }], groups: [] },
     'agents/PROTO.md': '---\nname: PROTO\nslot: prd\nrole: po\n__proto__: x\n---\n',
     'agents/LONG.md': '---\nname: LONG\nslot: prd\nrole: po\n---\n' + 'y'.repeat(16001) + '\n',
     'agents/TRIAGEM.md': '---\nname: TRIAGEM   # comentário\nslot: operator\ncategory: acme-cat\nrole: backend\nspecialty: "Java, Spring"\nicon: flow\nmodel: opus\neffort: high\ntools: [Read, Glob, Grep]\navatar: triagem\ndescription: Triagem do backend\nsoul: Calmo\nhellos:\n  - Oi! Qual é a feature?\n  - \'E aí # tudo\'\nconventions:\n  template: acme-java\n  subsets: [style-java, acme-sub]\n---\nConduza como o TRIAGEM.\n',
     'agents/VIGIA.md': '---\nname: VIGIA\nslot: commander\nrole: commander\n---\nComande.\n',
     'agents/BROKEN.md': '---\nname: BROKEN\nslot: operator\nrole: qa\nnested:\n  deep:\n    x: 1\n---\n',
     'agents/NOSLOT.md': '---\nname: NOSLOT\nrole: qa\n---\n',
+    'agents/TOOLY.md': '---\nname: TOOLY\nslot: operator\nrole: qa\ntools: [Read, Foo]\n---\n',
+    'agents/TWICE.md': '---\nname: TWICE\nslot: operator\nrole: qa\ntools: [Read, Read]\n---\n',
   });
   writeTree(path.join(root, 'dup'), { 'squad-plugin.json': { id: 'acme', name: 'Outro Acme' } });
   writeTree(path.join(root, 'other'), { 'squad-plugin.json': { id: 'other' }, 'agents/TRIAGEM.md': '---\nname: TRIAGEM\nslot: adr\nrole: architect\n---\n', 'agents/ECHO.md': '---\nname: ECHO\nslot: prd\nrole: po\n---\nPRD.\n' });
@@ -594,17 +596,18 @@ test('plugins from the local config and SQUAD_PLUGINS are loaded, validated and 
   assert.equal(acme.avatars[0].src, 'data:image/png;base64,' + PNG.toString('base64'));
   assert.deepEqual(acme.themes, [{ key: 'acme/noite', label: 'Noite', ui: { '--bg': '#05070a', '--line': 'rgba(1, 2, 3, 0.5)' }, city: { bg: 0xff0000, build: 0x00ff00 }, office: {}, agent: {}, run: { work: 0x112233 } }]);
   assert.deepEqual(acme.conventions.families.backend.templates.map(t => t.key), ['acme-java']);
-  assert.deepEqual(acme.conventions.subsets.map(t => t.key), ['acme-sub']);
+  assert.deepEqual(acme.conventions.subsets.map(t => t.key), ['acme-sub', 'max-sub']);
   assert.deepEqual(acme.runtime, { model: 'opus', concurrency: 3 });
-  assert.deepEqual(tag.plugins[1].presets.map(p => p.name), ['ECHO']); // TRIAGEM already came from acme
+  // A repeated name is not reserved by the bridge: every candidate reaches the page, which keeps the first one it accepts (role/slot).
+  assert.deepEqual(tag.plugins[1].presets.map(p => p.name), ['ECHO', 'TRIAGEM']);
   assert.deepEqual(tag.runtime, { model: 'sonnet', concurrency: 3 }); // the configuration wins over the plugins
   const w = tag.warnings.join('\n');
-  for (const re of [/dup: id acme repetido/, /\[acme\] agents\/BROKEN\.md: linha 7: só um nível/, /\[acme\] agents\/NOSLOT\.md: slot inválido/, /\[other\] agents\/TRIAGEM\.md: nome TRIAGEM repetido \(já definido no plugin acme\)/,
+  for (const re of [/dup: id acme repetido/, /\[acme\] agents\/BROKEN\.md: linha 7: só um nível/, /\[acme\] agents\/NOSLOT\.md: slot inválido/, /\[acme\] agents\/TOOLY\.md: tools: ferramenta desconhecida: Foo/, /\[acme\] agents\/TWICE\.md: tools: ferramenta repetida: Read/,
     /SVG não é aceito/, /fake\.png: não é uma imagem/, /key de categoria inválida/, /exposure/, /--Bad/, /cor inválida em --x/, /agent\.blue/, /runtime\.foo/, /runtime\.permissionMode/, /missing: pasta do plugin não encontrada/,
-    /\[acme\] conventions\.json: template inválido em backend/, /família constructor inválida/, /subset huge-sub ignorado: content deve ser texto de até 20000/, /item inválido em subsets/,
+    /\[acme\] conventions\.json: template inválido em backend/, /família constructor inválida/, /subset huge-sub ignorado: content deve ser texto de até 8000/, /item inválido em subsets/,
     /\[acme\] agents\/PROTO\.md: .*chave reservada: __proto__/, /\[acme\] agents\/LONG\.md: corpo maior que 16000/]) assert.match(w, re);
   assert.ok(!Object.hasOwn(acme.conventions.families, 'constructor'));
-  assert.ok(!/OFFLINE|off\//.test(w));
+  assert.ok(!/OFFLINE|off\/|repetido \(já definido/.test(w));
   if (links) {
     assert.deepEqual(tag.plugins[2].presets, []); assert.deepEqual(tag.plugins[2].avatars, []);
     assert.match(w, /\[linky\] agents\/OUT\.md: aponta para fora da pasta do plugin/);
