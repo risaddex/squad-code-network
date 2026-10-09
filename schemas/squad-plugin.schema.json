@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "squad-plugin.schema.json",
   "title": "Manifesto de Plugin do SQUAD/CODE (squad-plugin.json)",
-  "description": "Pasta que estende o catálogo (agentes em agents/*.md, categorias, avatares, temas, diretrizes, padrões de execução). O frontmatter dos agentes segue squad-agent.schema.json.",
+  "description": "Pasta fora do repositório que estende o SQUAD/CODE: conteúdo de catálogo (categorias, avatares, temas, diretrizes, padrões de execução e agents/*.md), código do bridge (\"server\" com register(ctx)) ou os dois, no mesmo manifesto. Conteúdo pode vir de qualquer arquivo de configuração; código só vale quando a pasta vem da configuração LOCAL e o id está em plugins.enabled. O frontmatter dos agentes segue squad-agent.schema.json.",
   "type": "object",
   "required": [
     "id"
@@ -16,7 +16,7 @@
     "id": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9-]{1,40}$",
-      "description": "Id único do Plugin."
+      "description": "Id único do Plugin. Na pasta do home (~/.squad-code/plugins/<id>/), a pasta tem o mesmo nome."
     },
     "name": {
       "type": "string",
@@ -32,6 +32,52 @@
       "type": "string",
       "maxLength": 1000,
       "description": "Descrição."
+    },
+    "apiVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Versão do contrato do ctx que o plugin espera (este bridge oferece a 1; maior é recusado)."
+    },
+    "server": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Módulo do bridge dentro do Plugin (.mjs ou .js) que exporta register(ctx). Só em configuração local."
+    },
+    "requires": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]{1,40}$"
+      },
+      "description": "Ids de outros Plugins que precisam estar ativos (carregam antes; ctx.use(id))."
+    },
+    "capabilities": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "enum": [
+          "run.mutate",
+          "adapter",
+          "adapter.override",
+          "run.content",
+          "workspace.read"
+        ]
+      },
+      "description": "Capacidades pedidas; valem só as que a configuração local concede em plugins.entries.<id>.grants."
+    },
+    "env": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,99}$"
+      },
+      "description": "Nomes de variáveis de ambiente que ctx.secret(nome) pode ler."
+    },
+    "configSchema": {
+      "type": "object",
+      "description": "JSON Schema (subconjunto do schema.js) das settings do plugin em plugins.entries.<id>.settings."
     },
     "categories": {
       "type": "array",

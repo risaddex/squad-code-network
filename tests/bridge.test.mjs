@@ -617,7 +617,7 @@ test('plugins from the local config and SQUAD_PLUGINS are loaded, validated and 
     assert.match(w, /\[linky\] agents\/OUT\.md: aponta para fora da pasta do plugin/);
     assert.match(w, /avatars\/evil\.png: aponta para fora da pasta do plugin/);
   }
-  assert.match(b.out(), /Plugins: acme 1\.2\.0 \(2 agente\(s\)\), other/);
+  assert.match(b.out(), /Plugins: acme 1\.2\.0 \(2 agente\(s\)\), acme \(inválido: id repetido .*\), other \(2 agente\(s\)\), off \(desligado: desligado em plugins\.disabled\)/);
 
   // /api/plugins: same data without the data URLs, plus the configuration; /api/health counts the plugins.
   assert.equal((await fetch(b.base + '/api/plugins')).status, 401);

@@ -18,6 +18,7 @@
  *   SQUAD_CONFIG      local configuration file used instead of ./squad.local.json (plugins.js, docs/plans/plugins-conteudo.md)
  *   SQUAD_CONFIG_SHARED  shared configuration file used instead of ./squad.config.json
  *   SQUAD_PLUGINS       extra plugin folders, separated by the platform's path delimiter
+ *   SQUAD_PLUGIN_REGISTER_TIMEOUT_MS  time limit of a plugin's register(ctx) (default 10000; tests)
  */
 const http = require('node:http');
 const fs = require('node:fs');
@@ -40,7 +41,7 @@ const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'squad-code-'));
 // Every project runs in its own folder under PROJECTS_DIR (created on the first run).
 const PROJECTS_DIR = path.resolve(process.env.SQUAD_PROJECTS_DIR || path.join(ROOT, 'projects'));
 const FOLDER_RE = /^[a-z0-9][a-z0-9-]{0,79}$/;
-const RESERVED_RE = /^(con|prn|aux|nul|com\d|lpt\d)$/;
+const RESERVED_RE = require('./plugins.js').CONSTANTS.WINDOWS_RESERVED_RE;
 try { fs.mkdirSync(PROJECTS_DIR, { recursive: true }); } catch {} // otherwise the first project run creates it
 // The app's data (workspace, versions, operation rooms, chats, run history) lives in DATA_DIR/squad.db (db.js).
 // It is opened at start only when it exists (or a data/workspace.json from the file version waits to be imported); otherwise the
@@ -53,12 +54,15 @@ const dbModule = require('./db.js');
 if (dbModule.driverError) { console.error(`SQUAD/CODE: ${dbModule.driverError}`); process.exit(1); }
 const nodeMajor = Number(process.versions.node.split('.')[0]);
 if (nodeMajor < 22) console.warn(`SQUAD/CODE pede o Node 22 ou mais novo (este é o ${process.version}). Atualize se algo falhar.`);
-// Plugins (plugins.js): reread on every serveIndex when a file they came from changed.
+// Plugins (plugins.js): reread on every serveIndex when a file they came from changed. The code of the plugins (plugin-host.js) is
+// loaded once, at the start; their content follows the files.
 const pluginLoader = require('./plugins.js').createPluginLoader({ root: ROOT, home: HOME });
 function loadPlugins() {
   try { return pluginLoader.load(); }
-  catch (e) { const warnings = [`Plugins não carregados: ${e.message}`]; return { page: { plugins: [], runtime: {}, warnings }, api: { plugins: [], runtime: {}, warnings, config: { files: [], paths: [], disabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: true } }, count: 0 }; }
+  catch (e) { const warnings = [`Plugins não carregados: ${e.message}`]; return { page: { plugins: [], runtime: {}, warnings }, api: { plugins: [], runtime: {}, warnings, config: { files: [], paths: [], disabled: [], enabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: true } }, count: 0, discovery: { plugins: [], config: { enabled: [], entries: {}, hookTimeoutMs: 3000 }, warnings }, cfgRuntime: {} }; }
 }
+/** The loader's result with the content of a plugin with code only while its code is active (register() worked at the start). */
+const activeContent = loaded => require('./plugins.js').selectContent(loaded, id => pluginHost.statusOf(id) === 'active');
 let store = null;
 /* After the database opens: "Codex (padrão)" when codex is on the PATH (once per database). When it is created on a machine without
    claude and the default is still the untouched "Claude (padrão)", it becomes the default, so agents without a Perfil do not all
@@ -75,6 +79,7 @@ async function afterOpen() {
       if (untouchedClaudeDefault(store.defaultProfile()) && !await resolveBin(DEFAULT_BIN)) { store.setDefaultProfile(made.id); console.log(`Claude não encontrado: ${made.name} é o Perfil padrão.`); }
     } catch (e) { console.warn(`Perfil do Codex não criado: ${e.message}`); }
   })();
+  if (pluginHost.pending) await pluginHost.ready; // register(ctx) of the plugins first (they may add Adapters the configured Perfis name)
   await syncConfigProfiles(codex);
 }
 function openDb() {
@@ -146,6 +151,10 @@ function tokenOk(req, url) {
   const a = Buffer.from(String(given)); const b = Buffer.from(TOKEN);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+
+// Plugins with code (plugin-host.js, docs/plans/plugins.md): found now (read-only), imported only once the port is ours (listen
+// callback below). With none, `pending` stays false and nothing here costs a thing.
+const pluginHost = require('./plugin-host.js').createPluginHost({ getDiscovery: () => loadPlugins().discovery, dataRoot: DATA_DIR, http: { readBody, json, fail }, maxBody: MAX_BODY });
 
 /** Resolve an executable name to a full path (Windows needs to know .exe vs .cmd). */
 function resolveBin(bin) {
@@ -628,10 +637,41 @@ async function defaultInConfig(pid) {
 /** Plugins + configuration as the page/API get them, with the warnings of the configured Perfis appended. */
 async function pluginsWithProfiles() {
   await syncConfigProfiles();
-  const plugins = loadPlugins();
+  const plugins = activeContent(loadPlugins());
   if (!cfgProfiles.warnings.length) return plugins;
   return { ...plugins, page: { ...plugins.page, warnings: [...plugins.page.warnings, ...cfgProfiles.warnings] }, api: { ...plugins.api, warnings: [...plugins.api.warnings, ...cfgProfiles.warnings] } };
 }
+
+const NO_CONTENT = { categories: [], presets: [], avatars: [], themes: [], conventions: null, runtime: {} };
+/**
+ * GET /api/plugins: every plugin found (content, code or both), each with the summary of its content in the page (empty when it is not
+ * there) and what the host says of its code; the runtime and the configuration as plugins.js read them; restartRequired when the code
+ * that runs no longer matches the files.
+ */
+function pluginsBody(loaded) {
+  const view = pluginHost.view(loaded.discovery);
+  const content = new Map(loaded.api.plugins.map(p => [p.id, p]));
+  const plugins = view.plugins.map(v => {
+    const found = (v.status === 'active' || v.status === 'data') && content.get(v.id);
+    const c = found && found.path === v.path ? found : NO_CONTENT;
+    return {
+      id: v.id, name: v.name, version: v.version, description: v.description, path: v.path,
+      categories: c.categories, presets: c.presets, avatars: c.avatars, themes: c.themes, conventions: c.conventions, runtime: c.runtime,
+      hasCode: v.hasCode, status: v.status, error: v.error, source: v.source, requires: v.requires, env: v.env, capabilities: v.capabilities,
+      routes: v.routes, events: v.events, adapters: v.adapters, ...(v.observers ? { observers: v.observers } : {}), warnings: v.warnings,
+    };
+  });
+  return { ok: true, plugins, runtime: loaded.api.runtime, warnings: [...new Set([...loaded.api.warnings, ...view.warnings])], config: loaded.api.config, restartRequired: view.restartRequired };
+}
+const pluginsOn = body => body.plugins.filter(p => p.status === 'active' || p.status === 'data').length;
+/** One plugin in the start log: "acme 1.2.0 (2 agente(s))", "hello 1.0.0 (ativo)", "x (desligado: motivo)". */
+function pluginLine(p) {
+  const parts = [];
+  if (p.status !== 'data') parts.push(`${STATUS_PT[p.status] || p.status}${p.error ? `: ${p.error}` : ''}`);
+  if (p.status === 'data' || (p.status === 'active' && p.presets.length)) parts.push(`${p.presets.length} agente(s)`);
+  return `${p.id}${p.version ? ` ${p.version}` : ''} (${parts.join(', ')})`;
+}
+const { STATUS_PT } = require('./plugin-host.js');
 
 /* ---------- telemetry (OTLP/HTTP JSON, one trace per run) ---------- */
 const INHERITED_TELEMETRY = /^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$|CLAUDE_CODE_OTEL_|BETA_TRACING_ENDPOINT$|ENABLE_BETA_TRACING_DETAILED$)/;
@@ -842,6 +882,7 @@ async function startRun(body, internal = {}) {
   const parent = internal.parent || null;
   // A sync of the configured Perfis still running (database just opened, configuration changed) finishes first; awaited before the
   // slot below is taken, which stays synchronous.
+  if (pluginHost.pending) await pluginHost.ready;
   await configProfilesReady();
   // internal.exact: that Perfil and no other (the usage probe of Configurações > Perfis).
   const { profile, fallbackFrom } = internal.exact ? { profile: getProfile(opts.profile) || defaultProfile(), fallbackFrom: null } : pickProfile(opts.profile);
@@ -1114,6 +1155,7 @@ function memoryTag() {
 
 /* ---------- http ---------- */
 async function serveIndex(res) {
+  if (pluginHost.pending) await pluginHost.ready;
   const file = path.join(ROOT, 'index.html');
   let html;
   try { html = await fsp.readFile(file, 'utf8'); }
@@ -1141,8 +1183,12 @@ async function handle(req, res) {
   if (!url.pathname.startsWith('/api/')) return fail(res, 404, 'Não encontrado.');
   if (!tokenOk(req, url)) return fail(res, 401, 'Token do bridge inválido. Recarregue a página servida pelo bridge.');
 
+  if (pluginHost.pending) await pluginHost.ready;
+
   const parts = url.pathname.split('/').filter(Boolean); // ['api', ...]
   try {
+    // /api/plugins/<id>/...: the routes a plugin registered (same token, Host and Origin as every call above); never the core's.
+    if (parts[1] === 'plugins' && parts.length > 2 && await pluginHost.route(req, res, url)) return;
     if (req.method === 'GET' && url.pathname === '/api/health') {
       const bin = url.searchParams.get('claudePath') || DEFAULT_BIN;
       let info = await binVersion(bin);
@@ -1158,10 +1204,10 @@ async function handle(req, res) {
       if (info.version) engines.claude = true;
       const live = info.version ? { adapter: 'claude', ...info } : usable;
       if (!info.version && live) info = { ...info, version: live.version };
-      return json(res, 200, { ok: true, bridge: 'squad-code', claudeVersion: info.version, claudePath: info.resolved, claudeError: info.error, engines, engineAdapter: live?.adapter || null, enginePath: live?.resolved || null, defaultCwd: process.cwd(), projectsDir: longPath(PROJECTS_DIR), home: HOME, platform: process.platform, activeRuns: activeCount(), maxConcurrent, dbReady: !setupNeeded(), dbPath: store?.file || DB_FILE, profiles: listProfiles().length, plugins: loadPlugins().count });
+      return json(res, 200, { ok: true, bridge: 'squad-code', claudeVersion: info.version, claudePath: info.resolved, claudeError: info.error, engines, engineAdapter: live?.adapter || null, enginePath: live?.resolved || null, defaultCwd: process.cwd(), projectsDir: longPath(PROJECTS_DIR), home: HOME, platform: process.platform, activeRuns: activeCount(), maxConcurrent, dbReady: !setupNeeded(), dbPath: store?.file || DB_FILE, profiles: listProfiles().length, plugins: pluginsOn(pluginsBody(activeContent(loadPlugins()))) });
     }
-    // Plugins as injected in the page, without the avatars' data URLs, plus the configuration they came from.
-    if (req.method === 'GET' && url.pathname === '/api/plugins') return json(res, 200, { ok: true, ...(await pluginsWithProfiles()).api });
+    // Every plugin (content without the avatars' data URLs, and the state of its code), plus the configuration they came from.
+    if (req.method === 'GET' && url.pathname === '/api/plugins') return json(res, 200, pluginsBody(await pluginsWithProfiles()));
     // First start: the page creates the database with the workspace the person chose (from scratch, the example, a backup or the
     // browser's copy). Validated before anything is written; refused once a workspace exists.
     if (req.method === 'POST' && url.pathname === '/api/setup') {
@@ -1329,8 +1375,11 @@ function shutdown() {
   for (const run of runs.values()) { if (run.child) { run.cancelled = true; killTree(run.child); } flushRun(run); }
   try { fs.rmSync(TMP_DIR, { recursive: true, force: true }); } catch {}
   server.close();
+  // onDispose of the plugins (1 s each, in parallel; a register() still loading gets 1 s first) runs while the process waits to exit; without any, the wait stays 300 ms.
+  const disposing = pluginHost.hasDisposers();
+  const disposed = pluginHost.dispose().catch(() => {});
   // Runs still open are marked interrupted at the next start.
-  setTimeout(() => { try { store?.close(); } catch {} process.exit(0); }, 300).unref();
+  setTimeout(async () => { await disposed; try { store?.close(); } catch {} process.exit(0); }, pluginHost.pending ? 2300 : disposing ? 1200 : 300).unref();
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
@@ -1350,14 +1399,16 @@ server.listen(PORT, HOST, () => {
     catch (e) { console.error(`SQUAD/CODE: não foi possível abrir o banco em ${DATA_DIR}.\n${e.message}`); try { fs.rmSync(TMP_DIR, { recursive: true, force: true }); } catch {} process.exit(1); }
   }
   const url = `http://${HOST}:${PORT}`;
+  pluginHost.load(); // import() + register(ctx) of the enabled plugins; handle(), serveIndex, startRun and afterOpen wait for it
   afterOpen();
   console.log(`SQUAD/CODE bridge ativo em ${url}`);
   console.log(`Pasta dos projetos: ${PROJECTS_DIR}`);
   if (store) console.log(`Banco de dados: ${store.file}`);
   else console.log(`Banco de dados: nenhum em ${DATA_DIR}. Abra ${url} para criar um.`);
-  const plugins = loadPlugins();
-  const pluginList = plugins.page.plugins.map(p => `${p.id}${p.version ? ` ${p.version}` : ''} (${p.presets.length} agente(s))`).join(', ');
-  console.log(`Plugins: ${pluginList || 'nenhum'}${plugins.page.warnings.length ? ` · ${plugins.page.warnings.length} aviso(s): ${plugins.page.warnings.join(' | ')}` : ''}`);
+  pluginHost.ready.then(() => {
+    const body = pluginsBody(activeContent(loadPlugins()));
+    console.log(`Plugins: ${body.plugins.map(pluginLine).join(', ') || 'nenhum'}${body.warnings.length ? ` · ${body.warnings.length} aviso(s): ${body.warnings.join(' | ')}` : ''}`);
+  });
   if (store?.interrupted) console.log(`${store.interrupted} execução(ões) interrompida(s) na última sessão marcada(s) no histórico.`);
   if (process.env.SQUAD_PRINT_TOKEN) console.log(`TOKEN=${TOKEN}`);
   binVersion(DEFAULT_BIN).then(info => {

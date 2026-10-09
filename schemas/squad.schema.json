@@ -13,7 +13,7 @@
     "plugins": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Plugins de conteúdo.",
+      "description": "Plugins (docs/plans/plugins-conteudo.md, docs/plans/plugins.md). paths e disabled valem em qualquer arquivo para plugins de conteúdo; código (enabled, entries, hookTimeoutMs e plugins com server) só vale em squad.local.json; no compartilhado é ignorado com aviso.",
       "properties": {
         "paths": {
           "type": "array",
@@ -21,14 +21,35 @@
             "type": "string",
             "minLength": 1
           },
-          "description": "Pastas de Plugins. Relativas à pasta deste arquivo; ~ = home. Concatenadas entre os arquivos."
+          "description": "Pastas de Plugins (com squad-plugin.json). Relativas à pasta deste arquivo; ~ = home. Concatenadas entre os arquivos. Além delas, vale ~/.squad-code/plugins/<id>/."
         },
         "disabled": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "Ids de Plugins desligados (o último arquivo que declara vence)."
+          "description": "Ids de Plugins desligados (o último arquivo que declara vence). Um plugin com código só é desligado pelo arquivo local."
+        },
+        "enabled": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{1,40}$"
+          },
+          "description": "Ids dos Plugins com código que o bridge pode importar (o último arquivo local que declara vence). Plugins só de conteúdo não precisam constar."
+        },
+        "hookTimeoutMs": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 60000,
+          "description": "Tempo limite (ms) de cada handler de evento (padrão 3000)."
+        },
+        "entries": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/pluginEntry"
+          },
+          "description": "Por id de Plugin: grants, settings e failClosed."
         }
       }
     },
@@ -249,6 +270,33 @@
               "description": "Incluir prompt e resposta."
             }
           }
+        }
+      }
+    },
+    "pluginEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "grants": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "run.mutate",
+              "adapter",
+              "adapter.override",
+              "run.content",
+              "workspace.read"
+            ]
+          },
+          "description": "Capacidades concedidas (interseção com as pedidas no manifesto). Só no arquivo local."
+        },
+        "settings": {
+          "type": "object",
+          "description": "Configuração do plugin, validada pelo configSchema do manifesto (até 16 KB). Sem segredos: use env."
+        },
+        "failClosed": {
+          "type": "boolean",
+          "description": "run:beforeSpawn com falha ou tempo esgotado bloqueia a execução (padrão: segue em frente)."
         }
       }
     }

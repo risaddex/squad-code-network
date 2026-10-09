@@ -8,7 +8,8 @@ upstream mais um carregador genérico; o conteúdo específico de uma empresa vi
 ## Termos
 
 - **Plugin**: pasta com um `squad-plugin.json` e arquivos que estendem o catálogo (agentes, categorias, souls,
-  diretrizes, avatares, temas, defaults). Nunca altera dados já salvos no workspace.
+  diretrizes, avatares, temas, defaults). Nunca altera dados já salvos no workspace. O mesmo manifesto pode trazer também código
+  do bridge (`server`), que só roda pela configuração local: ver `docs/plans/plugins.md`.
 - **Tema**: paleta da interface e do mapa (cidade e escritório) oferecida por um plugin; escolhido nas Configurações.
 - **Configuração local**: `squad.config.json` (versionável, compartilhado) e `squad.local.json` (git-ignored, desta
   máquina), na raiz do app. O local vence o compartilhado.
@@ -39,6 +40,7 @@ Ordem (o último vence campo a campo; `plugins.paths` é concatenado sem repetir
 - `runtime`: chaves permitidas = as de `DEFAULT_RUNTIME` do app (o bridge repassa só chaves de um whitelist:
   `permissionMode, model, effort, maxBudgetUsd, timeoutSec, concurrency, addDirs, restrictTools, extraAllowedTools`).
   Vale como **default** para workspaces novos e para campos vazios; nunca sobrescreve o que a pessoa salvou.
+- **`runtime` de fonte compartilhada:** `permissionMode`, `addDirs` e `extraAllowedTools` ampliam o que um agente pode fazer, então só valem vindos do arquivo local (`squad.local.json`/`SQUAD_CONFIG`), de um plugin que algum arquivo local nomeia, de `SQUAD_PLUGINS` ou da pasta do home. No `squad.config.json` (runtime direto) e em plugin achado só por ele são avisos e são ignorados; os demais campos de `runtime` seguem como antes.
 - `profiles`: Perfis declarados (termos em `CONTEXT.md`; contrato dos Perfis em `docs/plans/perfis-adapters.md`). Detalhes em
   **Perfis da configuração**, abaixo.
 - `defaultProfile`: o Perfil padrão: a `key` de um Perfil da configuração ou o id de um Perfil existente (o último arquivo

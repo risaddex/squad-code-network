@@ -1,7 +1,9 @@
 'use strict';
 /*
- * Plugins (docs/plans/plugins-conteudo.md): local configuration (squad.config.json + squad.local.json, SQUAD_CONFIG, SQUAD_PLUGINS) and the
- * loader of the plugins it points to (squad-plugin.json, agents/*.md, avatars, conventions.json, themes, runtime defaults).
+ * Plugins (docs/plans/plugins-conteudo.md, docs/plans/plugins.md): local configuration (squad.config.json + squad.local.json,
+ * SQUAD_CONFIG, SQUAD_PLUGINS), the discovery of every plugin (plugins.paths of each file, SQUAD_PLUGINS and ~/.squad-code/plugins/<id>/)
+ * and the loader of their content (squad-plugin.json, agents/*.md, avatars, conventions.json, themes, runtime defaults). A plugin
+ * may bring content, code (`server`, imported by plugin-host.js) or both, in the same manifest; code only runs from a local source.
  * No dependencies: the agents' frontmatter goes through a small strict parser of a YAML subset (parseFrontmatter).
  * A plugin is trusted (the person installed it), but reads stay inside its folder (realpath), with size and count limits and no SVG.
  * createPluginLoader(...).load() rereads only when a file it read (or a folder it listed) changed: mtime + size of each one.
@@ -65,6 +67,19 @@ const PROFILE_KEY_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
 const PROFILE_FIELDS = ['name', 'adapter', 'bin', 'configDir', 'model', 'effort', 'concurrency', 'fallbackId', 'threshold', 'ignoreUserConfig', 'telemetry'];
 const MAX_CONFIG_PROFILES = 50;
 const TELEMETRY_KEYS = ['enabled', 'native', 'content'];
+// Plugins with code (docs/plans/plugins.md): what a manifest may ask for (capabilities) and the events the bridge can emit. The schemas
+// repeat the capabilities; tests/plugins.test.mjs checks they match.
+// Names Windows reserves for devices: refused as a project folder (server.js) and as a plugin id.
+const WINDOWS_RESERVED_RE = /^(con|prn|aux|nul|com\d|lpt\d)$/;
+const PLUGIN_CAPABILITIES = ['run.mutate', 'adapter', 'adapter.override', 'run.content', 'workspace.read'];
+const PLUGIN_EVENTS = ['run:start', 'run:event', 'run:finish', 'profile:usage', 'workspace:saved', 'run:beforeSpawn'];
+const PLUGIN_HOOK_TIMEOUT_MS = 3000;
+const PLUGIN_FILE = 'squad-plugin.json';
+const API_VERSION = 1;
+const SERVER_MAX = 2 * 1024 * 1024;
+const SERVER_EXTS = ['.mjs', '.js'];
+// Errors of these manifest fields refuse the plugin (the content fields are checked item by item).
+const MANIFEST_RE = /^(?:id|name|version|description|apiVersion|server|requires|capabilities|env|configSchema)(?:$|[.[])/;
 
 /* ---------- frontmatter: a strict YAML subset ---------- */
 // `chave: valor` (string, number, true/false; quotes optional), inline lists `[a, "b, c"]`, block lists `- item`, one level of nested
@@ -198,13 +213,17 @@ function hexColor(v) {
 }
 
 /** Runtime defaults (contract whitelist), in the app's DEFAULT_RUNTIME types. Invalid values are dropped with a warning. */
-function validateRuntime(value, where, warn) {
+// `trusted` false = the values come from a shared source (squad.config.json, or a plugin found only through it): the keys that widen
+// what an agent may do (permissionMode, addDirs, extraAllowedTools) are warnings and ignored there; the local file decides them.
+const SENSITIVE_RUNTIME = ['permissionMode', 'addDirs', 'extraAllowedTools'];
+function validateRuntime(value, where, warn, trusted = true) {
   const out = {};
   if (value === undefined || value === null) return out;
   if (!isObj(value)) { warn(`${where}: "runtime" deve ser um objeto`); return out; }
   const bad = k => warn(`${where}: runtime.${k} inválido, ignorado`);
   const list = v => Array.isArray(v) ? v.map(String).map(s => s.trim()).filter(Boolean).join(', ') : typeof v === 'string' ? v.trim() : null;
   for (const [k, v] of Object.entries(value)) {
+    if (!trusted && SENSITIVE_RUNTIME.includes(k)) { warn(`${where}: runtime.${k} só vale vindo do arquivo local (squad.local.json ou SQUAD_CONFIG) ou de um plugin dele; ignorado`); continue; }
     switch (k) {
       case 'permissionMode': PERMISSION_MODES.includes(v) ? out[k] = v : bad(k); break;
       case 'model': typeof v === 'string' && (v === '' || MODEL_RE.test(v)) ? out[k] = v : bad(k); break;
@@ -359,6 +378,215 @@ function imageMime(buf) {
   return null;
 }
 
+/* ---------- reading a plugin folder ---------- */
+/**
+ * Reader of one plugin folder: only inside `dir`, lexically and after resolving symlinks (realRoot = its realpath).
+ * read(relPath, max, exts) → Buffer; read.locate(relPath, max, exts) → the real path of the file after the same checks (for a module
+ * the bridge imports instead of reading). Throws a message; `track` records each file for the loader's cache.
+ */
+function createInsideReader(dir, realRoot, track) {
+  const locate = (relPath, max, exts) => {
+    const abs = path.resolve(dir, String(relPath));
+    const lex = path.relative(dir, abs);
+    if (!lex || lex.startsWith('..') || path.isAbsolute(lex)) throw new Error('caminho fora da pasta do plugin');
+    const ext = path.extname(abs).toLowerCase();
+    if (ext === '.svg') throw new Error('SVG não é aceito');
+    if (!exts.includes(ext)) throw new Error(`extensão não aceita (${ext || 'sem extensão'})`);
+    track(abs);
+    let real;
+    try { real = fs.realpathSync(abs); } catch (e) { throw new Error(e.code === 'ENOENT' ? 'arquivo não encontrado' : e.message); }
+    const r = path.relative(realRoot, real);
+    if (!r || r.startsWith('..') || path.isAbsolute(r)) throw new Error('aponta para fora da pasta do plugin (link simbólico recusado)');
+    const st = fs.statSync(real);
+    if (!st.isFile()) throw new Error('não é um arquivo');
+    if (st.size > max) throw new Error(`arquivo maior que ${Math.round(max / 1024)} KB`);
+    return real;
+  };
+  const read = (relPath, max, exts) => fs.readFileSync(locate(relPath, max, exts));
+  read.locate = locate;
+  return read;
+}
+
+/**
+ * Reads one folder's squad-plugin.json and builds the content it describes: categories, avatars, themes, runtime defaults,
+ * conventions.json and agents/*.md. Returns { plugin, meta, id, realRoot, read, tag }; `plugin` (the content) is null when the folder
+ * was refused (a warning says why) or ctx.gate said no content.
+ * ctx = { warn, rel, track, seen (id → folder, to refuse repeated ids), trusted (false: a shared source, see
+ *   validateRuntime), gate(meta, { id, metaErrors, read, realRoot, tag }) → false stops before the content is read }.
+ */
+function buildPlugin(dir, ctx) {
+  const { warn, rel, track, seen } = ctx;
+  const label = rel(dir);
+  track(dir);
+  let realRoot;
+  try { realRoot = fs.realpathSync(dir); if (!fs.statSync(realRoot).isDirectory()) throw new Error('não é uma pasta'); }
+  catch (e) { warn(`${label}: pasta do plugin não encontrada (${e.code || e.message})`); return { plugin: null }; }
+  const read = createInsideReader(dir, realRoot, track);
+  // Before the id is known the warning names the folder; after, the plugin id and the file inside it.
+  let tag = label;
+  const at = (file, msg) => `${tag}${tag === label ? '/' : ' '}${file}: ${msg}`;
+  let meta, id = '';
+  const out = plugin => ({ plugin, meta, id, realRoot, read, tag });
+
+  try { meta = JSON.parse(read(PLUGIN_FILE, LIMITS.text, ['.json']).toString('utf8').replace(/^﻿/, '')); }
+  catch (e) { warn(at(PLUGIN_FILE, `${e instanceof SyntaxError ? 'JSON inválido' : e.message}; plugin ignorado`)); return out(null); }
+  if (!isObj(meta)) { warn(at(PLUGIN_FILE, 'deve ser um objeto JSON; plugin ignorado')); return out(null); }
+  id = typeof meta.id === 'string' ? meta.id : '';
+  if (!PLUGIN_ID_RE.test(id)) { warn(at(PLUGIN_FILE, `id ausente ou inválido (${String(meta.id ?? '').slice(0, 40) || 'vazio'}); plugin ignorado`)); id = ''; return out(null); }
+  if (seen.has(id)) { warn(`${label}: id ${id} repetido (já carregado de ${rel(seen.get(id))}); plugin ignorado`); return out(null); }
+  tag = `[${id}]`;
+  const metaErrors = schemaValidate(SCHEMAS.plugin, meta);
+  for (const e of metaErrors) if (isUnknown(e) && !/[.[]/.test(e.path)) warn(at(PLUGIN_FILE, `campo "${e.path}" desconhecido, ignorado`));
+  if (ctx.gate && ctx.gate(meta, { id, metaErrors, read, realRoot, tag }) === false) return out(null);
+  // An item that passed the checks below still goes through its schema: unknown field = warning, anything else refuses it.
+  const schemaItem = (list, i) => {
+    const p = `${list}[${i}]`, errs = errorsUnder(metaErrors, p);
+    for (const e of errs) if (isUnknown(e)) warn(at(PLUGIN_FILE, `${e.path}: campo desconhecido, ignorado`));
+    const hard = errs.find(e => !isUnknown(e));
+    if (hard) throw new Error(formatError(hard));
+  };
+  const plugin = { id, name: '', version: '', description: '', path: realRoot, hasCode: meta.server !== undefined, categories: [], presets: [], avatars: [], themes: [], conventions: null, runtime: {} };
+  try { plugin.name = str(meta.name, 80) || id; plugin.version = str(meta.version, 40); plugin.description = str(meta.description, 1000); }
+  catch (e) { warn(at(PLUGIN_FILE, `name/version/description: ${e.message}`)); plugin.name = plugin.name || id; }
+
+  const listOf = (k, max) => {
+    if (meta[k] === undefined) return [];
+    if (!Array.isArray(meta[k])) { warn(at(PLUGIN_FILE, `"${k}" deve ser uma lista`)); return []; }
+    if (meta[k].length > max) warn(at(PLUGIN_FILE, `mais de ${max} itens em "${k}": os excedentes foram ignorados`));
+    return meta[k].slice(0, max);
+  };
+  for (const [i, c] of listOf('categories', LIMITS.categories).entries()) {
+    try { const cat = validateCategory(c); schemaItem('categories', i); if (plugin.categories.some(x => x.key === cat.key)) throw new Error(`categoria ${cat.key} repetida`); plugin.categories.push(cat); }
+    catch (e) { warn(at(PLUGIN_FILE, e.message)); }
+  }
+  let imageBytes = 0;
+  for (const [i, a] of listOf('avatars', LIMITS.avatars).entries()) {
+    try {
+      if (!isObj(a)) throw new Error('avatar deve ser um objeto');
+      const key = String(a.key || '');
+      if (!KEY_RE.test(key)) throw new Error(`key de avatar inválida: ${key.slice(0, 40)}`);
+      if (plugin.avatars.some(x => x.key === `plugin:${id}/${key}`)) throw new Error(`avatar ${key} repetido`);
+      if (typeof a.file !== 'string' || !a.file) throw new Error(`avatar ${key} sem "file"`);
+      schemaItem('avatars', i);
+      let buf;
+      try { buf = read(a.file, LIMITS.image, IMAGE_EXTS); } catch (e) { throw new Error(`${a.file}: ${e.message}`); }
+      const mime = imageMime(buf);
+      if (!mime) throw new Error(`${a.file}: não é uma imagem PNG, JPEG ou WebP`);
+      if (imageBytes + buf.length > LIMITS.images) throw new Error(`${a.file}: limite de 12 MB de imagens por plugin atingido`);
+      imageBytes += buf.length;
+      plugin.avatars.push({ key: `plugin:${id}/${key}`, label: str(a.label, 60) || key.toUpperCase(), src: `data:${mime};base64,${buf.toString('base64')}` });
+    } catch (e) { warn(at(PLUGIN_FILE, e.message)); }
+  }
+  for (const [i, t] of listOf('themes', LIMITS.themes).entries()) {
+    try {
+      const theme = validateTheme(t, `${tag} ${PLUGIN_FILE}`, warn);
+      schemaItem('themes', i);
+      theme.key = `${id}/${theme.key}`;
+      if (plugin.themes.some(x => x.key === theme.key)) throw new Error(`tema ${t.key} repetido`);
+      plugin.themes.push(theme);
+    } catch (e) { warn(at(PLUGIN_FILE, e.message)); }
+  }
+  plugin.runtime = validateRuntime(meta.runtime, `${tag} ${PLUGIN_FILE}`, warn, ctx.trusted !== false);
+
+  const convFile = meta.conventions === undefined ? 'conventions.json' : meta.conventions;
+  if (typeof convFile !== 'string' || !convFile) warn(at(PLUGIN_FILE, '"conventions" deve ser o caminho de um arquivo .json'));
+  else if (meta.conventions !== undefined || fs.existsSync(path.join(dir, 'conventions.json'))) {
+    try { plugin.conventions = validateConventions(JSON.parse(read(convFile, LIMITS.text, ['.json']).toString('utf8').replace(/^﻿/, '')), `${tag} ${convFile}`, warn); }
+    catch (e) { warn(at(convFile, e instanceof SyntaxError ? `JSON inválido (${e.message})` : e.message)); }
+  }
+
+  const agentsDir = path.join(dir, 'agents');
+  track(agentsDir);
+  let files = [];
+  try {
+    const real = fs.realpathSync(agentsDir), r = path.relative(realRoot, real);
+    if (!r || r.startsWith('..') || path.isAbsolute(r)) warn(`${tag} agents: aponta para fora da pasta do plugin (link simbólico recusado)`);
+    else files = fs.readdirSync(agentsDir).filter(f => f.toLowerCase().endsWith('.md')).sort();
+  } catch (e) { if (e.code !== 'ENOENT') warn(`${tag} agents: ${e.message}`); }
+  if (files.length > LIMITS.agents) { warn(`${tag} agents: mais de ${LIMITS.agents} agentes, os excedentes foram ignorados`); files = files.slice(0, LIMITS.agents); }
+  for (const f of files) {
+    const file = `agents/${f}`;
+    try {
+      const { data, body } = parseFrontmatter(read(file, LIMITS.text, ['.md']).toString('utf8'));
+      // A repeated name is not decided here: only the page knows ROLES and the built-in names, so every valid candidate goes
+      // and the page keeps the first one it accepts (pluginPresets in src/app.js).
+      const preset = validatePreset(data, body);
+      const agentErrors = schemaValidate(SCHEMAS.agent, data);
+      for (const e of agentErrors) if (isUnknown(e)) warn(at(file, `campo "${e.path}" desconhecido, ignorado`));
+      const hard = agentErrors.find(e => !isUnknown(e));
+      if (hard) throw new Error(formatError(hard));
+      plugin.presets.push(preset);
+    } catch (e) { warn(at(file, /agente ignorado$/.test(e.message) ? e.message : `${e.message}; agente ignorado`)); }
+  }
+  return out(plugin);
+}
+
+/* ---------- order ---------- */
+/**
+ * Pure. list = [{ id, requires?: string[], enabled?: boolean }] → { order: [id], disabled: [{ id, reason: 'off'|'requires'|'cycle', message }], warnings }.
+ * Kahn's algorithm taking the alphabetically first ready id each time. A plugin that requires one that is missing or off is disabled
+ * too (transitively). Fail-closed on a cycle: its members (and whatever needs them) are disabled, with a warning naming the members.
+ */
+function orderPlugins(list) {
+  const byId = new Map(list.map(p => [p.id, p]));
+  const disabled = new Map();
+  for (const p of list) if (p.enabled === false) disabled.set(p.id, { id: p.id, reason: 'off', message: 'desligado' });
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const p of list) {
+      if (disabled.has(p.id)) continue;
+      for (const dep of p.requires || []) {
+        const why = !byId.has(dep) ? 'que não existe' : disabled.has(dep) ? 'que está desligado' : '';
+        if (!why) continue;
+        disabled.set(p.id, { id: p.id, reason: 'requires', missing: dep, message: `depende de "${dep}", ${why}` });
+        changed = true; break;
+      }
+    }
+  }
+  const active = list.filter(p => !disabled.has(p.id));
+  const deps = new Map(active.map(p => [p.id, new Set(p.requires || [])]));
+  const order = [], warnings = [];
+  const done = new Set();
+  for (;;) {
+    const ready = active.filter(p => !done.has(p.id) && [...deps.get(p.id)].every(d => done.has(d))).map(p => p.id).sort();
+    if (!ready.length) break;
+    order.push(ready[0]); done.add(ready[0]);
+  }
+  const rest = active.map(p => p.id).filter(id => !done.has(id)).sort();
+  if (rest.length) {
+    // Members of a cycle reach themselves through requires; the others of `rest` only wait for one.
+    const reaches = (from, target, seenIds = new Set()) => [...deps.get(from)].some(d => d === target || (rest.includes(d) && !seenIds.has(d) && (seenIds.add(d), reaches(d, target, seenIds))));
+    const members = rest.filter(id => reaches(id, id));
+    warnings.push(`ciclo de dependências entre plugins: ${members.join(', ')}; os membros do ciclo ficam desligados`);
+    for (const id of rest) {
+      if (members.includes(id)) disabled.set(id, { id, reason: 'cycle', message: `ciclo de dependências com ${members.filter(m => m !== id).join(', ') || 'si mesmo'}` });
+      else disabled.set(id, { id, reason: 'requires', message: `depende de um plugin em ciclo (${members.join(', ')})` });
+    }
+  }
+  return { order, disabled: list.filter(p => disabled.has(p.id)).map(p => disabled.get(p.id)), warnings };
+}
+
+/** The manifest fields the host reads, normalized (the schema already refused what is wrong). */
+function normalizeManifest(meta, id) {
+  return {
+    id, name: typeof meta.name === 'string' && meta.name.trim() ? meta.name.trim().slice(0, 80) : id,
+    version: typeof meta.version === 'string' ? meta.version.trim().slice(0, 40) : '', description: typeof meta.description === 'string' ? meta.description.trim().slice(0, 1000) : '',
+    apiVersion: Number.isInteger(meta.apiVersion) ? meta.apiVersion : API_VERSION, server: typeof meta.server === 'string' ? meta.server : '',
+    requires: Array.isArray(meta.requires) ? [...new Set(meta.requires.filter(x => typeof x === 'string'))] : [],
+    capabilities: Array.isArray(meta.capabilities) ? [...new Set(meta.capabilities.filter(x => PLUGIN_CAPABILITIES.includes(x)))] : [],
+    env: Array.isArray(meta.env) ? [...new Set(meta.env.filter(x => typeof x === 'string'))] : [], configSchema: isObj(meta.configSchema) ? meta.configSchema : null,
+  };
+}
+
+/** The content plugins of a load() result whose `keep(id)` holds for the ones with code (the host decides those), with the runtime redone. */
+function selectContent(result, keep) {
+  const plugins = result.page.plugins.filter(p => !p.hasCode || keep(p.id));
+  if (plugins.length === result.page.plugins.length) return result;
+  const runtime = Object.assign({}, ...plugins.map(p => p.runtime), result.cfgRuntime || {});
+  const ids = new Set(plugins.map(p => p.id));
+  return { ...result, page: { ...result.page, plugins, runtime }, api: { ...result.api, plugins: result.api.plugins.filter(p => ids.has(p.id)), runtime }, count: plugins.length };
+}
+
 /* ---------- loader ---------- */
 function createPluginLoader({ root, home, env = process.env, cwd = process.cwd() }) {
   let cache = null; // { sigs: Map<path, sig>, result }
@@ -409,6 +637,56 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
     }
   }
 
+  // `plugins` of one configuration file, merged into `into`: paths concatenated (resolved against the file; a folder some local file
+  // names counts as local), disabled from the last file that declares it (disabledLocal: from the local file), enabled from the local
+  // file, entries by id (a later file overrides field by field). A shared file (local = false) cannot say what code runs or how: its
+  // `enabled`, `grants`, `settings`, `failClosed` and `hookTimeoutMs` are warnings and ignored, a plugin with `server` found only
+  // through its paths is blocked, and its `disabled` does not switch off a plugin with code.
+  function readPluginsConfig(raw, file, base, local, into, warn, addPath) {
+    const where = rel(file);
+    if (!isObj(raw)) { warn(`${where}: "plugins" deve ser um objeto com "paths" e "disabled"`); return; }
+    const onlyLocal = what => warn(`${where}: ${what} só vale no arquivo local (squad.local.json ou SQUAD_CONFIG); ignorado`);
+    if (raw.paths !== undefined) {
+      if (!Array.isArray(raw.paths)) warn(`${where}: "plugins.paths" deve ser uma lista de pastas`);
+      else for (const v of raw.paths) {
+        if (typeof v !== 'string' || !v.trim()) { warn(`${where}: item de "plugins.paths" inválido`); continue; }
+        addPath(expand(v, base), local, file);
+      }
+    }
+    if (raw.disabled !== undefined) {
+      if (!Array.isArray(raw.disabled)) warn(`${where}: "plugins.disabled" deve ser uma lista de ids`);
+      else { into.disabled = raw.disabled.filter(x => typeof x === 'string').map(x => x.trim()); if (local) into.disabledLocal = into.disabled; }
+    }
+    if (raw.enabled !== undefined) {
+      if (!Array.isArray(raw.enabled)) warn(`${where}: "plugins.enabled" deve ser uma lista de ids`);
+      else if (!local) onlyLocal('"plugins.enabled"');
+      else {
+        const ids = raw.enabled.filter(v => { const ok = typeof v === 'string' && PLUGIN_ID_RE.test(v); if (!ok) warn(`${where}: id inválido em "plugins.enabled": ${String(v).slice(0, 40)}`); return ok; });
+        into.enabled = [...new Set(ids)];
+      }
+    }
+    if (raw.hookTimeoutMs !== undefined) {
+      if (!local) onlyLocal('"plugins.hookTimeoutMs"');
+      else if (Number.isInteger(raw.hookTimeoutMs) && raw.hookTimeoutMs >= 100 && raw.hookTimeoutMs <= 60000) into.hookTimeoutMs = raw.hookTimeoutMs;
+      else warn(`${where}: "plugins.hookTimeoutMs" deve ser um inteiro entre 100 e 60000`);
+    }
+    if (raw.entries !== undefined) {
+      if (!isObj(raw.entries)) warn(`${where}: "plugins.entries" deve ser um objeto por id`);
+      else for (const [id, e] of Object.entries(raw.entries)) {
+        if (!PLUGIN_ID_RE.test(id) || RESERVED_KEYS.has(id)) { warn(`${where}: plugins.entries.${id.slice(0, 40)}: id inválido; ignorado`); continue; }
+        if (!isObj(e)) { warn(`${where}: plugins.entries.${id} deve ser um objeto; ignorado`); continue; }
+        const out = into.entries[id] || (into.entries[id] = {});
+        if (e.grants !== undefined) {
+          if (!local) onlyLocal(`plugins.entries.${id}.grants`);
+          else if (!Array.isArray(e.grants) || !e.grants.every(g => PLUGIN_CAPABILITIES.includes(g))) warn(`${where}: plugins.entries.${id}.grants deve ser uma lista de ${PLUGIN_CAPABILITIES.join(', ')}; ignorado`);
+          else out.grants = [...new Set(e.grants)];
+        }
+        if (e.settings !== undefined) { if (!local) onlyLocal(`plugins.entries.${id}.settings`); else if (isObj(e.settings)) out.settings = e.settings; else warn(`${where}: plugins.entries.${id}.settings deve ser um objeto; ignorado`); }
+        if (e.failClosed !== undefined) { if (!local) onlyLocal(`plugins.entries.${id}.failClosed`); else if (typeof e.failClosed === 'boolean') out.failClosed = e.failClosed; else warn(`${where}: plugins.entries.${id}.failClosed deve ser true ou false; ignorado`); }
+      }
+    }
+  }
+
   function load() {
     if (cache && [...cache.sigs].every(([p, s]) => statSig(p) === s)) return cache.result;
     const sigs = new Map();
@@ -423,10 +701,18 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
     // read, so the bridge leaves the configured Perfis as they are instead of removing what it no longer sees.
     // localFile: where a new defaultProfile is written when no file declares one; hashes: sha1 of each file as read (the bridge refuses
     // to write over a file changed since); profileWarnings: the warnings about profiles/defaultProfile (shown in the PERFIS tab).
-    const config = { files: [], paths: [], disabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: false, errorFiles: [], localFile: cfgFiles[1], hashes: {}, profileWarnings: [] };
+    const config = { files: [], paths: [], disabled: [], enabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: false, errorFiles: [], localFile: cfgFiles[1], hashes: {}, profileWarnings: [] };
+    // What only the plugins with code use (plugin-host.js); entries may hold settings, so it stays out of /api/plugins.
+    const code = { pathInfo: [], disabled: [], disabledLocal: [], enabled: [], entries: {}, hookTimeoutMs: PLUGIN_HOOK_TIMEOUT_MS };
+    const pluginWarnings = []; // what the configuration and the discovery say about plugins
     const profMap = new Map();
     let cfgRuntime = {};
-    const addPlugin = p => { if (!config.paths.includes(p)) config.paths.push(p); };
+    const addPath = (dir, local, file) => {
+      if (!config.paths.includes(dir)) config.paths.push(dir);
+      const x = code.pathInfo.find(y => y.path === dir);
+      if (!x) code.pathInfo.push({ path: dir, local, file });
+      else if (local) x.local = true; // the same folder in both files: the local file decided it
+    };
     for (const [idx, file] of cfgFiles.entries()) {
       track(file);
       let text;
@@ -441,164 +727,109 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
       const base = path.dirname(file);
       // The schema's top-level errors other than unknown fields are reported by the checks below (plugins, runtime...), with their messages.
       const errors = schemaValidate(SCHEMAS.config, data);
-      for (const e of errors) if (isUnknown(e) && (!/[.[]/.test(e.path) || /^plugins\.[^.[]+$/.test(e.path))) warn(`${rel(file)}: campo "${e.path}" desconhecido, ignorado`);
+      for (const e of errors) if (isUnknown(e) && (!/[.[]/.test(e.path) || e.path.startsWith('plugins.'))) warn(`${rel(file)}: campo "${e.path}" desconhecido, ignorado`);
       const pwarn = msg => { warn(msg); config.profileWarnings.push(msg); };
-      if (data.plugins !== undefined) {
-        if (!isObj(data.plugins)) warn(`${rel(file)}: "plugins" deve ser um objeto com "paths" e "disabled"`);
-        else {
-          const { paths, disabled } = data.plugins;
-          if (paths !== undefined) {
-            if (!Array.isArray(paths)) warn(`${rel(file)}: "plugins.paths" deve ser uma lista de pastas`);
-            else for (const p of paths) typeof p === 'string' && p.trim() ? addPlugin(expand(p, base)) : warn(`${rel(file)}: item de "plugins.paths" inválido`);
-          }
-          if (disabled !== undefined) {
-            if (Array.isArray(disabled)) config.disabled = disabled.filter(x => typeof x === 'string').map(x => x.trim());
-            else warn(`${rel(file)}: "plugins.disabled" deve ser uma lista de ids`);
-          }
-        }
-      }
+      // Code only by local configuration (docs/plans/plugins.md, decision 2): the shared file's enabled/grants/settings are warnings.
+      if (data.plugins !== undefined) readPluginsConfig(data.plugins, file, base, idx === 1, code, msg => { warn(msg); pluginWarnings.push(msg); }, addPath);
       if (data.profiles !== undefined) readProfiles(data.profiles, file, base, profMap, config, pwarn, errors);
       if (data.defaultProfile !== undefined) {
         const d = typeof data.defaultProfile === 'string' ? data.defaultProfile.trim() : '';
         if (d && d.length <= 100) { config.defaultProfile = d; config.defaultProfileFile = file; }
         else pwarn(`${rel(file)}: "defaultProfile" deve ser a key de um Perfil da configuração ou o id de um Perfil`);
       }
-      cfgRuntime = { ...cfgRuntime, ...validateRuntime(data.runtime, rel(file), warn) };
+      cfgRuntime = { ...cfgRuntime, ...validateRuntime(data.runtime, rel(file), warn, idx === 1) };
     }
     config.profiles = [...profMap.values()].map(e => ({ key: e.key, ...e.fields, source: e.source, files: e.files, ...(e.invalid.length ? { invalid: e.invalid } : {}) }));
-    for (const p of String(env.SQUAD_PLUGINS || '').split(path.delimiter).map(s => s.trim()).filter(Boolean)) addPlugin(expand(p, cwd));
+    for (const p of String(env.SQUAD_PLUGINS || '').split(path.delimiter).map(s => s.trim()).filter(Boolean)) addPath(expand(p, cwd), true, '');
+    config.disabled = code.disabled; config.enabled = code.enabled;
 
-    /* plugins */
-    const plugins = [];
-    let dirs = config.paths;
-    if (dirs.length > LIMITS.plugins) { warn(`mais de ${LIMITS.plugins} plugins configurados: os excedentes foram ignorados`); dirs = dirs.slice(0, LIMITS.plugins); }
-    for (const dir of dirs) {
-      const label = rel(dir);
-      track(dir);
-      let realRoot;
-      try { realRoot = fs.realpathSync(dir); if (!fs.statSync(realRoot).isDirectory()) throw new Error('não é uma pasta'); }
-      catch (e) { warn(`${label}: pasta do plugin não encontrada (${e.code || e.message})`); continue; }
-      // Reads only inside the plugin folder: lexically and after resolving symlinks. Returns a Buffer or throws a message.
-      const read = (relPath, max, exts) => {
-        const abs = path.resolve(dir, String(relPath));
-        const lex = path.relative(dir, abs);
-        if (!lex || lex.startsWith('..') || path.isAbsolute(lex)) throw new Error('caminho fora da pasta do plugin');
-        const ext = path.extname(abs).toLowerCase();
-        if (ext === '.svg') throw new Error('SVG não é aceito');
-        if (!exts.includes(ext)) throw new Error(`extensão não aceita (${ext || 'sem extensão'})`);
-        track(abs);
-        let real;
-        try { real = fs.realpathSync(abs); } catch (e) { throw new Error(e.code === 'ENOENT' ? 'arquivo não encontrado' : e.message); }
-        const r = path.relative(realRoot, real);
-        if (!r || r.startsWith('..') || path.isAbsolute(r)) throw new Error('aponta para fora da pasta do plugin (link simbólico recusado)');
-        const st = fs.statSync(real);
-        if (!st.isFile()) throw new Error('não é um arquivo');
-        if (st.size > max) throw new Error(`arquivo maior que ${Math.round(max / 1024)} KB`);
-        return fs.readFileSync(real);
+    /* plugins: the folders of plugins.paths (and SQUAD_PLUGINS), then ~/.squad-code/plugins/<id>/ */
+    const list = [], seen = new Map(); // discovered plugins; plugin id → folder
+    const cands = code.pathInfo.map(c => ({ dir: c.path, local: c.local, source: 'config', file: c.file }));
+    const homeDir = path.join(home, '.squad-code', 'plugins');
+    track(homeDir);
+    try {
+      for (const e of fs.readdirSync(homeDir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+        const dir = path.join(homeDir, e.name);
+        let isDir = e.isDirectory();
+        if (!isDir && e.isSymbolicLink()) { try { isDir = fs.statSync(dir).isDirectory(); } catch {} }
+        if (isDir) cands.push({ dir, local: true, source: 'home', file: '', home: true });
+      }
+    } catch (e) { if (e.code !== 'ENOENT') warn(`${rel(homeDir)}: não foi possível listar (${e.code || e.message})`); }
+    // The same folder through two paths counts once. Local sources go first: with a repeated id the local one wins (the shared one is
+    // listed as refused, with a warning).
+    const real = new Set(), unique = [];
+    for (const c of cands) {
+      let r = c.dir; try { r = fs.realpathSync(c.dir); } catch {}
+      if (!real.has(r)) { real.add(r); unique.push(c); }
+    }
+    unique.sort((a, b) => Number(b.local) - Number(a.local));
+    let dirs = unique;
+    const pwarn = msg => { warn(msg); pluginWarnings.push(msg); };
+    if (dirs.length > LIMITS.plugins) { pwarn(`mais de ${LIMITS.plugins} plugins configurados: os excedentes foram ignorados`); dirs = dirs.slice(0, LIMITS.plugins); }
+    const enabled = new Set(code.enabled), keys = new Set();
+    for (const cand of dirs) {
+      const mine = [];
+      const w = msg => { pwarn(msg); mine.push(msg); };
+      let outcome = null; // set by the gate; none = buildPlugin stopped on a repeated id
+      const gate = (meta, { id, metaErrors, read, tag }) => {
+        const refuse = (status, error) => { outcome = { status, error }; w(`${tag} ${PLUGIN_FILE}: ${error}; plugin ignorado`); return false; };
+        const base = path.basename(cand.dir);
+        if (cand.home && base !== id) { outcome = { silent: true }; w(`${rel(cand.dir)}: a pasta "${base}" deve ter o nome do id "${id}"; plugin ignorado`); return false; }
+        if (WINDOWS_RESERVED_RE.test(id)) return refuse('invalid', `id "${id}" é nome reservado do Windows`);
+        const hard = metaErrors.find(e => !isUnknown(e) && MANIFEST_RE.test(e.path));
+        if (hard) return refuse('invalid', formatError(hard));
+        const api = meta.apiVersion ?? API_VERSION;
+        if (api > API_VERSION) return refuse('invalid', `exige apiVersion ${api}; este bridge oferece ${API_VERSION}. Atualize o SQUAD/CODE ou use outra versão do plugin`);
+        const hasCode = meta.server !== undefined;
+        if (hasCode && !cand.local) return refuse('blocked', 'código só vale por configuração local (squad.local.json, SQUAD_CONFIG ou ~/.squad-code/plugins); o arquivo compartilhado não pode carregar plugin com "server"');
+        // plugins.disabled: for a plugin with code only the local file's counts (a shared file must not switch off what the person runs).
+        if ((hasCode ? code.disabledLocal : code.disabled).includes(id)) { outcome = { status: 'disabled', error: 'desligado em plugins.disabled' }; return false; }
+        if (!hasCode) { outcome = {}; return true; }
+        let serverFile;
+        try { serverFile = read.locate(meta.server, SERVER_MAX, SERVER_EXTS); } catch (e) { return refuse('invalid', `server: ${e.message}`); }
+        outcome = { serverFile };
+        // The content of a plugin with code only counts once it is enabled (and, in the page, once its register() worked).
+        return enabled.has(id);
       };
-      // Before the id is known the warning names the folder; after, the plugin id and the file inside it.
-      let tag = label;
-      const at = (file, msg) => `${tag}${tag === label ? '/' : ' '}${file}: ${msg}`;
+      const built = buildPlugin(cand.dir, { warn: w, rel, track, seen, trusted: cand.local, gate });
+      if (!built.id || (outcome && outcome.silent)) continue;
+      const { meta, id, realRoot } = built;
+      const manifest = normalizeManifest(meta, id);
+      let key = id;
+      if (keys.has(key)) key = `${id}@${realRoot}`; // two folders with one id: both are listed, each under a key of its own
+      keys.add(key);
+      const entry = { key, id, name: manifest.name, version: manifest.version, description: manifest.description, source: cand.source, file: cand.file, local: cand.local, dir: realRoot, manifest, serverFile: '', hasCode: meta.server !== undefined, content: null, warnings: mine };
+      if (!outcome) { entry.status = 'invalid'; entry.error = `id repetido (já carregado de ${rel(seen.get(id))})`; }
+      else if (outcome.status) { entry.status = outcome.status; entry.error = outcome.error; }
+      else { entry.serverFile = outcome.serverFile || ''; entry.content = built.plugin; seen.set(id, realRoot); }
+      list.push(entry);
+    }
+    const counts = new Map();
+    for (const e of list) counts.set(e.id, (counts.get(e.id) || 0) + 1);
+    for (const [id, n] of counts) if (n > 1) pwarn(`id ${id} aparece em ${n} pastas (${list.filter(e => e.id === id).map(e => rel(e.dir)).join(', ')}); só a primeira (a local, se houver) vale`);
 
-      let meta;
-      try { meta = JSON.parse(read('squad-plugin.json', LIMITS.text, ['.json']).toString('utf8').replace(/^﻿/, '')); }
-      catch (e) { warn(at('squad-plugin.json', `${e instanceof SyntaxError ? 'JSON inválido' : e.message}; plugin ignorado`)); continue; }
-      if (!isObj(meta)) { warn(at('squad-plugin.json', 'deve ser um objeto JSON; plugin ignorado')); continue; }
-      const id = typeof meta.id === 'string' ? meta.id : '';
-      if (!PLUGIN_ID_RE.test(id)) { warn(at('squad-plugin.json', `id ausente ou inválido (${String(meta.id ?? '').slice(0, 40) || 'vazio'}); plugin ignorado`)); continue; }
-      if (config.disabled.includes(id)) continue;
-      const dup = plugins.find(p => p.id === id);
-      if (dup) { warn(`${label}: id ${id} repetido (já carregado de ${rel(dup.path)}); plugin ignorado`); continue; }
-      tag = `[${id}]`;
-      const metaErrors = schemaValidate(SCHEMAS.plugin, meta);
-      for (const e of metaErrors) if (isUnknown(e) && !/[.[]/.test(e.path)) warn(at('squad-plugin.json', `campo "${e.path}" desconhecido, ignorado`));
-      // An item that passed the checks below still goes through its schema: unknown field = warning, anything else refuses it.
-      const schemaItem = (list, i) => {
-        const p = `${list}[${i}]`, errs = errorsUnder(metaErrors, p);
-        for (const e of errs) if (isUnknown(e)) warn(at('squad-plugin.json', `${e.path}: campo desconhecido, ignorado`));
-        const hard = errs.find(e => !isUnknown(e));
-        if (hard) throw new Error(formatError(hard));
-      };
-      const plugin = { id, name: '', version: '', description: '', path: realRoot, categories: [], presets: [], avatars: [], themes: [], conventions: null, runtime: {} };
-      try { plugin.name = str(meta.name, 80) || id; plugin.version = str(meta.version, 40); plugin.description = str(meta.description, 1000); }
-      catch (e) { warn(at('squad-plugin.json', `name/version/description: ${e.message}`)); plugin.name = plugin.name || id; }
-
-      const listOf = (k, max) => {
-        if (meta[k] === undefined) return [];
-        if (!Array.isArray(meta[k])) { warn(at('squad-plugin.json', `"${k}" deve ser uma lista`)); return []; }
-        if (meta[k].length > max) warn(at('squad-plugin.json', `mais de ${max} itens em "${k}": os excedentes foram ignorados`));
-        return meta[k].slice(0, max);
-      };
-      for (const [i, c] of listOf('categories', LIMITS.categories).entries()) {
-        try { const cat = validateCategory(c); schemaItem('categories', i); if (plugin.categories.some(x => x.key === cat.key)) throw new Error(`categoria ${cat.key} repetida`); plugin.categories.push(cat); }
-        catch (e) { warn(at('squad-plugin.json', e.message)); }
-      }
-      let imageBytes = 0;
-      for (const [i, a] of listOf('avatars', LIMITS.avatars).entries()) {
-        try {
-          if (!isObj(a)) throw new Error('avatar deve ser um objeto');
-          const key = String(a.key || '');
-          if (!KEY_RE.test(key)) throw new Error(`key de avatar inválida: ${key.slice(0, 40)}`);
-          if (plugin.avatars.some(x => x.key === `plugin:${id}/${key}`)) throw new Error(`avatar ${key} repetido`);
-          if (typeof a.file !== 'string' || !a.file) throw new Error(`avatar ${key} sem "file"`);
-          schemaItem('avatars', i);
-          let buf;
-          try { buf = read(a.file, LIMITS.image, IMAGE_EXTS); } catch (e) { throw new Error(`${a.file}: ${e.message}`); }
-          const mime = imageMime(buf);
-          if (!mime) throw new Error(`${a.file}: não é uma imagem PNG, JPEG ou WebP`);
-          if (imageBytes + buf.length > LIMITS.images) throw new Error(`${a.file}: limite de 12 MB de imagens por plugin atingido`);
-          imageBytes += buf.length;
-          plugin.avatars.push({ key: `plugin:${id}/${key}`, label: str(a.label, 60) || key.toUpperCase(), src: `data:${mime};base64,${buf.toString('base64')}` });
-        } catch (e) { warn(at('squad-plugin.json', e.message)); }
-      }
-      for (const [i, t] of listOf('themes', LIMITS.themes).entries()) {
-        try {
-          const theme = validateTheme(t, `${tag} squad-plugin.json`, warn);
-          schemaItem('themes', i);
-          theme.key = `${id}/${theme.key}`;
-          if (plugin.themes.some(x => x.key === theme.key)) throw new Error(`tema ${t.key} repetido`);
-          plugin.themes.push(theme);
-        } catch (e) { warn(at('squad-plugin.json', e.message)); }
-      }
-      plugin.runtime = validateRuntime(meta.runtime, `${tag} squad-plugin.json`, warn);
-
-      const convFile = meta.conventions === undefined ? 'conventions.json' : meta.conventions;
-      if (typeof convFile !== 'string' || !convFile) warn(at('squad-plugin.json', '"conventions" deve ser o caminho de um arquivo .json'));
-      else if (meta.conventions !== undefined || fs.existsSync(path.join(dir, 'conventions.json'))) {
-        try { plugin.conventions = validateConventions(JSON.parse(read(convFile, LIMITS.text, ['.json']).toString('utf8').replace(/^﻿/, '')), `${tag} ${convFile}`, warn); }
-        catch (e) { warn(at(convFile, e instanceof SyntaxError ? `JSON inválido (${e.message})` : e.message)); }
-      }
-
-      const agentsDir = path.join(dir, 'agents');
-      track(agentsDir);
-      let files = [];
-      try {
-        const real = fs.realpathSync(agentsDir), r = path.relative(realRoot, real);
-        if (!r || r.startsWith('..') || path.isAbsolute(r)) warn(`${tag} agents: aponta para fora da pasta do plugin (link simbólico recusado)`);
-        else files = fs.readdirSync(agentsDir).filter(f => f.toLowerCase().endsWith('.md')).sort();
-      } catch (e) { if (e.code !== 'ENOENT') warn(`${tag} agents: ${e.message}`); }
-      if (files.length > LIMITS.agents) { warn(`${tag} agents: mais de ${LIMITS.agents} agentes, os excedentes foram ignorados`); files = files.slice(0, LIMITS.agents); }
-      for (const f of files) {
-        const file = `agents/${f}`;
-        try {
-          const { data, body } = parseFrontmatter(read(file, LIMITS.text, ['.md']).toString('utf8'));
-          // A repeated name is not decided here: only the page knows ROLES and the built-in names, so every valid candidate goes
-          // and the page keeps the first one it accepts (pluginPresets in src/app.js).
-          const preset = validatePreset(data, body);
-          const agentErrors = schemaValidate(SCHEMAS.agent, data);
-          for (const e of agentErrors) if (isUnknown(e)) warn(at(file, `campo "${e.path}" desconhecido, ignorado`));
-          const hard = agentErrors.find(e => !isUnknown(e));
-          if (hard) throw new Error(formatError(hard));
-          plugin.presets.push(preset);
-        } catch (e) { warn(at(file, /agente ignorado$/.test(e.message) ? e.message : `${e.message}; agente ignorado`)); }
-      }
-      plugins.push(plugin);
+    // A plugin whose requires is missing or off leaves the page too (the same rule the host applies to code).
+    const live = list.filter(e => !e.status), off = list.filter(e => e.status === 'disabled' && !live.some(o => o.id === e.id));
+    const plan = orderPlugins([...live.map(e => ({ id: e.id, requires: e.manifest.requires, enabled: !e.hasCode || enabled.has(e.id) })), ...off.map(e => ({ id: e.id, requires: [], enabled: false }))]);
+    for (const d of plan.disabled) {
+      const e = live.find(x => x.id === d.id);
+      if (!e || d.reason === 'off') continue;
+      e.content = null;
+      if (e.hasCode) continue; // the host says why (plugin-host.js)
+      seen.delete(e.id);
+      e.status = 'disabled'; e.error = d.message;
+      const m = `[${e.id}] plugin desligado: ${d.message}`; pwarn(m); e.warnings.push(m);
     }
 
+    // A plugin with code that brings no content stays out of the page (the host lists it in /api/plugins).
+    const hasContent = c => !!(c.categories.length || c.presets.length || c.avatars.length || c.themes.length || c.conventions || Object.keys(c.runtime).length);
+    const plugins = list.filter(e => e.content && !e.status && (!e.hasCode || hasContent(e.content))).map(e => e.content);
     const runtime = Object.assign({}, ...plugins.map(p => p.runtime), cfgRuntime);
     const page = { plugins, runtime, warnings };
     const api = { plugins: plugins.map(p => ({ ...p, avatars: p.avatars.map(({ src, ...a }) => a) })), runtime, warnings, config };
-    cache = { sigs, result: { page, api, count: plugins.length } };
+    const discovery = { plugins: list, config: { paths: code.pathInfo, enabled: code.enabled, entries: code.entries, hookTimeoutMs: code.hookTimeoutMs }, warnings: pluginWarnings };
+    cache = { sigs, result: { page, api, count: plugins.length, discovery, cfgRuntime } };
     return cache.result;
   }
   // invalidate(): the next load() rereads everything (the bridge calls it after writing a configuration file: the mtime may not move).
@@ -606,5 +837,5 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
 }
 
 // The constants the schemas repeat (tests/bridge.test.mjs checks that schemas/*.json match them).
-const CONSTANTS = { BUDGET_RE, PLUGIN_ID_RE, KEY_RE, CONV_ID_RE, NAME_RE, ROLE_RE, MODEL_RE, TOOLS, ICON_RE, AVATAR_REF_RE, PROFILE_KEY_RE, SLOTS, EFFORTS, CODEX_EFFORTS, ADAPTERS, PERMISSION_MODES, PROFILE_FIELDS, TELEMETRY_KEYS };
-module.exports = { createPluginLoader, parseFrontmatter, validateRuntime, LIMITS, CONSTANTS, SCHEMAS };
+const CONSTANTS = { BUDGET_RE, PLUGIN_ID_RE, KEY_RE, CONV_ID_RE, NAME_RE, ROLE_RE, MODEL_RE, TOOLS, ICON_RE, AVATAR_REF_RE, PROFILE_KEY_RE, SLOTS, EFFORTS, CODEX_EFFORTS, ADAPTERS, PERMISSION_MODES, PROFILE_FIELDS, TELEMETRY_KEYS, WINDOWS_RESERVED_RE, PLUGIN_CAPABILITIES, PLUGIN_EVENTS, PLUGIN_HOOK_TIMEOUT_MS };
+module.exports = { createPluginLoader, createInsideReader, buildPlugin, orderPlugins, selectContent, parseFrontmatter, validateRuntime, LIMITS, CONSTANTS, SCHEMAS, PLUGIN_FILE, API_VERSION };

@@ -1,0 +1,4 @@
+{
+  "id": "content-only", "name": "Só conteúdo", "version": "0.1.0", "description": "Plugin sem server: só conteúdo de catálogo.",
+  "categories": [{ "key": "po-cat", "label": "Categoria do plugin" }]
+}

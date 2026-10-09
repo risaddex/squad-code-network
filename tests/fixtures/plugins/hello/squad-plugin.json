@@ -1,0 +1,10 @@
+{
+  "id": "hello",
+  "name": "Hello",
+  "version": "1.0.0",
+  "description": "Plugin de teste: registra uma rota, usa settings, dataDir e onDispose.",
+  "apiVersion": 1,
+  "server": "server.mjs",
+  "env": ["HELLO_SECRET"],
+  "configSchema": { "type": "object", "additionalProperties": false, "properties": { "greeting": { "type": "string", "maxLength": 40 } } }
+}
