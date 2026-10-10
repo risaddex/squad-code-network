@@ -99,7 +99,11 @@ const MAX_BODY = 2 * 1024 * 1024;
 
 const runs = new Map();
 let maxConcurrent = 2;
-const versionCache = new Map();
+// Version probes (binVersion): `<bin> --version` once per resolved executable while it answers; a probe in flight is shared and a
+// failure is kept for PROBE_RETRY_MS, as is the PATH lookup per name, so the first GET of many Perfis on one executable is one probe.
+const versionCache = new Map(), probeNames = new Map();
+const PROBE_RETRY_MS = 30000;
+const probeFresh = hit => hit && (hit.pending || hit.ok || Date.now() - hit.at < PROBE_RETRY_MS);
 
 /* ---------- helpers ---------- */
 function json(res, status, body) {
@@ -199,11 +203,24 @@ function spawnBin(resolved, args, opts) {
   return spawn(resolved, args, opts);
 }
 
-async function binVersion(bin) {
-  const resolved = await resolveBin(bin);
-  if (!resolved) return { resolved: null, version: null, error: `Executável "${bin}" não encontrado no PATH.` };
-  if (versionCache.has(resolved)) return versionCache.get(resolved);
-  const info = await new Promise(resolve => {
+function binVersion(bin) {
+  const name = probeNames.get(bin);
+  const resolving = probeFresh(name) ? name.promise : remember(probeNames, bin, resolveBin(bin), () => false);
+  return resolving.then(resolved => {
+    if (!resolved) return { resolved: null, version: null, error: `Executável "${bin}" não encontrado no PATH.` };
+    const hit = versionCache.get(resolved);
+    return probeFresh(hit) ? hit.promise : remember(versionCache, resolved, probeVersion(resolved), info => !!info.version);
+  });
+}
+/** Keeps `promise` under `key` while pending; once settled, `ok(value)` decides whether it stays for good or for PROBE_RETRY_MS. */
+function remember(map, key, promise, ok) {
+  const hit = { pending: true, ok: false, at: 0, promise };
+  map.set(key, hit);
+  promise.then(v => { hit.pending = false; hit.ok = ok(v); hit.at = Date.now(); });
+  return promise;
+}
+function probeVersion(resolved) {
+  return new Promise(resolve => {
     const child = spawnBin(resolved, ['--version'], { windowsHide: true });
     let out = ''; let err = '';
     const timer = setTimeout(() => child.kill(), 15000);
@@ -216,8 +233,6 @@ async function binVersion(bin) {
       else resolve({ resolved, version: null, error: (err || out).trim().slice(0, 500) || `exit ${code}` });
     });
   });
-  if (info.version) versionCache.set(resolved, info);
-  return info;
 }
 
 function killTree(child) {
@@ -318,6 +333,8 @@ async function validateProfile(body, current = null) {
   p.name = typeof src.name === 'string' ? src.name.trim() : '';
   if (!p.name || p.name.length > 40) throw new Error('Nome do Perfil: de 1 a 40 caracteres.');
   if (!dbModule.ADAPTERS.includes(src.adapter)) throw new Error('Adapter inválido. Use claude ou codex.');
+  // Same rule as a Perfil of the configuration (editConfigProfile): the reserves pointing at it are checked against its Adapter.
+  if (current && src.adapter !== current.adapter) throw new Error('O Adapter de um Perfil não muda depois de criado.');
   p.adapter = src.adapter;
   p.configDir = typeof src.configDir === 'string' ? src.configDir.trim() : '';
   if (p.configDir) {
@@ -646,12 +663,14 @@ function telemetryHeaders(cfg) {
   return out;
 }
 function validateTelemetry(body) {
-  const endpoint = typeof body?.endpoint === 'string' ? body.endpoint.trim() : '';
+  let endpoint = typeof body?.endpoint === 'string' ? body.endpoint.trim() : '';
   if (endpoint) {
     let u; try { u = new URL(endpoint); } catch { throw new Error('Endpoint OTLP inválido.'); }
     if (!/^https?:$/.test(u.protocol) || /["\\\s]/.test(endpoint) || endpoint.length > 500) throw new Error('Endpoint OTLP inválido: use uma URL http(s).');
     if (u.username || u.password) throw new Error('O endpoint OTLP não pode ter usuário ou senha na URL: use um header com o nome da variável de ambiente.');
   }
+  // The value of OTEL_EXPORTER_OTLP_ENDPOINT stays inherited: saving it here would pin it after the environment changes.
+  if (endpoint && endpoint === (process.env.OTEL_EXPORTER_OTLP_ENDPOINT || '').trim()) endpoint = '';
   const serviceName = typeof body?.serviceName === 'string' ? body.serviceName.trim().slice(0, 80) : '';
   const headersEnv = {};
   const h = body?.headersEnv && typeof body.headersEnv === 'object' && !Array.isArray(body.headersEnv) ? body.headersEnv : {};

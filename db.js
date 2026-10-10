@@ -528,13 +528,17 @@ function openStore(dataDir) {
     return getProfile(p.id);
   }
   const setProfileFallback = (id, fallbackId) => q.profSetFallback.run(fallbackId || null, id);
-  /** Removes a configured Perfil; when it was the default, "Claude (padrão)" (or the first one left) becomes the default. */
+  /** Removes a configured Perfil; when it was the default, "Claude (padrão)" (or the first one left) becomes the default, and when no
+   *  Perfil is left (the built-in one may have been deleted before) "Claude (padrão)" is created again, so a default always exists. */
   function removeConfigProfile(id) {
     const p = getProfile(id);
     if (!p || p.source !== 'config') return false;
     db.transaction(() => {
       q.profUnfallback.run(id); q.profDelete.run(id);
-      if (p.isDefault) { const next = getProfile(DEFAULT_PROFILE_IDS.claude) || listProfiles()[0]; if (next) q.profSetDefault.run(next.id); }
+      if (q.profDefault.get()) return;
+      let next = getProfile(DEFAULT_PROFILE_IDS.claude) || listProfiles()[0];
+      if (!next) { q.profInsert.run(profileRow({ id: DEFAULT_PROFILE_IDS.claude, name: 'Claude (padrão)', adapter: 'claude', concurrency: 2, threshold: 90, ignoreUserConfig: true, telemetry: TELEMETRY_OFF })); next = getProfile(DEFAULT_PROFILE_IDS.claude); }
+      q.profSetDefault.run(next.id);
     })();
     return true;
   }

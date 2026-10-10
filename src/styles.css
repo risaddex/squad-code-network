@@ -1330,6 +1330,7 @@ select option,select optgroup{background-color:#0b1215;color:#e3eaed}
 .room-call-line i{position:absolute;inset:0;width:40%;background:var(--purple);animation:room-flow 1.2s linear infinite}
 .room-row.call.answered .room-call-line i,.room-row.call.error .room-call-line i{animation:none;width:100%}.room-row.call.error .room-call-line i{background:#d8a86f}
 .room-call-ask{font-size:12px;line-height:1.7;color:#d3c6e6;margin:0;white-space:pre-wrap}
+.room-call-via{display:flex;align-items:center;gap:5px;margin-top:6px;font:9px var(--mono);color:#a896c8;letter-spacing:.3px}.room-call-via svg{width:11px;height:11px;flex:none}
 .room-call-answer{margin-top:8px;padding-top:8px;border-top:1px dashed #9b7fd433;font-size:12px;line-height:1.7;color:#c3cfd5}
 .room-call-answer b{display:block;font:9px var(--mono);color:var(--purple);letter-spacing:.5px;margin-bottom:4px}.room-call-answer p{margin:0 0 5px}
 .room-call-state{display:inline-block;margin-top:6px;font:9px var(--mono);color:#a896c8;letter-spacing:.4px}.room-call-state.error{color:#d8a86f}

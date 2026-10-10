@@ -734,6 +734,12 @@ test('Perfis: CRUD, validation, default and reserve', async () => {
   assert.equal((await b.api(`/api/profiles/${a.id}`, { method: 'PUT', body: JSON.stringify({ fallbackId: a.id }) })).status, 400);
   const reserve = await newProfile(b, { name: 'Claude C', adapter: 'claude' });
   assert.equal((await b.api(`/api/profiles/${a.id}`, { method: 'PUT', body: JSON.stringify({ fallbackId: reserve.id }) })).status, 200);
+  // The Adapter does not change after creation (a reserve of the same Adapter would stop matching); the same value is accepted.
+  res = await b.api(`/api/profiles/${reserve.id}`, { method: 'PUT', body: JSON.stringify({ adapter: 'codex', effort: '' }) });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /Adapter de um Perfil não muda/);
+  assert.equal((await profilesOf(b)).find(p => p.id === reserve.id).adapter, 'claude');
+  assert.equal((await b.api(`/api/profiles/${reserve.id}`, { method: 'PUT', body: JSON.stringify({ adapter: 'claude', concurrency: 2 }) })).status, 200);
   // Exactly one default; the default cannot be deleted; deleting a reserve clears who pointed at it.
   res = await b.api(`/api/profiles/${a.id}/default`, { method: 'POST' });
   assert.equal(res.status, 200);
@@ -1077,6 +1083,19 @@ test('telemetry: an endpoint with credentials in the URL is ignored, also from O
   await b.stop();
 });
 
+test('telemetry: an endpoint inherited from OTEL_EXPORTER_OTLP_ENDPOINT is never saved as the settings endpoint', async () => {
+  const env = 'http://127.0.0.1:9/herdado';
+  const b = await setupBridge({ OTEL_EXPORTER_OTLP_ENDPOINT: env });
+  let view = await (await b.api('/api/telemetry')).json();
+  assert.deepEqual([view.endpoint, view.source], [env, 'env']);
+  // A page that sends the inherited value back (older page, or typed by hand) keeps following the environment.
+  view = await (await b.api('/api/telemetry', { method: 'PUT', body: JSON.stringify({ endpoint: env, serviceName: 'outro' }) })).json();
+  assert.deepEqual([view.endpoint, view.source, view.serviceName], [env, 'env', 'outro']);
+  view = await (await b.api('/api/telemetry', { method: 'PUT', body: JSON.stringify({ endpoint: 'http://127.0.0.1:9/proprio' }) })).json();
+  assert.deepEqual([view.endpoint, view.source], ['http://127.0.0.1:9/proprio', 'settings']);
+  await b.stop();
+});
+
 test('caps hold under parallel requests (global and per Perfil)', async () => {
   const b = await setupBridge();
   await b.api('/api/config', { method: 'POST', body: JSON.stringify({ concurrency: 8 }) });
@@ -1108,6 +1127,54 @@ test('codex session files: a symlink anywhere under CODEX_HOME/sessions is not f
   assert.equal(exitOf(r.events).model, null);
   const ref = await (await b.api(`/api/profiles/${p.id}/refresh`, { method: 'POST' })).json();
   assert.equal(ref.observed, false);
+  await b.stop();
+});
+
+test('Perfis: remover o último Perfil da configuração nunca deixa o banco sem Perfil padrão', () => {
+  const req = createRequire(import.meta.url);
+  const dir = tmp('squad-dbpf-'); extraDirs.push(dir);
+  const store = req('../db.js').openStore(dir);
+  try {
+    const cfgP = key => ({ id: `cfg-${key}`, name: `Cfg ${key}`, adapter: 'claude', concurrency: 2, threshold: 90, ignoreUserConfig: true, telemetry: {} });
+    const defaults = () => store.listProfiles().filter(p => p.isDefault).map(p => p.id);
+    // The built-in Claude was deleted while a configured Perfil was the default; that Perfil then leaves the file.
+    store.upsertConfigProfile(cfgP('solo'), '/x/squad.local.json');
+    store.setDefaultProfile('cfg-solo');
+    store.deleteProfile('claude-default');
+    assert.deepEqual(store.listProfiles().map(p => p.id), ['cfg-solo']);
+    store.removeConfigProfile('cfg-solo');
+    assert.deepEqual(store.listProfiles().map(p => [p.id, p.name, p.adapter, p.isDefault]), [['claude-default', 'Claude (padrão)', 'claude', true]]);
+    // With another Perfil left, that one becomes the default (nothing is created).
+    store.upsertConfigProfile(cfgP('a'), '/x/squad.local.json'); store.setDefaultProfile('cfg-a'); store.deleteProfile('claude-default');
+    const other = store.createProfile({ name: 'Outro', adapter: 'claude', concurrency: 2, threshold: 90, ignoreUserConfig: true, telemetry: {} });
+    store.removeConfigProfile('cfg-a');
+    assert.deepEqual([store.listProfiles().map(p => p.id), defaults()], [[other.id], [other.id]]);
+  } finally { store.close(); }
+});
+
+test('Perfis: uma sonda de versão por executável (em voo e falha também ficam em cache)', async () => {
+  const root = tmp('squad-probe-'); extraDirs.push(root);
+  // Two fake executables that log every --version and take a moment, so the first GET probes them all at the same time.
+  const fake = (name, code) => {
+    const file = path.join(root, `${name}.mjs`), log = path.join(root, `${name}.log`);
+    writeFileSync(file, `import { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(log)}, 'x\\n');\nsetTimeout(() => { console.log('9.9.9'); process.exit(${code}); }, 300);\n`);
+    return { file, count: () => { try { return readFileSync(log, 'utf8').split('\n').filter(Boolean).length; } catch { return 0; } } };
+  };
+  const ok = fake('ok', 0), bad = fake('bad', 1);
+  const cfg = path.join(root, 'squad.local.json');
+  writeFileSync(cfg, JSON.stringify({ profiles: [
+    ...[1, 2, 3, 4].map(i => ({ key: `ok${i}`, name: `OK ${i}`, adapter: 'claude', bin: ok.file })),
+    ...[1, 2, 3].map(i => ({ key: `bad${i}`, name: `Ruim ${i}`, adapter: 'claude', bin: bad.file })),
+  ] }));
+  const b = await setupBridge({ SQUAD_CONFIG: cfg });
+  const lists = await Promise.all([1, 2].map(async () => (await (await b.api('/api/profiles')).json()).profiles));
+  const again = (await (await b.api('/api/profiles')).json()).profiles;
+  for (const list of [...lists, again]) {
+    assert.equal(list.find(p => p.id === 'cfg-ok1').status.version, '9.9.9');
+    assert.equal(list.find(p => p.id === 'cfg-bad2').status.version, null);
+    assert.ok(list.find(p => p.id === 'cfg-bad2').status.error);
+  }
+  assert.deepEqual([ok.count(), bad.count()], [1, 1]);
   await b.stop();
 });
 
