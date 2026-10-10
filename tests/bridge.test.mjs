@@ -925,6 +925,39 @@ test('usage windows: Claude rate_limit_event and codex session file; the reserve
   await b.stop();
 });
 
+test('session limit mid-run: the exit says rateLimited and which reserve the next try gets', async () => {
+  const b = await setupBridge();
+  const cfgA = tmp('squad-la-'), cfgB = tmp('squad-lb-'), cfgC = tmp('squad-lc-'); extraDirs.push(cfgA, cfgB, cfgC);
+  const reserve = await newProfile(b, { name: 'Reserva L', adapter: 'claude', configDir: cfgB });
+  const main = await newProfile(b, { name: 'Principal L', adapter: 'claude', configDir: cfgA, threshold: 90, fallbackId: reserve.id });
+  assert.equal((await b.api(`/api/profiles/${main.id}/default`, { method: 'POST' })).status, 200);
+  // Below the threshold at the start: the run goes to the main Perfil and hits the limit in the middle.
+  let r = await runOn(b, { prompt: 'LIMITE', options: { cwd: workdir } });
+  assert.equal(profileEvt(r.events).profileId, main.id);
+  let exit = exitOf(r.events);
+  assert.deepEqual([exit.status, exit.isError, exit.rateLimited], ['error', true, true]);
+  assert.deepEqual(exit.retryProfile, { id: reserve.id, name: 'Reserva L' });
+  assert.match(exit.error, /session limit/);
+  // The history keeps it too (the exit is the run's stored result).
+  const db = new Database(path.join(b.dir, 'squad.db'), { readonly: true });
+  try { assert.equal(JSON.parse(db.prepare('SELECT result FROM runs WHERE id = ?').get(r.runId).result).rateLimited, true); } finally { db.close(); }
+  // The next run without a Perfil goes to the reserve.
+  r = await runOn(b, { prompt: 'depois', options: { cwd: workdir } });
+  assert.deepEqual(profileEvt(r.events), { type: 'bridge', subtype: 'profile', profileId: reserve.id, name: 'Reserva L', adapter: 'claude', fallbackFrom: main.id });
+  assert.equal(exitOf(r.events).status, 'done');
+  assert.equal(exitOf(r.events).rateLimited, undefined);
+  // No reserve: rateLimited without retryProfile.
+  const solo = await newProfile(b, { name: 'Sozinho', adapter: 'claude', configDir: cfgC });
+  r = await runOn(b, { prompt: 'LIMITE', options: { cwd: workdir, profile: solo.id } });
+  exit = exitOf(r.events);
+  assert.equal(exit.rateLimited, true);
+  assert.equal('retryProfile' in exit, false);
+  // A plain failure is not a limit.
+  r = await runOn(b, { prompt: 'FAIL', options: { cwd: workdir, profile: solo.id } });
+  assert.equal(exitOf(r.events).rateLimited, undefined);
+  await b.stop();
+});
+
 test('a Perfil cap answers 429 with the Perfil name', async () => {
   const b = await setupBridge();
   await b.api('/api/config', { method: 'POST', body: JSON.stringify({ concurrency: 4 }) });

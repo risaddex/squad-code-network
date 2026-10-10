@@ -790,7 +790,7 @@ function observe(run, event) {
   if (event.type === 'system' && event.subtype === 'init' && typeof event.model === 'string' && event.model) run.seenModel = event.model;
   if (run.impl?.onEvent) {
     // Hot path of every event: an Adapter that throws never breaks the stream (warned once per run).
-    try { const seen = run.impl.onEvent(run.adapterRun || run, event); if (seen?.windows) recordWindows(run.profileId, seen.windows, 'event'); }
+    try { const seen = run.impl.onEvent(run.adapterRun || run, event); if (seen?.windows) recordWindows(run.profileId, seen.windows, 'event'); if (seen?.rateLimited === true) run.rateLimited = true; }
     catch (e) { if (!run.onEventWarned) { run.onEventWarned = true; console.warn(`Adapter ${run.adapter}: onEvent falhou (execução ${run.id}): ${e.message}`); } }
   }
   if (run.parent && event.type === 'assistant' && !event.parent_tool_use_id && run.parent.status === 'running') {
@@ -1071,6 +1071,15 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
       error: isError ? (run.cancelled ? 'Execução cancelada pelo operador.' : run.timedOut ? 'Tempo limite excedido.' : (r.is_error && r.result) || stderrTail.trim().slice(-1500) || `${adapter} saiu com código ${code}`) : null,
       usage, profileId: profile.id, adapter, model,
     };
+    // The account's limit arrived mid-run: the bridge does not retry (1 run = 1 process); it says which Perfil the same request would
+    // get now (the reserve, by pickProfile on the Perfil first asked), so the app can launch the step again once.
+    if (run.status === 'error' && run.rateLimited) {
+      exit.rateLimited = true; exit.profileName = profile.name;
+      if (!internal.exact) {
+        const next = pickProfile(fallbackFrom || opts.profile).profile;
+        if (next && next.id !== profile.id && !overLimit(next)) exit.retryProfile = { id: next.id, name: next.name };
+      }
+    }
     pushEvent(run, exit);
     if (run.persist) try { store.finishRun(run, exit); } catch (e) { console.warn(`Histórico da execução ${id} não finalizado: ${e.message}`); }
     try { sendTrace(run, exit); } catch {}

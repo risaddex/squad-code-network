@@ -13271,10 +13271,16 @@ function advanceRoute(f,a,text,real){
 }
 async function liveStep(f,a){
  const owner=runner,p=project();if(owner.inFlight)return;owner.inFlight=true;render();
- let exit;try{exit=await executeLiveStep(f,a,p,owner);}finally{owner.inFlight=false;}
+ let exit;try{exit=await executeLiveStep(f,a,p,owner);
+  // The Perfil's limit arrived mid-step and the bridge says a reserve would take it now: the same step once more (it picks the reserve).
+  if(runner===owner&&!exit.cancelled&&exit.rateLimited&&exit.retryProfile){const lim=exit.profileName||exit.profileId||'atual';
+   roomTyping(null);roomPush({kind:'system',text:`${a.name} bateu o limite do Perfil ${lim}. Tentando de novo no Perfil reserva ${exit.retryProfile.name}.`,tone:'warn'});
+   log(`${a.name} bateu o limite do Perfil ${lim} em ${f.key}. Nova tentativa no Perfil reserva ${exit.retryProfile.name}.`,'agent',a.id,p);p.logs.at(-1).simulated=false;save();
+   exit=await executeLiveStep(f,a,p,owner);}
+ }finally{owner.inFlight=false;}
  if(runner!==owner||exit.cancelled)return;
  if(exit.error||exit.isError){
-  const message=exit.error||'Falha na execução do Claude Code.';
+  const raw=exit.error||'Falha na execução do Claude Code.',message=exit.rateLimited&&!exit.retryProfile?`o Perfil ${exit.profileName||exit.profileId||'atual'} atingiu o limite de uso e não há Perfil reserva disponível (${raw})`:raw;
   f.outputs.push({agentId:a.id,at:nowISO(),text:`[FALHA] ${message}`,simulated:false,error:true,costUsd:exit.costUsd??null,durationMs:null,sessionId:exit.sessionId??null});
   f.status='ready';f.currentAgentId=null;f.step=0;runner=null;clearTimeout(timer);
   log(`${a.name} falhou em ${f.key}: ${message.slice(0,400)}. A feature voltou para Prontas.`,'agent',a.id,p);p.logs.at(-1).simulated=false;
