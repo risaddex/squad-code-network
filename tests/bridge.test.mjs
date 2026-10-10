@@ -998,6 +998,23 @@ test('MCP of the bridge: a codex agent calls a colleague, who runs on his own Pe
   await b.stop();
 });
 
+test('MCP of the bridge: two calls open at once each get their own tool_use id, matched by arguments, not the latest one', async () => {
+  const b = await setupBridge();
+  const agents = { argus: { description: 'ARGUS, arquiteto.', prompt: 'Você é o ARGUS.' }, echo: { description: 'ECHO, QA.', prompt: 'Você é o ECHO.' } };
+  const r = await runOn(b, { prompt: 'CALL DUO', options: { cwd: workdir, profile: 'codex-default', agents } });
+  const duo = codexRun('CALL DUO').mcp.duo;
+  assert.match(duo[0].result.content[0].text, /^ECHO:Pedido A ECOAR\|SYS:Você é o ARGUS\.$/);
+  assert.match(duo[1].result.content[0].text, /^ECHO:Pedido B ECOAR\|SYS:Você é o ECHO\.$/);
+  // Each colleague's text hangs under its own call card.
+  const under = id => r.events.filter(e => e.type === 'assistant' && e.parent_tool_use_id === id).map(e => JSON.stringify(e.message.content)).join(' ');
+  assert.match(under('item_5a'), /Pedido A/);
+  assert.doesNotMatch(under('item_5a'), /Pedido B/);
+  assert.match(under('item_5b'), /Pedido B/);
+  assert.doesNotMatch(under('item_5b'), /Pedido A/);
+  assert.equal(exitOf(r.events).status, 'done');
+  await b.stop();
+});
+
 test('telemetry: OTLP trace per run with squad.* attributes, no content by default, header values never exposed', async () => {
   const got = [];
   const collector = (await import('node:http')).createServer((req, res) => { let t = ''; req.on('data', d => { t += d; }); req.on('end', () => { got.push({ url: req.url, headers: req.headers, body: JSON.parse(t) }); res.end('{}'); }); });
@@ -1067,7 +1084,15 @@ test('health: a machine with only Codex still reports a usable engine (claudeVer
   assert.equal(h.engineAdapter, 'codex');
   assert.match(h.claudeVersion, /codex-cli 9\.9\.9/);
   assert.match(h.claudeError, /não encontrado/);
+  // A new database: "Codex (padrão)" becomes the default (Claude (padrão) is untouched and its claude is missing), so an agent
+  // without a Perfil runs on the engine that exists.
+  await new Promise(r => setTimeout(r, 200));
+  assert.deepEqual((await profilesOf(b)).map(p => [p.id, p.isDefault]), [['codex-default', true], ['claude-default', false]]);
+  const r = await runOn(b, { prompt: 'SO-CODEX', options: { cwd: workdir } });
+  assert.equal(profileEvt(r.events).profileId, 'codex-default');
+  assert.equal(exitOf(r.events).status, 'done');
   await b.stop();
+  // With claude on the PATH nothing changes: Claude (padrão) stays the default (the first test of Perfis checks it too).
 });
 
 test('telemetry: an endpoint with credentials in the URL is ignored, also from OTEL_EXPORTER_OTLP_ENDPOINT', async () => {

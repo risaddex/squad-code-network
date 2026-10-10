@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Stand-in for `codex exec --json` used by bridge tests. The prompt (stdin) picks the script: SLEEP, FAIL, CALL (calls the bridge's
-// MCP; CALLAS:<name> asks for that colleague), TARDIO (a detached helper sends the call's body after this run ended), STREAMERR
+// MCP; CALLAS:<name> asks for that colleague; CALL DUO opens two calls at once), TARDIO (a detached helper sends the call's body after this run ended), STREAMERR
 // (a stream-level error after the turn), HOT (usage window at 95%). Each run appends {argv, cwd, stdin, env, thread, mcp} to FAKE_CODEX_LOG for the assertions, and
 // with CODEX_HOME set writes a session file with rate limits, as codex does.
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -48,11 +48,26 @@ process.stdin.on('end', async () => {
     entry.mcp.list = (await rpc('tools/list', {}, 2)).body;
     const asked = input.match(/CALLAS:(\S+)/);
     const agente = asked ? asked[1] : entry.mcp.list?.result?.tools?.[0]?.inputSchema?.properties?.agente?.enum?.[0];
+    if (input.includes('DUO')) {
+      // Two calls open at once (both item.started first), answered out of order: the second one's request reaches the bridge first.
+      const enumd = entry.mcp.list?.result?.tools?.[0]?.inputSchema?.properties?.agente?.enum || [];
+      const calls = ['A', 'B'].map((k, i) => ({ id: `item_5${k.toLowerCase()}`, type: 'mcp_tool_call', server: 'squad', tool: 'chamar_colega', arguments: { agente: enumd[i] || agente, pedido: `Pedido ${k} ECOAR` } }));
+      for (const c of calls) emit({ type: 'item.started', item: { ...c, status: 'in_progress' } });
+      await new Promise(r => setTimeout(r, 150));
+      const second = rpc('tools/call', { name: 'chamar_colega', arguments: calls[1].arguments }, 4);
+      await new Promise(r => setTimeout(r, 50));
+      const first = rpc('tools/call', { name: 'chamar_colega', arguments: calls[0].arguments }, 3);
+      const answers = [(await first).body, (await second).body];
+      entry.mcp.duo = answers;
+      calls.forEach((c, i) => emit({ type: 'item.completed', item: { ...c, status: 'completed', result: { content: answers[i]?.result?.content || [] } } }));
+    } else {
     const call = { id: 'item_5', type: 'mcp_tool_call', server: 'squad', tool: 'chamar_colega', arguments: { agente, pedido: 'Pode confirmar o contrato?' } };
     emit({ type: 'item.started', item: { ...call, status: 'in_progress' } });
     const answer = (await rpc('tools/call', { name: 'chamar_colega', arguments: call.arguments }, 3)).body;
     entry.mcp.call = answer;
     emit({ type: 'item.completed', item: { ...call, status: answer?.result ? 'completed' : 'failed', result: answer?.result ? { content: answer.result.content } : null, error: answer?.error ? { message: answer.error.message } : null } });
+
+    }
   }
 
   if (input.includes('TARDIO')) {

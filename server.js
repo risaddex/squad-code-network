@@ -60,13 +60,20 @@ function loadPlugins() {
   catch (e) { const warnings = [`Plugins não carregados: ${e.message}`]; return { page: { plugins: [], runtime: {}, warnings }, api: { plugins: [], runtime: {}, warnings, config: { files: [], paths: [], disabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: true } }, count: 0 }; }
 }
 let store = null;
-/* After the database opens: "Codex (padrão)" when codex is on the PATH (once per database). */
+/* After the database opens: "Codex (padrão)" when codex is on the PATH (once per database). When it is created on a machine without
+   claude and the default is still the untouched "Claude (padrão)", it becomes the default, so agents without a Perfil do not all
+   fall on an engine that does not exist (a defaultProfile of the configuration, applied right after, still wins). */
+const untouchedClaudeDefault = p => !!p && p.id === dbModule.DEFAULT_PROFILE_IDS.claude && p.isDefault && !p.source && !p.bin && !p.configDir && !p.model && !p.effort;
 async function afterOpen() {
   // Runs wait on cfgProfiles.run (configProfilesReady): first "Codex (padrão)", then the configured Perfis, so a defaultProfile
   // "codex-default" already exists when the configuration is applied.
   const codex = (async () => {
-    try { if (store && await resolveBin(DEFAULT_CODEX_BIN)) { const made = store.ensureCodexDefault(); if (made) console.log(`Perfil criado: ${made.name}`); } }
-    catch (e) { console.warn(`Perfil do Codex não criado: ${e.message}`); }
+    try {
+      if (!store || !await resolveBin(DEFAULT_CODEX_BIN)) return;
+      const made = store.ensureCodexDefault(); if (!made) return;
+      console.log(`Perfil criado: ${made.name}`);
+      if (untouchedClaudeDefault(store.defaultProfile()) && !await resolveBin(DEFAULT_BIN)) { store.setDefaultProfile(made.id); console.log(`Claude não encontrado: ${made.name} é o Perfil padrão.`); }
+    } catch (e) { console.warn(`Perfil do Codex não criado: ${e.message}`); }
   })();
   await syncConfigProfiles(codex);
 }
@@ -948,7 +955,7 @@ function codexTranslator(run) {
         if (!it) return [];
         const use = toolUse(it);
         if (!use) return [];
-        st.started.add(use.id); if (isCall(it)) st.calls.push(use.id);
+        st.started.add(use.id); if (isCall(it)) st.calls.push({ id: use.id, agente: String(it.arguments?.agente ?? ''), pedido: String(it.arguments?.pedido ?? ''), claimed: false });
         return [assistant([use])];
       }
       case 'item.completed': {
@@ -958,7 +965,7 @@ function codexTranslator(run) {
         const use = toolUse(it);
         if (!use) return []; // reasoning, todo_list
         const out = st.started.has(use.id) ? [] : [assistant([use])];
-        st.started.delete(use.id); st.calls = st.calls.filter(id => id !== use.id);
+        st.started.delete(use.id); st.calls = st.calls.filter(c => c.id !== use.id);
         out.push(toolResult(it));
         return out;
       }
@@ -970,7 +977,15 @@ function codexTranslator(run) {
     return { type: 'result', subtype: isError ? 'error_during_execution' : 'success', is_error: isError, result: isError && !st.last ? (st.failed || st.lastError || '') : st.last, session_id: st.threadId, num_turns: st.turns, duration_ms: durationMs, total_cost_usd: null,
       usage: { input_tokens: st.usage.input, cache_read_input_tokens: st.usage.cacheRead, cache_creation_input_tokens: st.usage.cacheWrite, output_tokens: st.usage.output, reasoning_output_tokens: st.usage.reasoning } };
   }
-  return { feed, finish, openCall: () => st.calls.at(-1) || null, state: st };
+  /* The open call an MCP request answers: the unclaimed one with the same arguments, else the oldest unclaimed one; each id is used
+     once, so concurrent calls never share a card (or a parent span). openCall: the latest one, for text that arrives without one. */
+  function claimCall(a) {
+    const open = st.calls.filter(c => !c.claimed), agente = String(a?.agente ?? ''), pedido = String(a?.pedido ?? '');
+    const c = open.find(x => x.agente === agente && x.pedido === pedido) || open[0];
+    if (!c) return null;
+    c.claimed = true; return c.id;
+  }
+  return { feed, finish, openCall: () => st.calls.at(-1)?.id || null, claimCall, state: st };
 }
 
 /* Codex keeps each session in <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl, with the account's rate limits in its
@@ -1293,7 +1308,7 @@ async function callColleague(run, a) {
   const options = { profile: meta.profile || '', model: def.model, effort: def.effort, permissionMode: o.permissionMode, timeoutSec: o.timeoutSec, addDirs: o.addDirs, ...(def.tools ? { tools: def.tools } : {}), ...(o.claudePathSet ? { claudePath: o.claudePath } : {}), ...(o.projectRun ? { project: o.project } : { cwd: o.cwd }) };
   let child;
   try {
-    child = await startRun({ prompt: pedido.slice(0, 400000), systemPrompt: def.prompt, label: `Chamado: ${slug}`, options, meta: { ...run.meta, agentId: meta.agentId || null, kind: 'call' } }, { parent: run, toolUseId: run.translator?.openCall() || null });
+    child = await startRun({ prompt: pedido.slice(0, 400000), systemPrompt: def.prompt, label: `Chamado: ${slug}`, options, meta: { ...run.meta, agentId: meta.agentId || null, kind: 'call' } }, { parent: run, toolUseId: run.translator?.claimCall(a) || null });
   } catch (e) { return text(`Não foi possível chamar ${slug}: ${e.message}`, true); }
   const exit = await child.done;
   return exit.isError ? text(`${slug} não concluiu: ${exit.error || 'erro'}${exit.result ? `\n${exit.result}` : ''}`, true) : text(exit.result || '(sem resposta)');

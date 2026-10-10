@@ -39,6 +39,7 @@ process.stdin.on('end', () => {
   if (input.includes('FAIL')) { process.stderr.write('fake failure\n'); emit({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'fake failure', session_id: 'fake-session' }); process.exit(1); }
   emit({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'README.md' } }] } });
   if (args.includes('--include-partial-messages')) for (const text of ['wor', 'king']) emit({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } });
-  emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } });
+  // ECOAR: the text repeats the prompt (a Chamado's text can then be told apart from another's).
+  emit({ type: 'assistant', message: { content: [{ type: 'text', text: input.includes('ECOAR') ? `working: ${input.trim().slice(0, 80)}` : 'working' }] } });
   emit({ type: 'result', subtype: 'success', is_error: false, result: `ECHO:${input.trim()}|SYS:${system.trim()}`, total_cost_usd: 0.001, duration_ms: 12, num_turns: 1, session_id: 'fake-session', usage: { input_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 30, output_tokens: 4, output_tokens_details: { thinking_tokens: 2 } }, modelUsage: { [opt('--model') || 'claude-fake']: {} } });
 });
