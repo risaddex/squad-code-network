@@ -1636,6 +1636,37 @@ test('P2-2: plugin só de conteúdo que requer um plugin com código cujo regist
   }
 });
 
+test('P2-2b: cadeia código (falha) ← conteúdo ← código: o de conteúdo cai antes de o segundo com código carregar, e ele fica disabled', async () => {
+  const mid = cloneFixture('content-only', 'needs-throws', { requires: ['throws-on-register'] });
+  const tail = cloneFixture('hello', 'tail-code', { requires: ['needs-throws'] });
+  const b = await startBridge({ local: pcfg([fx('throws-on-register'), mid, tail], ['throws-on-register', 'tail-code']) });
+  const listed = byId(await b.json('/api/plugins'));
+  assert.equal(listed['throws-on-register'].status, 'error');
+  assert.equal(listed['needs-throws'].status, 'disabled');
+  assert.equal(listed['tail-code'].status, 'disabled');
+  assert.match(listed['tail-code'].error, /depende de "needs-throws", que não carregou \(disabled\)/);
+  assert.equal((await b.api('/api/plugins/tail-code/hello')).status, 404, 'sem rotas do dependente');
+  assert.equal((await b.json('/api/health')).plugins, 0);
+  await b.stop();
+});
+
+test('P2-3b: o esforço salvo no Perfil (efetivo, sem override na execução) também é conferido contra o adapter que o substituiu', async () => {
+  const data = scratch('squad-pl-effort-');
+  const b1 = await startBridge({ data });
+  await setupDb(b1);
+  const forte = await newProfile(b1, { name: 'Forte', adapter: 'claude', effort: 'high' });
+  await b1.stop();
+  const b = await startBridge({ data, local: adapterCfg(['adapter', 'adapter.override'], { kind: 'claude' }) });
+  const res = await postRun(b, { prompt: 'oi', options: { cwd: WORKDIR, profile: forte.id } });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /esforço "high" do Perfil "Forte" não é aceito pelo Adapter "claude".*low/i);
+  assert.equal((await b.json('/api/plugins/fake-adapter/last')).last, null, 'prepare não foi chamado');
+  assert.equal((await b.json('/api/health')).activeRuns, 0, 'a vaga voltou');
+  // Um esforço explícito aceito pelo adapter vence o do Perfil e roda.
+  assert.equal(exitOf((await runOn(b, { prompt: 'oi', options: { cwd: WORKDIR, profile: forte.id, effort: 'low' } })).events).status, 'done');
+  await b.stop();
+});
+
 test('P2-3: esforço explícito fora de efforts do adapter do Perfil é recusado (400) antes de preparar a execução', async () => {
   const b = await startBridge({ local: adapterCfg(['adapter']) });
   await setupDb(b);

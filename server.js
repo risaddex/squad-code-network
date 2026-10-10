@@ -794,7 +794,7 @@ function observe(run, event) {
     catch (e) { if (!run.onEventWarned) { run.onEventWarned = true; console.warn(`Adapter ${run.adapter}: onEvent falhou (execução ${run.id}): ${e.message}`); } }
   }
   if (run.parent && event.type === 'assistant' && !event.parent_tool_use_id && run.parent.status === 'running') {
-    pushEvent(run.parent, { ...structuredClone(event), parent_tool_use_id: run.toolUseId || run.parent.translator?.openCall() || null });
+    pushEvent(run.parent, { ...structuredClone(event), parent_tool_use_id: run.toolUseId || run.parent.translator?.openCall?.() || null });
   }
 }
 /* Run history (db.js): events go to the database in small batches. Partial text deltas are not kept (the console never shows
@@ -919,9 +919,13 @@ async function startRun(body, internal = {}) {
   const { profile, fallbackFrom } = internal.exact ? { profile: getProfile(opts.profile) || defaultProfile(), fallbackFrom: null } : pickProfile(opts.profile);
   const impl = registry.get(profile.adapter);
   if (!impl) throw new Error(missingAdapter(profile));
-  // validateRunOptions only knows the union of every Adapter's levels: an explicit level must be one the Adapter of the chosen Perfil
-  // announces (a reserve has the same Adapter). '' (the model's default) never gets here; codex adjusts max/ultra to the model itself.
-  if (opts.effort && !impl.efforts.includes(opts.effort)) throw new Error(`O esforço "${opts.effort}" não é aceito pelo Adapter "${profile.adapter}" do Perfil "${profile.name}" (aceitos: ${impl.efforts.join(', ')}).`);
+  // validateRunOptions only knows the union of every Adapter's levels: the effective level (the run's, else the Perfil's) must be one
+  // the Adapter of the chosen Perfil announces (a reserve has the same Adapter; a Perfil saved before an override may hold a level the
+  // new one lacks). '' (the model's default) never gets here; codex adjusts max/ultra to the model itself.
+  const effort = opts.effort || profile.effort || '';
+  if (effort && !impl.efforts.includes(effort)) throw new Error(opts.effort
+    ? `O esforço "${effort}" não é aceito pelo Adapter "${profile.adapter}" do Perfil "${profile.name}" (aceitos: ${impl.efforts.join(', ')}).`
+    : `O esforço "${effort}" do Perfil "${profile.name}" não é aceito pelo Adapter "${profile.adapter}" (aceitos: ${impl.efforts.join(', ')}). Ajuste o esforço do Perfil.`);
   let release = () => {};
   if (!parent) {
     if (activeCount() >= maxConcurrent) throw Object.assign(new Error(`Limite de ${maxConcurrent} execuções simultâneas atingido.`), { status: 429 });
@@ -1116,7 +1120,7 @@ async function callColleague(run, a) {
   const options = { profile: meta.profile || '', model: def.model, effort: def.effort, permissionMode: o.permissionMode, timeoutSec: o.timeoutSec, addDirs: o.addDirs, ...(def.tools ? { tools: def.tools } : {}), ...(o.claudePathSet ? { claudePath: o.claudePath } : {}), ...(o.projectRun ? { project: o.project } : { cwd: o.cwd }) };
   let child;
   try {
-    child = await startRun({ prompt: pedido.slice(0, 400000), systemPrompt: def.prompt, label: `Chamado: ${slug}`, options, meta: { ...run.meta, agentId: meta.agentId || null, kind: 'call' } }, { parent: run, toolUseId: run.translator?.claimCall(a) || null });
+    child = await startRun({ prompt: pedido.slice(0, 400000), systemPrompt: def.prompt, label: `Chamado: ${slug}`, options, meta: { ...run.meta, agentId: meta.agentId || null, kind: 'call' } }, { parent: run, toolUseId: run.translator?.claimCall?.(a) || null });
   } catch (e) { return text(`Não foi possível chamar ${slug}: ${e.message}`, true); }
   const exit = await child.done;
   return exit.isError ? text(`${slug} não concluiu: ${exit.error || 'erro'}${exit.result ? `\n${exit.result}` : ''}`, true) : text(exit.result || '(sem resposta)');

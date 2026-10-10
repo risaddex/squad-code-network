@@ -288,29 +288,29 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
 
   host.load = function load() {
     if (host.pending) return host.ready;
-    const todo = order.filter(id => byId.get(id).hasCode);
-    if (!todo.length) return host.ready;
+    if (!order.some(id => byId.get(id).hasCode)) return host.ready;
     host.pending = true;
     const deadline = Date.now() + budgetMs;
     host.ready = (async () => {
       try {
-        for (const id of todo) {
-          const r = byId.get(id);
-          if (host.closing) { r.status = 'disabled'; r.error = 'bridge encerrando'; continue; }
-          await loadOne(r, deadline);
-        }
-        // A plugin without code that requires one whose register() failed (or timed out) cannot stay as data: its content would
-        // reach the page. `order` is topological, so one pass also covers a chain of them.
+        // `order` is topological: a plugin without code is checked when its turn comes, before the plugins with code after it load.
+        // One that requires a plugin whose register() failed (or timed out) cannot stay as data (its content would reach the page),
+        // and a plugin with code that requires it then sees it disabled instead of loading on top of it.
         for (const id of order) {
           const r = byId.get(id);
-          if (r.hasCode || r.status !== 'data') continue;
-          for (const dep of r.manifest.requires) {
-            const d = byId.get(dep);
-            if (d && (d.status === 'active' || d.status === 'data')) continue;
-            r.status = 'disabled'; r.error = `depende de "${dep}", que não carregou (${d ? d.status : 'ausente'})`; r.depFailed = true;
-            log.warn(`Plugin ${r.id}: ${r.error}`);
-            break;
+          if (!r.hasCode) {
+            if (r.status !== 'data') continue;
+            for (const dep of r.manifest.requires) {
+              const d = byId.get(dep);
+              if (d && (d.status === 'active' || d.status === 'data')) continue;
+              r.status = 'disabled'; r.error = `depende de "${dep}", que não carregou (${d ? d.status : 'ausente'})`; r.depFailed = true;
+              log.warn(`Plugin ${r.id}: ${r.error}`);
+              break;
+            }
+            continue;
           }
+          if (host.closing) { r.status = 'disabled'; r.error = 'bridge encerrando'; continue; }
+          await loadOne(r, deadline);
         }
       } catch (e) { log.warn(`Plugins: ${e.message}`); }
       finally { host.pending = false; }

@@ -141,6 +141,7 @@ Revisão do Codex no PR (P2), depois do rebase sobre as correções de `feat/ext
   antes de tomar a vaga, resolver modelo/esforço ou chamar `prepare`, recusa (400) um esforço explícito fora de `impl.efforts` do
   Adapter do Perfil escolhido (a reserva tem sempre o mesmo Adapter). `''` (padrão do modelo) não passa por aí; o Codex segue
   ajustando `max`/`ultra` ao modelo; o golden argv não muda.
+- **Segunda revisão do Codex (PR #3).** A checagem dos plugins só de conteúdo saiu da passada pós-carga e roda na vez de cada um, no mesmo laço topológico da carga, antes dos plugins com código seguintes (cadeia código que falha ← conteúdo ← código: o último fica `disabled`, sem carregar); e o esforço conferido contra `impl.efforts` é o efetivo (`opts.effort || profile.effort`), então um Perfil salvo antes de um override com um nível que o novo Adapter não anuncia recebe 400 antes da vaga e do `prepare`.
 ---
 
 ## Apêndice: blueprint do arquiteto
