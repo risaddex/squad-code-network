@@ -142,6 +142,12 @@ Revisão do Codex no PR (P2), depois do rebase sobre as correções de `feat/ext
   Adapter do Perfil escolhido (a reserva tem sempre o mesmo Adapter). `''` (padrão do modelo) não passa por aí; o Codex segue
   ajustando `max`/`ultra` ao modelo; o golden argv não muda.
 - **Segunda revisão do Codex (PR #3).** A checagem dos plugins só de conteúdo saiu da passada pós-carga e roda na vez de cada um, no mesmo laço topológico da carga, antes dos plugins com código seguintes (cadeia código que falha ← conteúdo ← código: o último fica `disabled`, sem carregar); e o esforço conferido contra `impl.efforts` é o efetivo (`opts.effort || profile.effort`), então um Perfil salvo antes de um override com um nível que o novo Adapter não anuncia recebe 400 antes da vaga e do `prepare`.
+- **Estrutura (depois do PR #3).** `plugins.js` virou `plugins/loader.js` e `plugin-host.js` virou `plugins/host.js` (simétrico a
+  `adapters/`); o guia de uso saiu do README raiz para `plugins/README.md` e `adapters/README.md`, e estes planos ficam como registro
+  de decisões. Descoberta ganhou `<repo>/.plugins/<id>/` como fonte local (mesma confiança do home; `SQUAD_PLUGINS_DIR` troca ou
+  desliga, os testes desligam). O manifesto ganhou `squadCode` (faixa semver contra a `version` do `package.json`; fora da faixa,
+  status novo `incompatible`; ausente, aceito sem aviso), e `#squad-plugins` ganhou `others` (plugins achados e não carregados,
+  com status, para a aba Plugins). Scaffold: `npm run plugin:new` (`scripts/plugin-new.mjs`).
 ---
 
 ## Apêndice: blueprint do arquiteto
