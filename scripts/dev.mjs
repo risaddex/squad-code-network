@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Dev runner: builds index.html, starts the bridge, rebuilds on src/ changes and restarts on server.js / db.js / plugins.js / plugin-host.js / schema.js / schemas/ / adapters/ changes.
+// Dev runner: builds index.html, starts the bridge, rebuilds on src/ changes and restarts on server.js / db.js / schema.js / schemas/ / adapters/ / plugins/ changes.
 //   npm run dev [-- --port 4317]
 import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, watch } from 'node:fs';
@@ -47,10 +47,11 @@ try { build(); } catch (err) { say(`falha no build inicial: ${err.message}`); pr
 start();
 watch(SRC, (_event, file) => { if (file && /\.(js|css|html)$/.test(file)) rebuild(); });
 const restartSoon = debounce(restart, 200);
-for (const file of ['server.js', 'db.js', 'plugins.js', 'plugin-host.js', 'schema.js']) watch(path.join(ROOT, file), restartSoon);
+for (const file of ['server.js', 'db.js', 'schema.js']) watch(path.join(ROOT, file), restartSoon);
 watch(path.join(ROOT, 'adapters'), { recursive: true }, restartSoon);
+watch(path.join(ROOT, 'plugins'), { recursive: true }, restartSoon);
 watch(path.join(ROOT, 'schemas'), restartSoon);
-say('observando src/, server.js, db.js, plugins.js, plugin-host.js, schema.js, schemas/ e adapters/. Ctrl+C para sair.');
+say('observando src/, server.js, db.js, schema.js, schemas/, adapters/ e plugins/. Ctrl+C para sair.');
 
 const stop = () => { if (server) server.kill(); process.exit(0); };
 process.on('SIGINT', stop);

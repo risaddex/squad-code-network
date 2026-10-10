@@ -1,5 +1,5 @@
 // Plugins com código, passos 4 a 7 (docs/plans/plugins.md): schema único do manifesto, descoberta (a mesma dos plugins de conteúdo),
-// ordem, carga (plugin-host.js), ctx, rotas, eventos, run:beforeSpawn e registerAdapter.
+// ordem, carga (plugins/host.js), ctx, rotas, eventos, run:beforeSpawn e registerAdapter.
 // `npm test` roda este arquivo junto de bridge.test.mjs e adapters.test.mjs. Portas 4700-4799 (bridge.test.mjs usa outras, adapters 4800+).
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,8 +14,8 @@ import { createRequire } from 'node:module';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FIX = path.join(ROOT, 'tests', 'fixtures', 'plugins');
 const require = createRequire(import.meta.url);
-const { createPluginLoader, orderPlugins, CONSTANTS, SCHEMAS } = require('../plugins.js');
-const { createPluginHost } = require('../plugin-host.js');
+const { createPluginLoader, orderPlugins, CONSTANTS, SCHEMAS } = require('../plugins/loader.js');
+const { createPluginHost } = require('../plugins/host.js');
 const { validate } = require('../schema.js');
 
 delete process.env.CODEX_HOME;
@@ -764,7 +764,7 @@ test('/api/health e serveIndex esperam plugins.ready (plugin lento)', async () =
 });
 
 test('zero plugins: o host não fica pending, ready já resolvido, load() não muda nada', async () => {
-  const { createPluginHost } = require('../plugin-host.js');
+  const { createPluginHost } = require('../plugins/host.js');
   const host = createPluginHost({ getDiscovery: () => ({ plugins: [], config: { enabled: [], entries: {} }, warnings: [] }), dataRoot: '/nonexistent', http: {}, maxBody: 1 });
   assert.equal(host.pending, false); assert.equal(host.closing, false);
   const ready = host.ready;

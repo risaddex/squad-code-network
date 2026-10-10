@@ -3,7 +3,7 @@
  * Host of the plugins with code (ADR 0004, docs/plans/plugins.md). Plugins run in the bridge's process with the person's permissions
  * (not a sandbox): `capabilities` in the manifest + `grants` in the LOCAL configuration are auditable consent, not containment.
  *
- *  - Discovery and order are plugins.js' (the same list as the content plugins, docs/plans/plugins-conteudo.md): one manifest,
+ *  - Discovery and order are plugins/loader.js' (the same list as the content plugins, docs/plans/plugins-conteudo.md): one manifest,
  *    squad-plugin.json, may bring content, code (`server`) or both. Nothing is imported there.
  *  - createPluginHost(): after the port is ours (server.js listen callback) imports the enabled `server` plugins in order and calls
  *    register(ctx). An error in one plugin never reaches the others or the core: its registrations are undone and dependents are off.
@@ -16,8 +16,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { pathToFileURL } = require('node:url');
-const { orderPlugins, CONSTANTS, API_VERSION } = require('./plugins.js');
-const { validate: schemaValidate } = require('./schema.js');
+const { orderPlugins, CONSTANTS, API_VERSION } = require('./loader.js');
+const { validate: schemaValidate } = require('../schema.js');
 
 const SETTINGS_MAX = 16 * 1024;
 const DISPOSE_MS = 1000;
@@ -98,7 +98,7 @@ function signature(disc) {
 
 /**
  * createPluginHost({ getDiscovery, dataRoot, http: { readBody, json, fail }, maxBody, env, registry? }) → host.
- * getDiscovery() → { plugins, config, warnings }: the `discovery` of plugins.js' load() (cached; rereads when a file changed). The first
+ * getDiscovery() → { plugins, config, warnings }: the `discovery` of plugins/loader.js' load() (cached; rereads when a file changed). The first
  * call is the start's snapshot: the code that runs is that list, and view().restartRequired says when the files no longer match it.
  * host.pending is true from load() until every plugin has been tried; host.ready is the promise to await meanwhile.
  * getRegistry() → the Adapter registry (adapters/index.js), for ctx.registerAdapter.
@@ -474,7 +474,7 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
   });
   host.list = () => all().map(viewOf);
   /**
-   * The plugins as the files say now (`now`, plugins.js' discovery): content is live, so a plugin without code is described as found;
+   * The plugins as the files say now (`now`, plugins/loader.js' discovery): content is live, so a plugin without code is described as found;
    * a plugin with code is the record of what runs (loaded at the start), and one that appeared later stays 'disabled' until a restart
    * (restartRequired). A plugin with code still running that left the files is listed too.
    */

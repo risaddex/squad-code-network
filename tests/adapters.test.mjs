@@ -14,7 +14,7 @@ import Database from 'better-sqlite3';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { createRegistry, validateAdapter } = require('../adapters/index.js');
-const { CONSTANTS } = require('../plugins.js');
+const { CONSTANTS } = require('../plugins/loader.js');
 const dbModule = require('../db.js');
 
 delete process.env.CODEX_HOME; // the tests set their own account folders
@@ -38,7 +38,7 @@ const fakeAdapter = (kind, over = {}) => ({
 });
 
 /* ---------- registry ---------- */
-test('registry: built-ins are claude and codex, in that order, and builtinKinds() matches the constants of plugins.js and db.js', () => {
+test('registry: built-ins are claude and codex, in that order, and builtinKinds() matches the constants of plugins/loader.js and db.js', () => {
   const reg = createRegistry(hostFor());
   assert.deepEqual(reg.builtinKinds(), CONSTANTS.ADAPTERS);
   assert.deepEqual(reg.builtinKinds(), dbModule.ADAPTERS);

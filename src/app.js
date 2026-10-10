@@ -127,7 +127,7 @@ const TEMPLATE_AVATARS_V1={ZERO:['avatar-greyman'],'ABELHA-RAINHA':['avatar-moth
    runtime defaults from folders outside the repository. Everything here is a function declaration that touches no const of app.js:
    city.js (same script, earlier) calls squadThemeBoot() while building its scene, before app.js runs. Without the tag (demo, file://)
    nothing changes. Plugin text is escaped (E) wherever it is rendered, like the built-in catalog. */
-// Limits and ids shared with plugins.js (docs/plans/plugins-conteudo.md, "Limites efetivos"): text over a limit refuses the item with a
+// Limits and ids shared with plugins/loader.js (docs/plans/plugins-conteudo.md, "Limites efetivos"): text over a limit refuses the item with a
 // warning, never cut. They follow what normalizeWorkspace keeps of an agent (specialty 40, description 1200, soul 1200, 8 greetings
 // of 300, prompt 20000, tools of TOOLS, a subset's content 8000), so nothing a plugin gives is lost on reload. `tools` is TOOLS itself.
 function pluginLimits(){return pluginLimits.v||(pluginLimits.v={key:/^[a-z0-9][a-z0-9_-]{0,40}$/,convId:/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/,name:/^[A-Z0-9][A-Z0-9-]{1,23}$/,tools:['Read','Glob','Grep','Edit','Write','Bash','WebFetch','WebSearch','NotebookEdit'],cssVar:/^--[a-z0-9-]{1,40}$/,reserved:['__proto__','constructor','prototype'],
@@ -256,7 +256,7 @@ function mergePluginCatalog(){
   if(p.soul)AGENT_SOULS[p.name]={soul:p.soul,hellos:p.hellos.length?[...p.hellos]:genericHellos(p.role,p.specialty)};
   if(p.avatar){const k=['plugin:'+p.plugin+'/'+p.avatar,'avatar-'+p.avatar,p.avatar].find(x=>Object.hasOwn(PORTRAITS,x));if(k)TEMPLATE_AVATARS[p.name]=k;else pluginWarn(`Agente ${p.name}: avatar "${p.avatar}" não encontrado; usa a foto da especialidade.`);}
  }
- // DIRETRIZES: ids as in plugins.js (convId, never a reserved name), own families only (Object.hasOwn: a plugin naming "constructor"
+ // DIRETRIZES: ids as in plugins/loader.js (convId, never a reserved name), own families only (Object.hasOwn: a plugin naming "constructor"
  // must not reach Object's prototype), text within the shared limits or the item is refused; existing ids are never overwritten.
  const L=pluginLimits(),C=L.conv,id=k=>typeof k==='string'&&L.convId.test(k)&&!L.reserved.includes(k);
  const text=(v,max,what)=>{if(v===undefined||v===null||v==='')return'';if(typeof v!=='string')throw Error(`${what}: esperado texto`);if(v.length>max)throw Error(`${what} maior que ${max} caracteres`);return v.trim();};

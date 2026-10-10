@@ -3,7 +3,7 @@
  * Plugins (docs/plans/plugins-conteudo.md, docs/plans/plugins.md): local configuration (squad.config.json + squad.local.json,
  * SQUAD_CONFIG, SQUAD_PLUGINS), the discovery of every plugin (plugins.paths of each file, SQUAD_PLUGINS and ~/.squad-code/plugins/<id>/)
  * and the loader of their content (squad-plugin.json, agents/*.md, avatars, conventions.json, themes, runtime defaults). A plugin
- * may bring content, code (`server`, imported by plugin-host.js) or both, in the same manifest; code only runs from a local source.
+ * may bring content, code (`server`, imported by plugins/host.js) or both, in the same manifest; code only runs from a local source.
  * No dependencies: the agents' frontmatter goes through a small strict parser of a YAML subset (parseFrontmatter).
  * A plugin is trusted (the person installed it), but reads stay inside its folder (realpath), with size and count limits and no SVG.
  * createPluginLoader(...).load() rereads only when a file it read (or a folder it listed) changed: mtime + size of each one.
@@ -14,7 +14,7 @@ const crypto = require('node:crypto');
 // JSON Schemas in schemas/ (schema.js): the shape of the configuration, the manifest and an agent's frontmatter. The checks below
 // stay (paths, realpath, image signatures, limits, colors); the schema adds what they do not cover: an unknown field is a warning,
 // any other schema error refuses the item (a Perfil, category, avatar, theme or agent) with the path of the field.
-const { validate: schemaValidate, formatError, loadSchema } = require('./schema.js');
+const { validate: schemaValidate, formatError, loadSchema } = require('../schema.js');
 const SCHEMAS = { config: loadSchema('squad.schema.json'), plugin: loadSchema('squad-plugin.schema.json'), agent: loadSchema('squad-agent.schema.json') };
 const isUnknown = e => e.keyword === 'additionalProperties';
 const errorsUnder = (errors, prefix) => errors.filter(e => e.path === prefix || e.path.startsWith(prefix + '.') || e.path.startsWith(prefix + '['));
@@ -702,7 +702,7 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
     // localFile: where a new defaultProfile is written when no file declares one; hashes: sha1 of each file as read (the bridge refuses
     // to write over a file changed since); profileWarnings: the warnings about profiles/defaultProfile (shown in the PERFIS tab).
     const config = { files: [], paths: [], disabled: [], enabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: false, errorFiles: [], localFile: cfgFiles[1], hashes: {}, profileWarnings: [] };
-    // What only the plugins with code use (plugin-host.js); entries may hold settings, so it stays out of /api/plugins.
+    // What only the plugins with code use (plugins/host.js); entries may hold settings, so it stays out of /api/plugins.
     const code = { pathInfo: [], disabled: [], disabledLocal: [], enabled: [], entries: {}, hookTimeoutMs: PLUGIN_HOOK_TIMEOUT_MS };
     const pluginWarnings = []; // what the configuration and the discovery say about plugins
     const profMap = new Map();
@@ -819,7 +819,7 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
       const e = live.find(x => x.id === d.id);
       if (!e || d.reason === 'off') continue;
       e.content = null;
-      if (e.hasCode) continue; // the host says why (plugin-host.js)
+      if (e.hasCode) continue; // the host says why (plugins/host.js)
       seen.delete(e.id);
       e.status = 'disabled'; e.error = d.message;
       const m = `[${e.id}] plugin desligado: ${d.message}`; pwarn(m); e.warnings.push(m);

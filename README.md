@@ -490,8 +490,7 @@ squad-code-network/
 ├── index.html          # app completo, gerado pelo build (não editar)
 ├── server.js           # bridge local: serve o app e executa claude -p
 ├── db.js               # banco SQLite (workspace, versões, sala, conversas, execuções)
-├── plugins.js          # configuração local, descoberta dos plugins e carregador do conteúdo
-├── plugin-host.js      # código dos plugins: carga, ctx, rotas, eventos e Adapters de plugin
+├── plugins/            # loader.js (configuração local, descoberta, conteúdo) e host.js (código: ctx, rotas, eventos)
 ├── adapters/           # registro dos adapters (claude, codex) e funções de cada motor
 ├── schemas/            # JSON Schema da configuração, do manifesto dos plugins e dos agentes
 ├── package.json        # scripts npm e a dependência better-sqlite3

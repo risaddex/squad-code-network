@@ -528,7 +528,7 @@ test('chats are saved per kind, capped and swept when their feature is gone', as
   assert.equal(chats.agent.a1, undefined);
 });
 
-/* ---------- Plugins (plugins.js, docs/plans/plugins-conteudo.md) ---------- */
+/* ---------- Plugins (plugins/loader.js, docs/plans/plugins-conteudo.md) ---------- */
 // 1x1 PNG.
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
 const writeTree = (dir, files) => { for (const [rel, data] of Object.entries(files)) { const f = path.join(dir, rel); mkdirSync(path.dirname(f), { recursive: true }); writeFileSync(f, typeof data === 'string' || Buffer.isBuffer(data) ? data : JSON.stringify(data)); } };
@@ -1334,7 +1334,7 @@ test('Perfis da configuração: criados como cfg-<key>, removidos ao sair, defau
 });
 
 test('Perfis da configuração: squad.config.json + squad.local.json mesclados por key, campo a campo, caminhos pelo arquivo que declarou', () => {
-  const { createPluginLoader } = createRequire(import.meta.url)('../plugins.js');
+  const { createPluginLoader } = createRequire(import.meta.url)('../plugins/loader.js');
   const root = tmp('squad-cfgmerge-'); extraDirs.push(root);
   writeFileSync(path.join(root, 'squad.config.json'), JSON.stringify({
     profiles: [
@@ -1498,7 +1498,7 @@ test('Perfis da configuração: item inválido não trava os outros; o Perfil fi
 
 test('schemas: patterns e enums iguais às constantes do código; o validador cobre o subconjunto usado', () => {
   const req = createRequire(import.meta.url);
-  const { CONSTANTS: C, SCHEMAS } = req('../plugins.js');
+  const { CONSTANTS: C, SCHEMAS } = req('../plugins/loader.js');
   const { validate, formatError } = req('../schema.js');
   const pat = node => node.pattern ?? node.anyOf?.find(x => x.pattern)?.pattern;
   const same = (node, re, label) => assert.equal(pat(node), re.source, label);
@@ -1537,7 +1537,7 @@ test('schemas: patterns e enums iguais às constantes do código; o validador co
 });
 
 test('schemas no carregador: campo desconhecido no manifesto e no frontmatter é aviso; erro de schema recusa o item', () => {
-  const { createPluginLoader } = createRequire(import.meta.url)('../plugins.js');
+  const { createPluginLoader } = createRequire(import.meta.url)('../plugins/loader.js');
   const root = tmp('squad-schemaplugin-'); extraDirs.push(root);
   writeTree(path.join(root, 'pk'), {
     'squad-plugin.json': { $schema: '../schemas/squad-plugin.schema.json', id: 'pk', extra: 1, categories: [{ key: 'c1', label: 'C', color: 'red' }, { key: 'c2', label: 5 }], themes: [{ key: 't1', label: 'T', ui: { '--bg': '#000' }, mood: 'x' }] },
@@ -1700,7 +1700,7 @@ test('Perfis da configuração (gravação): com um arquivo inválido nada é gr
 
 test('schemas: maxBudgetUsd igual ao código e $ref circular vira erro', () => {
   const req = createRequire(import.meta.url);
-  const { CONSTANTS: C, SCHEMAS, validateRuntime } = req('../plugins.js');
+  const { CONSTANTS: C, SCHEMAS, validateRuntime } = req('../plugins/loader.js');
   const { validate } = req('../schema.js');
   for (const s of [SCHEMAS.config, SCHEMAS.plugin]) {
     const node = s.$defs.runtime.properties.maxBudgetUsd;
