@@ -15,7 +15,7 @@
  *   SQUAD_HOME        overrides the home dir used for ~/.claude/settings.json (tests)
  *   SQUAD_PROJECTS_DIR root of the per-project folders (default: ./projects next to this file)
  *   SQUAD_DATA_DIR    folder of the SQLite database, squad.db (default: ./data next to this file)
- *   SQUAD_CONFIG      local configuration file used instead of ./squad.local.json (plugins.js, docs/plans/plugins-conteudo.md)
+ *   SQUAD_CONFIG      local configuration file used instead of ./squad.local.json (plugins/loader.js, docs/plans/plugins-conteudo.md)
  *   SQUAD_CONFIG_SHARED  shared configuration file used instead of ./squad.config.json
  *   SQUAD_PLUGINS       extra plugin folders, separated by the platform's path delimiter
  *   SQUAD_PLUGIN_REGISTER_TIMEOUT_MS  time limit of a plugin's register(ctx) (default 10000; tests)
@@ -43,7 +43,7 @@ const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'squad-code-'));
 // Every project runs in its own folder under PROJECTS_DIR (created on the first run).
 const PROJECTS_DIR = path.resolve(process.env.SQUAD_PROJECTS_DIR || path.join(ROOT, 'projects'));
 const FOLDER_RE = /^[a-z0-9][a-z0-9-]{0,79}$/;
-const RESERVED_RE = require('./plugins.js').CONSTANTS.WINDOWS_RESERVED_RE;
+const RESERVED_RE = require('./plugins/loader.js').CONSTANTS.WINDOWS_RESERVED_RE;
 try { fs.mkdirSync(PROJECTS_DIR, { recursive: true }); } catch {} // otherwise the first project run creates it
 // The app's data (workspace, versions, operation rooms, chats, run history) lives in DATA_DIR/squad.db (db.js).
 // It is opened at start only when it exists (or a data/workspace.json from the file version waits to be imported); otherwise the
@@ -56,9 +56,9 @@ const dbModule = require('./db.js');
 if (dbModule.driverError) { console.error(`SQUAD/CODE: ${dbModule.driverError}`); process.exit(1); }
 const nodeMajor = Number(process.versions.node.split('.')[0]);
 if (nodeMajor < 22) console.warn(`SQUAD/CODE pede o Node 22 ou mais novo (este é o ${process.version}). Atualize se algo falhar.`);
-// Plugins (plugins.js): reread on every serveIndex when a file they came from changed. The code of the plugins (plugin-host.js) is
+// Plugins (plugins/loader.js): reread on every serveIndex when a file they came from changed. The code of the plugins (plugins/host.js) is
 // loaded once, at the start; their content follows the files.
-const pluginLoader = require('./plugins.js').createPluginLoader({ root: ROOT, home: HOME });
+const pluginLoader = require('./plugins/loader.js').createPluginLoader({ root: ROOT, home: HOME });
 function loadPlugins() {
   try { return pluginLoader.load(); }
   catch (e) { const warnings = [`Plugins não carregados: ${e.message}`]; return { page: { plugins: [], runtime: {}, warnings }, api: { plugins: [], runtime: {}, warnings, config: { files: [], paths: [], disabled: [], enabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: true } }, count: 0, discovery: { plugins: [], config: { enabled: [], entries: {}, hookTimeoutMs: 3000 }, warnings }, cfgRuntime: {} }; }
@@ -66,7 +66,7 @@ function loadPlugins() {
 /** The loader's result with the content of a plugin with code only while its code is active (register() worked at the start). */
 // The page and /api/plugins get the content of a plugin with code only while it is active; a plugin without code is reread live and
 // only leaves when the host switched it off because a plugin it requires failed to load (contentBlocked).
-const activeContent = loaded => require('./plugins.js').selectContent(loaded, (id, hasCode) => hasCode ? pluginHost.statusOf(id) === 'active' : !pluginHost.contentBlocked(id));
+const activeContent = loaded => require('./plugins/loader.js').selectContent(loaded, (id, hasCode) => hasCode ? pluginHost.statusOf(id) === 'active' : !pluginHost.contentBlocked(id));
 let store = null;
 /* After the database opens: "Codex (padrão)" when codex is on the PATH (once per database). When it is created on a machine without
    claude and the default is still the untouched "Claude (padrão)", it becomes the default, so agents without a Perfil do not all
@@ -102,8 +102,8 @@ function needStore() {
 }
 
 const PERMISSION_MODES = ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'];
-// Effort lists shared with plugins.js and schemas/squad.schema.json (one source, checked by the tests).
-const { EFFORTS, CODEX_EFFORTS } = require('./plugins.js').CONSTANTS;
+// Effort lists shared with plugins/loader.js and schemas/squad.schema.json (one source, checked by the tests).
+const { EFFORTS, CODEX_EFFORTS } = require('./plugins/loader.js').CONSTANTS;
 const TOOL_RE = /^[A-Za-z][A-Za-z0-9_]*(\([^()\r\n"]{0,200}\))?$|^mcp__[A-Za-z0-9_-]+(__[A-Za-z0-9_*-]+)?$/;
 const MODEL_RE = /^[A-Za-z0-9._\-\[\]]{1,80}$/;
 const MAX_EVENTS = 5000;
@@ -157,9 +157,9 @@ function tokenOk(req, url) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// Plugins with code (plugin-host.js, docs/plans/plugins.md): found now (read-only), imported only once the port is ours (listen
+// Plugins with code (plugins/host.js, docs/plans/plugins.md): found now (read-only), imported only once the port is ours (listen
 // callback below). With none, `pending` stays false and nothing here costs a thing.
-const pluginHost = require('./plugin-host.js').createPluginHost({ getDiscovery: () => loadPlugins().discovery, dataRoot: DATA_DIR, http: { readBody, json, fail }, maxBody: MAX_BODY, getRegistry: () => registry });
+const pluginHost = require('./plugins/host.js').createPluginHost({ getDiscovery: () => loadPlugins().discovery, dataRoot: DATA_DIR, http: { readBody, json, fail }, maxBody: MAX_BODY, getRegistry: () => registry });
 
 /** Resolve an executable name to a full path (Windows needs to know .exe vs .cmd). */
 function resolveBin(bin) {
@@ -334,7 +334,7 @@ async function profileView(p) {
 
 function adaptersCatalog() { return Object.fromEntries(registry.kinds().map(k => [k, { ...registry.get(k).catalog(), adapterSource: registry.get(k).source }])); }
 
-const PROFILE_FIELDS = require('./plugins.js').CONSTANTS.PROFILE_FIELDS;
+const PROFILE_FIELDS = require('./plugins/loader.js').CONSTANTS.PROFILE_FIELDS;
 /** Checks a Perfil sent by the page (a PUT may send only some fields: the rest comes from `current`). */
 async function validateProfile(body, current = null) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Perfil inválido.');
@@ -387,7 +387,7 @@ function checkReserve(p, ref) {
 }
 
 /* ---------- Perfis declared in the configuration (docs/plans/plugins-conteudo.md: `profiles`, `defaultProfile`) ----------
-   plugins.js reads and merges them by key; here they are validated like POST /api/profiles and upserted as `cfg-<key>` (source
+   plugins/loader.js reads and merges them by key; here they are validated like POST /api/profiles and upserted as `cfg-<key>` (source
    'config'). It runs when the database opens and whenever the configuration's signature changes (the loader keeps its mtime cache,
    checked only where the page reads the Perfis: page load, /api/plugins, GET /api/profiles). Removed from the file: removed from the
    table. A file that could not be read or a malformed list: nothing changes. defaultFile: the configuration chose the default. */
@@ -423,7 +423,7 @@ async function applyConfigProfiles(cfg) {
   const declared = new Set(cfg.profiles.map(e => `cfg-${e.key}`)), valid = [], errors = new Map();
   for (const e of cfg.profiles) {
     const { key, source, files, fallbackId, invalid, ...fields } = e, id = `cfg-${key}`;
-    // Invalid item in the file (plugins.js already warned, with file, key and field): the row stays as it was, or is not created.
+    // Invalid item in the file (plugins/loader.js already warned, with file, key and field): the row stays as it was, or is not created.
     if (invalid) { errors.set(id, invalid); continue; }
     try {
       if (fallbackId !== undefined && typeof fallbackId !== 'string') throw new Error('"fallbackId" deve ser texto (id ou key de um Perfil).');
@@ -467,7 +467,7 @@ async function applyConfigProfiles(cfg) {
    folder. Temp files have random names, are created exclusively ('wx') with the original file's mode (0600 for a new file), and the
    .bak is written the same way (temp + rename: an existing .bak link is replaced, never followed) with the text that was checked. */
 const { validate: schemaValidate, formatError } = require('./schema.js');
-const CONFIG_SCHEMA = require('./plugins.js').SCHEMAS.config;
+const CONFIG_SCHEMA = require('./plugins/loader.js').SCHEMAS.config;
 const sha1 = text => crypto.createHash('sha1').update(text).digest('hex');
 const conflict = msg => Object.assign(new Error(msg), { status: 409 });
 const badRequest = msg => Object.assign(new Error(msg), { status: 400 });
@@ -558,7 +558,7 @@ function profileItemOf(data, key, name) {
   if (!item) throw conflict(`O Perfil ${key} não está mais em ${name}. Recarregue a página.`);
   return item;
 }
-// Paths of a Perfil in a file: `~` and relative ones against the file's folder (plugins.js does the same when reading).
+// Paths of a Perfil in a file: `~` and relative ones against the file's folder (plugins/loader.js does the same when reading).
 const looksLikePath = v => /[\\/]|^~|^\./.test(v);
 function expandFrom(dir, p) {
   if (p === '~') return HOME;
@@ -652,7 +652,11 @@ async function defaultInConfig(pid) {
 /** Plugins + configuration as the page/API get them, with the warnings of the configured Perfis appended. */
 async function pluginsWithProfiles() {
   await syncConfigProfiles();
-  const plugins = activeContent(loadPlugins());
+  const loaded = activeContent(loadPlugins());
+  // others: the plugins found that are not in the page (incompatible, invalid, blocked, denied, error, disabled...), for the PLUGINS tab.
+  const others = pluginHost.view(loaded.discovery).plugins.filter(v => v.status !== 'active' && v.status !== 'data').slice(0, 40)
+    .map(v => ({ id: v.id, name: v.name, version: v.version, status: v.status, error: String(v.error || '').slice(0, 600), hasCode: v.hasCode }));
+  const plugins = { ...loaded, page: { ...loaded.page, others } };
   if (!cfgProfiles.warnings.length) return plugins;
   return { ...plugins, page: { ...plugins.page, warnings: [...plugins.page.warnings, ...cfgProfiles.warnings] }, api: { ...plugins.api, warnings: [...plugins.api.warnings, ...cfgProfiles.warnings] } };
 }
@@ -660,7 +664,7 @@ async function pluginsWithProfiles() {
 const NO_CONTENT = { categories: [], presets: [], avatars: [], themes: [], conventions: null, runtime: {} };
 /**
  * GET /api/plugins: every plugin found (content, code or both), each with the summary of its content in the page (empty when it is not
- * there) and what the host says of its code; the runtime and the configuration as plugins.js read them; restartRequired when the code
+ * there) and what the host says of its code; the runtime and the configuration as plugins/loader.js read them; restartRequired when the code
  * that runs no longer matches the files.
  */
 function pluginsBody(loaded) {
@@ -686,7 +690,7 @@ function pluginLine(p) {
   if (p.status === 'data' || (p.status === 'active' && p.presets.length)) parts.push(`${p.presets.length} agente(s)`);
   return `${p.id}${p.version ? ` ${p.version}` : ''} (${parts.join(', ')})`;
 }
-const { STATUS_PT } = require('./plugin-host.js');
+const { STATUS_PT } = require('./plugins/host.js');
 
 /* ---------- telemetry (OTLP/HTTP JSON, one trace per run) ---------- */
 const INHERITED_TELEMETRY = /^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$|CLAUDE_CODE_OTEL_|BETA_TRACING_ENDPOINT$|ENABLE_BETA_TRACING_DETAILED$)/;
@@ -790,7 +794,7 @@ function observe(run, event) {
   if (event.type === 'system' && event.subtype === 'init' && typeof event.model === 'string' && event.model) run.seenModel = event.model;
   if (run.impl?.onEvent) {
     // Hot path of every event: an Adapter that throws never breaks the stream (warned once per run).
-    try { const seen = run.impl.onEvent(run.adapterRun || run, event); if (seen?.windows) recordWindows(run.profileId, seen.windows, 'event'); }
+    try { const seen = run.impl.onEvent(run.adapterRun || run, event); if (seen?.windows) recordWindows(run.profileId, seen.windows, 'event'); if (seen?.rateLimited === true) run.rateLimited = true; }
     catch (e) { if (!run.onEventWarned) { run.onEventWarned = true; console.warn(`Adapter ${run.adapter}: onEvent falhou (execução ${run.id}): ${e.message}`); } }
   }
   if (run.parent && event.type === 'assistant' && !event.parent_tool_use_id && run.parent.status === 'running') {
@@ -1071,10 +1075,19 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
       error: isError ? (run.cancelled ? 'Execução cancelada pelo operador.' : run.timedOut ? 'Tempo limite excedido.' : (r.is_error && r.result) || stderrTail.trim().slice(-1500) || `${adapter} saiu com código ${code}`) : null,
       usage, profileId: profile.id, adapter, model,
     };
+    // The account's limit arrived mid-run: the bridge does not retry (1 run = 1 process); it says which Perfil the same request would
+    // get now (the reserve, by pickProfile on the Perfil first asked), so the app can launch the step again once.
+    if (run.status === 'error' && run.rateLimited) {
+      exit.rateLimited = true; exit.profileName = profile.name;
+      if (!internal.exact) {
+        const next = pickProfile(fallbackFrom || opts.profile).profile;
+        if (next && next.id !== profile.id && !overLimit(next)) exit.retryProfile = { id: next.id, name: next.name };
+      }
+    }
     pushEvent(run, exit);
     if (run.persist) try { store.finishRun(run, exit); } catch (e) { console.warn(`Histórico da execução ${id} não finalizado: ${e.message}`); }
     try { sendTrace(run, exit); } catch {}
-    // error: the text for run.content, the code (cancelled|timeout|spawn|exit|agent-error) for the rest (see plugin-host.js stripFinish).
+    // error: the text for run.content, the code (cancelled|timeout|spawn|exit|agent-error) for the rest (see plugins/host.js stripFinish).
     const errorCode = !isError ? null : run.cancelled ? 'cancelled' : run.timedOut ? 'timeout' : run.spawnFailed ? 'spawn' : code !== 0 ? 'exit' : 'agent-error';
     pluginHost.emit('run:finish', () => ({ runId: id, parentRunId: run.parentRunId, kind: run.meta.kind, profileId: profile.id, adapter, model: exit.model ?? null, status: run.status, isError, error: exit.error, errorCode, code, costUsd: exit.costUsd,
       durationMs: exit.durationMs ?? (Date.parse(run.endedAt) - Date.parse(run.startedAt)), numTurns: exit.numTurns, usage, sessionId: exit.sessionId }));

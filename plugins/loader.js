@@ -1,9 +1,9 @@
 'use strict';
 /*
  * Plugins (docs/plans/plugins-conteudo.md, docs/plans/plugins.md): local configuration (squad.config.json + squad.local.json,
- * SQUAD_CONFIG, SQUAD_PLUGINS), the discovery of every plugin (plugins.paths of each file, SQUAD_PLUGINS and ~/.squad-code/plugins/<id>/)
+ * SQUAD_CONFIG, SQUAD_PLUGINS), the discovery of every plugin (plugins.paths of each file, SQUAD_PLUGINS, <repo>/.plugins/<id>/ and ~/.squad-code/plugins/<id>/)
  * and the loader of their content (squad-plugin.json, agents/*.md, avatars, conventions.json, themes, runtime defaults). A plugin
- * may bring content, code (`server`, imported by plugin-host.js) or both, in the same manifest; code only runs from a local source.
+ * may bring content, code (`server`, imported by plugins/host.js) or both, in the same manifest; code only runs from a local source.
  * No dependencies: the agents' frontmatter goes through a small strict parser of a YAML subset (parseFrontmatter).
  * A plugin is trusted (the person installed it), but reads stay inside its folder (realpath), with size and count limits and no SVG.
  * createPluginLoader(...).load() rereads only when a file it read (or a folder it listed) changed: mtime + size of each one.
@@ -14,7 +14,7 @@ const crypto = require('node:crypto');
 // JSON Schemas in schemas/ (schema.js): the shape of the configuration, the manifest and an agent's frontmatter. The checks below
 // stay (paths, realpath, image signatures, limits, colors); the schema adds what they do not cover: an unknown field is a warning,
 // any other schema error refuses the item (a Perfil, category, avatar, theme or agent) with the path of the field.
-const { validate: schemaValidate, formatError, loadSchema } = require('./schema.js');
+const { validate: schemaValidate, formatError, loadSchema } = require('../schema.js');
 const SCHEMAS = { config: loadSchema('squad.schema.json'), plugin: loadSchema('squad-plugin.schema.json'), agent: loadSchema('squad-agent.schema.json') };
 const isUnknown = e => e.keyword === 'additionalProperties';
 const errorsUnder = (errors, prefix) => errors.filter(e => e.path === prefix || e.path.startsWith(prefix + '.') || e.path.startsWith(prefix + '['));
@@ -79,7 +79,62 @@ const API_VERSION = 1;
 const SERVER_MAX = 2 * 1024 * 1024;
 const SERVER_EXTS = ['.mjs', '.js'];
 // Errors of these manifest fields refuse the plugin (the content fields are checked item by item).
-const MANIFEST_RE = /^(?:id|name|version|description|apiVersion|server|requires|capabilities|env|configSchema)(?:$|[.[])/;
+const MANIFEST_RE = /^(?:id|name|version|description|apiVersion|squadCode|server|requires|capabilities|env|configSchema)(?:$|[.[])/;
+// The SQUAD/CODE version a manifest's "squadCode" range is checked against (package.json; createPluginLoader({version}) for tests).
+const APP_VERSION = require('../package.json').version;
+
+/* ---------- semver: the minimum the "squadCode" field needs (no dependency) ---------- */
+// Versions are x.y.z (a -prerelease/+build suffix is ignored). A range is alternatives joined by "||"; each alternative is comparators
+// separated by spaces, all of which must hold (AND). Comparators: exact (1.2.3, =1.2.3), >, >=, <, <=, ^ and ~, a partial version
+// (2 or 2.1 = any 2.x / 2.1.x) and * (any). Not supported: hyphen ranges (1 - 2), prerelease ordering, x inside a version (2.x).
+const SQUAD_CODE_RANGE_RE = /^[0-9A-Za-z*^~<>=|.+ -]{1,100}$/;
+const SEMVER_PART_RE = /^v?(\d{1,9})(?:\.(\d{1,9})(?:\.(\d{1,9}))?)?(?:[-+][0-9A-Za-z.+-]*)?$/;
+function parseVersion(text) {
+  const m = SEMVER_PART_RE.exec(String(text).trim());
+  if (!m) return null;
+  return { v: [Number(m[1]), Number(m[2] || 0), Number(m[3] || 0)], parts: m[3] !== undefined ? 3 : m[2] !== undefined ? 2 : 1 };
+}
+const cmpVersion = (a, b) => (a[0] - b[0]) || (a[1] - b[1]) || (a[2] - b[2]);
+/** One comparator → a list of [op, [x, y, z]] (all must hold), or null when it cannot be read. */
+function parseComparator(text) {
+  if (text === '*' || text === 'x' || text === 'X') return [];
+  const m = /^(\^|~|>=|<=|>|<|=)?(.+)$/.exec(text);
+  const p = m && parseVersion(m[2]);
+  if (!p) return null;
+  const [x, y, z] = p.v, op = m[1] || '';
+  if (op === '^') {
+    const upper = x > 0 || p.parts === 1 ? [x + 1, 0, 0] : y > 0 || p.parts === 2 ? [0, y + 1, 0] : [0, 0, z + 1];
+    return [['>=', p.v], ['<', upper]];
+  }
+  if (op === '~') return [['>=', p.v], ['<', p.parts === 1 ? [x + 1, 0, 0] : [x, y + 1, 0]]];
+  if (op === '' || op === '=') {
+    if (p.parts === 3) return [['=', p.v]];
+    return [['>=', p.v], ['<', p.parts === 1 ? [x + 1, 0, 0] : [x, y + 1, 0]]];
+  }
+  return [[op, p.v]];
+}
+/** parseRange('^2.1.0 || >=3') → alternatives of comparators, or null when the text is not a range this matcher reads. */
+function parseRange(range) {
+  if (typeof range !== 'string' || !SQUAD_CODE_RANGE_RE.test(range)) return null;
+  const alts = range.split('||').map(a => a.trim());
+  if (alts.some(a => !a)) return null;
+  const out = [];
+  for (const alt of alts) {
+    // ">= 2.1.0" (operator, space, version) reads as one comparator.
+    const toks = alt.replace(/(>=|<=|>|<|=|\^|~)\s+/g, '$1').split(/\s+/);
+    const all = [];
+    for (const t of toks) { const c = parseComparator(t); if (!c) return null; all.push(...c); }
+    out.push(all);
+  }
+  return out;
+}
+/** satisfies('2.1.0', '^2.0.0') → true; false for an unreadable version or range. */
+function satisfies(version, range) {
+  const v = parseVersion(version), alts = parseRange(range);
+  if (!v || !alts) return false;
+  const ok = ([op, w]) => { const c = cmpVersion(v.v, w); return op === '=' ? c === 0 : op === '>' ? c > 0 : op === '>=' ? c >= 0 : op === '<' ? c < 0 : c <= 0; };
+  return alts.some(cs => cs.every(ok));
+}
 
 /* ---------- frontmatter: a strict YAML subset ---------- */
 // `chave: valor` (string, number, true/false; quotes optional), inline lists `[a, "b, c"]`, block lists `- item`, one level of nested
@@ -571,7 +626,7 @@ function normalizeManifest(meta, id) {
   return {
     id, name: typeof meta.name === 'string' && meta.name.trim() ? meta.name.trim().slice(0, 80) : id,
     version: typeof meta.version === 'string' ? meta.version.trim().slice(0, 40) : '', description: typeof meta.description === 'string' ? meta.description.trim().slice(0, 1000) : '',
-    apiVersion: Number.isInteger(meta.apiVersion) ? meta.apiVersion : API_VERSION, server: typeof meta.server === 'string' ? meta.server : '',
+    apiVersion: Number.isInteger(meta.apiVersion) ? meta.apiVersion : API_VERSION, squadCode: typeof meta.squadCode === 'string' ? meta.squadCode.trim() : '', server: typeof meta.server === 'string' ? meta.server : '',
     requires: Array.isArray(meta.requires) ? [...new Set(meta.requires.filter(x => typeof x === 'string'))] : [],
     capabilities: Array.isArray(meta.capabilities) ? [...new Set(meta.capabilities.filter(x => PLUGIN_CAPABILITIES.includes(x)))] : [],
     env: Array.isArray(meta.env) ? [...new Set(meta.env.filter(x => typeof x === 'string'))] : [], configSchema: isObj(meta.configSchema) ? meta.configSchema : null,
@@ -588,7 +643,7 @@ function selectContent(result, keep) {
 }
 
 /* ---------- loader ---------- */
-function createPluginLoader({ root, home, env = process.env, cwd = process.cwd() }) {
+function createPluginLoader({ root, home, env = process.env, cwd = process.cwd(), version = APP_VERSION }) {
   let cache = null; // { sigs: Map<path, sig>, result }
 
   const statSig = p => { try { const s = fs.statSync(p); return `${s.mtimeMs}:${s.size}:${s.isDirectory() ? 'd' : 'f'}`; } catch { return 'missing'; } };
@@ -702,7 +757,7 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
     // localFile: where a new defaultProfile is written when no file declares one; hashes: sha1 of each file as read (the bridge refuses
     // to write over a file changed since); profileWarnings: the warnings about profiles/defaultProfile (shown in the PERFIS tab).
     const config = { files: [], paths: [], disabled: [], enabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: false, errorFiles: [], localFile: cfgFiles[1], hashes: {}, profileWarnings: [] };
-    // What only the plugins with code use (plugin-host.js); entries may hold settings, so it stays out of /api/plugins.
+    // What only the plugins with code use (plugins/host.js); entries may hold settings, so it stays out of /api/plugins.
     const code = { pathInfo: [], disabled: [], disabledLocal: [], enabled: [], entries: {}, hookTimeoutMs: PLUGIN_HOOK_TIMEOUT_MS };
     const pluginWarnings = []; // what the configuration and the discovery say about plugins
     const profMap = new Map();
@@ -743,19 +798,26 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
     for (const p of String(env.SQUAD_PLUGINS || '').split(path.delimiter).map(s => s.trim()).filter(Boolean)) addPath(expand(p, cwd), true, '');
     config.disabled = code.disabled; config.enabled = code.enabled;
 
-    /* plugins: the folders of plugins.paths (and SQUAD_PLUGINS), then ~/.squad-code/plugins/<id>/ */
+    /* plugins: the folders of plugins.paths (and SQUAD_PLUGINS), then <repo>/.plugins/<id>/, then ~/.squad-code/plugins/<id>/ */
     const list = [], seen = new Map(); // discovered plugins; plugin id → folder
     const cands = code.pathInfo.map(c => ({ dir: c.path, local: c.local, source: 'config', file: c.file }));
-    const homeDir = path.join(home, '.squad-code', 'plugins');
-    track(homeDir);
-    try {
-      for (const e of fs.readdirSync(homeDir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
-        const dir = path.join(homeDir, e.name);
-        let isDir = e.isDirectory();
-        if (!isDir && e.isSymbolicLink()) { try { isDir = fs.statSync(dir).isDirectory(); } catch {} }
-        if (isDir) cands.push({ dir, local: true, source: 'home', file: '', home: true });
-      }
-    } catch (e) { if (e.code !== 'ENOENT') warn(`${rel(homeDir)}: não foi possível listar (${e.code || e.message})`); }
+    // Folders scanned one level deep, as local sources (the same trust as the local file): <repo>/.plugins (SQUAD_PLUGINS_DIR replaces
+    // it, '' turns it off; the tests use that so the clone's own .plugins is never read) and the home folder.
+    const repoDir = env.SQUAD_PLUGINS_DIR !== undefined ? (env.SQUAD_PLUGINS_DIR ? path.resolve(cwd, env.SQUAD_PLUGINS_DIR) : '') : path.join(root, '.plugins');
+    const scan = (base, source) => {
+      track(base);
+      try {
+        for (const e of fs.readdirSync(base, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+          if (e.name.startsWith('.')) continue; // .gitkeep and the like
+          const dir = path.join(base, e.name);
+          let isDir = e.isDirectory();
+          if (!isDir && e.isSymbolicLink()) { try { isDir = fs.statSync(dir).isDirectory(); } catch {} }
+          if (isDir) cands.push({ dir, local: true, source, file: '', home: true });
+        }
+      } catch (e) { if (e.code !== 'ENOENT') warn(`${rel(base)}: não foi possível listar (${e.code || e.message})`); }
+    };
+    if (repoDir) scan(repoDir, 'repo');
+    scan(path.join(home, '.squad-code', 'plugins'), 'home');
     // The same folder through two paths counts once. Local sources go first: with a repeated id the local one wins (the shared one is
     // listed as refused, with a warning).
     // Local sources are ordered first BEFORE the duplicates go: a shared path pointing at a local plugin's folder (or an alias of it)
@@ -784,8 +846,13 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
         if (hard) return refuse('invalid', formatError(hard));
         const api = meta.apiVersion ?? API_VERSION;
         if (api > API_VERSION) return refuse('invalid', `exige apiVersion ${api}; este bridge oferece ${API_VERSION}. Atualize o SQUAD/CODE ou use outra versão do plugin`);
+        // squadCode: the SQUAD/CODE versions the plugin supports (absent = any, no warning). Out of range, nothing of it loads.
+        if (meta.squadCode !== undefined) {
+          if (!parseRange(meta.squadCode)) return refuse('invalid', `squadCode "${String(meta.squadCode).slice(0, 100)}" não é uma faixa de versões reconhecida (use ^x.y.z, ~x.y.z, >=, <, versão exata ou ||)`);
+          if (!satisfies(version, meta.squadCode)) return refuse('incompatible', `requer SQUAD/CODE ${meta.squadCode}, este é ${version}`);
+        }
         const hasCode = meta.server !== undefined;
-        if (hasCode && !cand.local) return refuse('blocked', 'código só vale por configuração local (squad.local.json, SQUAD_CONFIG ou ~/.squad-code/plugins); o arquivo compartilhado não pode carregar plugin com "server"');
+        if (hasCode && !cand.local) return refuse('blocked', 'código só vale por configuração local (squad.local.json, SQUAD_CONFIG, .plugins/ ou ~/.squad-code/plugins); o arquivo compartilhado não pode carregar plugin com "server"');
         // plugins.disabled: for a plugin with code only the local file's counts (a shared file must not switch off what the person runs).
         if ((hasCode ? code.disabledLocal : code.disabled).includes(id)) { outcome = { status: 'disabled', error: 'desligado em plugins.disabled' }; return false; }
         if (!hasCode) { outcome = {}; return true; }
@@ -819,7 +886,7 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
       const e = live.find(x => x.id === d.id);
       if (!e || d.reason === 'off') continue;
       e.content = null;
-      if (e.hasCode) continue; // the host says why (plugin-host.js)
+      if (e.hasCode) continue; // the host says why (plugins/host.js)
       seen.delete(e.id);
       e.status = 'disabled'; e.error = d.message;
       const m = `[${e.id}] plugin desligado: ${d.message}`; pwarn(m); e.warnings.push(m);
@@ -840,5 +907,5 @@ function createPluginLoader({ root, home, env = process.env, cwd = process.cwd()
 }
 
 // The constants the schemas repeat (tests/bridge.test.mjs checks that schemas/*.json match them).
-const CONSTANTS = { BUDGET_RE, PLUGIN_ID_RE, KEY_RE, CONV_ID_RE, NAME_RE, ROLE_RE, MODEL_RE, TOOLS, ICON_RE, AVATAR_REF_RE, PROFILE_KEY_RE, SLOTS, EFFORTS, CODEX_EFFORTS, ADAPTERS, PERMISSION_MODES, PROFILE_FIELDS, TELEMETRY_KEYS, WINDOWS_RESERVED_RE, PLUGIN_CAPABILITIES, PLUGIN_EVENTS, PLUGIN_HOOK_TIMEOUT_MS };
-module.exports = { createPluginLoader, createInsideReader, buildPlugin, orderPlugins, selectContent, parseFrontmatter, validateRuntime, LIMITS, CONSTANTS, SCHEMAS, PLUGIN_FILE, API_VERSION };
+const CONSTANTS = { BUDGET_RE, PLUGIN_ID_RE, KEY_RE, CONV_ID_RE, NAME_RE, ROLE_RE, MODEL_RE, TOOLS, ICON_RE, AVATAR_REF_RE, PROFILE_KEY_RE, SLOTS, EFFORTS, CODEX_EFFORTS, ADAPTERS, PERMISSION_MODES, PROFILE_FIELDS, TELEMETRY_KEYS, WINDOWS_RESERVED_RE, PLUGIN_CAPABILITIES, PLUGIN_EVENTS, PLUGIN_HOOK_TIMEOUT_MS, SQUAD_CODE_RANGE_RE };
+module.exports = { satisfies, parseRange, APP_VERSION, createPluginLoader, createInsideReader, buildPlugin, orderPlugins, selectContent, parseFrontmatter, validateRuntime, LIMITS, CONSTANTS, SCHEMAS, PLUGIN_FILE, API_VERSION };

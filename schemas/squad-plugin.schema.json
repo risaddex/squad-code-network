@@ -16,7 +16,7 @@
     "id": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9-]{1,40}$",
-      "description": "Id único do Plugin. Na pasta do home (~/.squad-code/plugins/<id>/), a pasta tem o mesmo nome."
+      "description": "Id único do Plugin. Em .plugins/<id>/ do repositório e em ~/.squad-code/plugins/<id>/, a pasta tem o mesmo nome."
     },
     "name": {
       "type": "string",
@@ -37,6 +37,11 @@
       "type": "integer",
       "minimum": 1,
       "description": "Versão do contrato do ctx que o plugin espera (este bridge oferece a 1; maior é recusado)."
+    },
+    "squadCode": {
+      "type": "string",
+      "pattern": "^[0-9A-Za-z*^~<>=|.+ -]{1,100}$",
+      "description": "Versões do SQUAD/CODE (version do package.json) que o Plugin suporta, como faixa semver: ^2.1.0, ~2.1.0, >=2.1.0 <3, 2.1.0, ^2 || ^3. Fora da faixa o Plugin fica com status incompatible e nada dele carrega. Ausente = qualquer versão. Diferente de apiVersion (contrato do ctx)."
     },
     "server": {
       "type": "string",

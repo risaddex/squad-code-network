@@ -103,11 +103,14 @@ module.exports = host => {
       if (content) env.OTEL_LOG_USER_PROMPTS = '1';
     },
 
-    /** Synchronous, on the hot path of every event: the usage windows ride on `rate_limit_event`. */
+    /** Synchronous, on the hot path of every event: the usage windows ride on `rate_limit_event`; status `rejected` = the account's
+        limit arrived (Claude Code then writes "You've hit your session limit" and exits with an error). */
     onEvent(run, event) {
       if (event.type !== 'rate_limit_event') return undefined;
       const windows = claudeWindows(event);
-      return windows ? { windows } : undefined;
+      const info = event.rate_limit_info || event.rateLimitInfo;
+      const rateLimited = !!info && typeof info === 'object' && info.status === 'rejected';
+      return windows || rateLimited ? { ...(windows ? { windows } : {}), ...(rateLimited ? { rateLimited } : {}) } : undefined;
     },
 
     finish(run) {

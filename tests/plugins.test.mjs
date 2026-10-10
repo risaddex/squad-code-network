@@ -1,11 +1,11 @@
 // Plugins com código, passos 4 a 7 (docs/plans/plugins.md): schema único do manifesto, descoberta (a mesma dos plugins de conteúdo),
-// ordem, carga (plugin-host.js), ctx, rotas, eventos, run:beforeSpawn e registerAdapter.
+// ordem, carga (plugins/host.js), ctx, rotas, eventos, run:beforeSpawn e registerAdapter.
 // `npm test` roda este arquivo junto de bridge.test.mjs e adapters.test.mjs. Portas 4700-4799 (bridge.test.mjs usa outras, adapters 4800+).
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync, cpSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync, cpSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,8 +14,8 @@ import { createRequire } from 'node:module';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FIX = path.join(ROOT, 'tests', 'fixtures', 'plugins');
 const require = createRequire(import.meta.url);
-const { createPluginLoader, orderPlugins, CONSTANTS, SCHEMAS } = require('../plugins.js');
-const { createPluginHost } = require('../plugin-host.js');
+const { createPluginLoader, orderPlugins, CONSTANTS, SCHEMAS, satisfies, parseRange, APP_VERSION } = require('../plugins/loader.js');
+const { createPluginHost } = require('../plugins/host.js');
 const { validate } = require('../schema.js');
 
 delete process.env.CODEX_HOME;
@@ -32,7 +32,7 @@ test('schemas: um schema só para o manifesto (conteúdo e código), e os enums 
   // Um manifesto, um schema: squad-plugin.json traz conteúdo, código ou os dois.
   assert.deepEqual(Object.keys(SCHEMAS).sort(), ['agent', 'config', 'plugin']);
   assert.deepEqual(readdirSync(path.join(ROOT, 'schemas')).sort(), ['squad-agent.schema.json', 'squad-plugin.schema.json', 'squad.schema.json']);
-  assert.deepEqual(Object.keys(plugin.properties), ['$schema', 'id', 'name', 'version', 'description', 'apiVersion', 'server', 'requires', 'capabilities', 'env', 'configSchema', 'categories', 'avatars', 'themes', 'runtime', 'conventions']);
+  assert.deepEqual(Object.keys(plugin.properties), ['$schema', 'id', 'name', 'version', 'description', 'apiVersion', 'squadCode', 'server', 'requires', 'capabilities', 'env', 'configSchema', 'categories', 'avatars', 'themes', 'runtime', 'conventions']);
   assert.deepEqual(plugin.required, ['id']);
   assert.equal(plugin.properties.id.pattern, CONSTANTS.PLUGIN_ID_RE.source);
 
@@ -231,6 +231,65 @@ test('pasta do home: ~/.squad-code/plugins/<id>/ vale, pasta com nome diferente 
   assert.deepEqual(loaderFor({}).loader.load().discovery.plugins, []);
 });
 
+test('pasta .plugins do repositório: <root>/.plugins/<id>/ é fonte local (código só com enabled), SQUAD_PLUGINS_DIR troca ou desliga, dedupe por realpath', () => {
+  const root = scratch('squad-pl-repo-'), home = scratch('squad-pl-repohome-');
+  const dir = path.join(root, '.plugins');
+  mkdirSync(dir, { recursive: true }); writeFileSync(path.join(dir, '.gitkeep'), '');
+  cpSync(fx('content-only'), path.join(dir, 'content-only'), { recursive: true });
+  cpSync(fx('hello'), path.join(dir, 'hello'), { recursive: true });
+  cpSync(fx('route-echo'), path.join(dir, 'nome-errado'), { recursive: true });
+  // o mesmo plugin também pelo home (link para a mesma pasta): conta uma vez só
+  mkdirSync(path.join(home, '.squad-code', 'plugins'), { recursive: true });
+  symlinkSync(path.join(dir, 'content-only'), path.join(home, '.squad-code', 'plugins', 'content-only'), 'dir');
+  const r = loaderFor({ root, home }).loader.load();
+  assert.deepEqual(r.discovery.plugins.map(p => [p.id, p.source, p.local]), [['content-only', 'repo', true], ['hello', 'repo', true]]);
+  assert.match(warnText(r), /pasta "nome-errado" deve ter o nome do id "route-echo"/);
+  assert.equal(r.discovery.plugins.find(p => p.id === 'hello').status, undefined, 'código de .plugins não é bloqueado (fonte local)');
+  assert.deepEqual(r.page.plugins.map(p => p.id), ['content-only'], 'conteúdo sem opt-in; o código espera plugins.enabled');
+  const on = loaderFor({ root, home, local: { plugins: { enabled: ['hello'] } } }).loader.load();
+  assert.ok(on.discovery.plugins.find(p => p.id === 'hello').serverFile.endsWith('server.mjs'));
+  // SQUAD_PLUGINS_DIR: '' desliga a pasta do repositório; um caminho a substitui
+  assert.deepEqual(loaderFor({ root, env: { SQUAD_PLUGINS_DIR: '' } }).loader.load().discovery.plugins, []);
+  const other = scratch('squad-pl-repo2-');
+  cpSync(fx('content-only'), path.join(other, 'content-only'), { recursive: true });
+  assert.deepEqual(loaderFor({ root, env: { SQUAD_PLUGINS_DIR: other } }).loader.load().discovery.plugins.map(p => p.dir), [path.join(realpathSync(other), 'content-only')]);
+});
+
+test('semver mínimo de squadCode: ^, ~, >=, <, exato, parcial, *, || e AND por espaço', () => {
+  const yes = [['2.1.0', '^2.1.0'], ['2.9.3', '^2.1.0'], ['2.1.5', '~2.1.0'], ['2.1.0', '2.1.0'], ['2.1.0', '=2.1.0'], ['2.1.0', '>=2.0.0 <3.0.0'], ['2.1.0', '>= 2.1.0'],
+    ['2.1.0', '^1.0.0 || ^2.0.0'], ['2.1.0', '2'], ['2.1.7', '2.1'], ['2.1.0', '*'], ['0.2.5', '^0.2.0'], ['0.0.3', '^0.0.3'], ['2.1.0', '^2'], ['2.1.0', '~2'], ['2.1.0-beta.1', '^2.1.0'], ['2.1.0', '>2.0.9'], ['2.1.0', '<=2.1.0']];
+  const no = [['3.0.0', '^2.1.0'], ['2.0.9', '^2.1.0'], ['2.2.0', '~2.1.0'], ['2.1.1', '2.1.0'], ['3.0.0', '>=2.0.0 <3.0.0'], ['0.3.0', '^0.2.0'], ['0.0.4', '^0.0.3'], ['2.2.0', '2.1'], ['2.1.0', '<2.1.0'], ['2.1.0', '>2.1.0']];
+  for (const [v, r] of yes) assert.equal(satisfies(v, r), true, `${v} em ${r}`);
+  for (const [v, r] of no) assert.equal(satisfies(v, r), false, `${v} fora de ${r}`);
+  for (const bad of ['', 'abc', '^', '1 - 2', '2.x', '>=2 ||', '^2.1.0;rm', 123]) assert.equal(parseRange(bad), null, `faixa inválida: ${bad}`);
+  assert.match(APP_VERSION, /^\d+\.\d+\.\d+/);
+  assert.equal(SCHEMAS.plugin.properties.squadCode.pattern, CONSTANTS.SQUAD_CODE_RANGE_RE.source);
+});
+
+test('squadCode fora da faixa: status incompatible, nada carrega; faixa ilegível é invalid; ausente é aceito sem aviso', () => {
+  const home = scratch('squad-pl-compat-');
+  const dir = path.join(home, '.squad-code', 'plugins');
+  writeJson(path.join(dir, 'futuro', 'squad-plugin.json'), { id: 'futuro', squadCode: '>=99.0.0', categories: [{ key: 'fut', label: 'Futuro' }] });
+  writeJson(path.join(dir, 'atual', 'squad-plugin.json'), { id: 'atual', squadCode: `^${APP_VERSION.split('.')[0]}.0.0`, categories: [{ key: 'atu', label: 'Atual' }] });
+  writeJson(path.join(dir, 'livre', 'squad-plugin.json'), { id: 'livre', categories: [{ key: 'liv', label: 'Livre' }] });
+  writeJson(path.join(dir, 'torto', 'squad-plugin.json'), { id: 'torto', squadCode: '2.x' });
+  writeJson(path.join(dir, 'codigo', 'squad-plugin.json'), { id: 'codigo', squadCode: '<1.0.0', server: 'server.mjs' });
+  writeFileSync(path.join(dir, 'codigo', 'server.mjs'), 'export function register() {}');
+  const r = loaderFor({ home, local: { plugins: { enabled: ['codigo'] } } }).loader.load();
+  const by = Object.fromEntries(r.discovery.plugins.map(p => [p.id, p]));
+  assert.equal(by.futuro.status, 'incompatible');
+  assert.equal(by.futuro.error, `requer SQUAD/CODE >=99.0.0, este é ${APP_VERSION}`);
+  assert.equal(by.codigo.status, 'incompatible'); assert.equal(by.codigo.serverFile, '');
+  assert.equal(by.torto.status, 'invalid'); assert.match(by.torto.error, /squadCode "2.x" não é uma faixa/);
+  assert.equal(by.atual.status, undefined); assert.equal(by.livre.status, undefined);
+  assert.deepEqual(r.page.plugins.map(p => p.id).sort(), ['atual', 'livre']);
+  assert.deepEqual(by.livre.warnings, []); assert.deepEqual(by.atual.warnings, []);
+  // a versão do app vem do package.json; createPluginLoader({version}) troca nos testes
+  const old = createPluginLoader({ root: scratch('squad-pl-compat-root-'), home, cwd: home, env: { SQUAD_CONFIG: path.join(home, 'nada.json'), SQUAD_CONFIG_SHARED: path.join(home, 'nada2.json') }, version: '99.1.0' }).load();
+  assert.equal(old.discovery.plugins.find(p => p.id === 'futuro').status, undefined);
+  assert.equal(old.discovery.plugins.find(p => p.id === 'atual').status, 'incompatible');
+});
+
 test('o carregador relê plugins quando um arquivo muda; limite de 20 plugins', () => {
   const home = scratch('squad-pl-reload-');
   const dir = path.join(home, '.squad-code', 'plugins');
@@ -257,7 +316,7 @@ async function startBridge({ local = null, shared = null, env = {}, port = PORT0
   const tmp = scratch('squad-pl-btmp-');
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js'), '--port', String(port)], {
     cwd: ROOT,
-    env: { ...process.env, SQUAD_HOME: home, SQUAD_PROJECTS_DIR: scratch('squad-pl-bproj-'), SQUAD_DATA_DIR: data, TMPDIR: tmp, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_CODEX_BIN: path.join(ROOT, 'tests', 'fake-codex.mjs'), SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: localFile, SQUAD_CONFIG_SHARED: sharedFile, SQUAD_PLUGINS: '', ...env },
+    env: { ...process.env, SQUAD_HOME: home, SQUAD_PLUGINS_DIR: "", SQUAD_PROJECTS_DIR: scratch('squad-pl-bproj-'), SQUAD_DATA_DIR: data, TMPDIR: tmp, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_CODEX_BIN: path.join(ROOT, 'tests', 'fake-codex.mjs'), SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: localFile, SQUAD_CONFIG_SHARED: sharedFile, SQUAD_PLUGINS: '', ...env },
   });
   let out = '';
   const exited = new Promise(r => proc.once('exit', code => r(code)));
@@ -286,6 +345,76 @@ const rawRequest = (port, pathname, headers = {}) => new Promise((resolve, rejec
 });
 const byId = body => Object.fromEntries(body.plugins.map(p => [p.id, p]));
 
+/* ---------- scaffold: npm run plugin:new ---------- */
+const GIT_ENV = { GIT_AUTHOR_NAME: 'Teste', GIT_AUTHOR_EMAIL: 'teste@example.com', GIT_COMMITTER_NAME: 'Teste', GIT_COMMITTER_EMAIL: 'teste@example.com', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+const pluginNew = (args, env) => spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'plugin-new.mjs'), ...args], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, ...GIT_ENV, ...env } });
+
+test('plugin:new --code --dir: cria manifesto, agente, server.mjs, README e .gitignore, git init + commit, registra no squad.local.json; o loader e o bridge carregam sem avisos', async () => {
+  const t = scratch('squad-pl-new-'), dir = path.join(t, 'fora', 'demo-plug'), cfg = path.join(t, 'cfg', 'squad.local.json'), home = scratch('squad-pl-newhome-');
+  const env = { SQUAD_CONFIG: cfg, SQUAD_HOME: home, SQUAD_PLUGINS_DIR: path.join(t, 'repo-plugins') };
+  const r = pluginNew(['demo-plug', '--name', 'Demo Plug', '--code', '--dir', dir], env);
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.match(r.stdout, /Plugin "demo-plug" criado/); assert.match(r.stdout, /reinicie o bridge/);
+  const files = p => readdirSync(p, { recursive: true }).filter(f => !f.startsWith('.git' + path.sep) && f !== '.git').sort();
+  assert.deepEqual(files(dir), ['.gitignore', 'README.md', 'agents', path.join('agents', '01-DEMO-PLUG-01.md'), 'server.mjs', 'squad-plugin.json']);
+  const man = JSON.parse(readFileSync(path.join(dir, 'squad-plugin.json'), 'utf8'));
+  const [maj, min] = require('../package.json').version.split('.');
+  assert.deepEqual(man, { id: 'demo-plug', name: 'Demo Plug', version: '0.1.0', description: 'Plugin Demo Plug do SQUAD/CODE.', squadCode: `^${maj}.${min}.0`, apiVersion: 1, server: 'server.mjs', capabilities: [], categories: [{ key: 'demo-plug', label: 'Demo Plug' }] }, 'fora do clone: sem $schema');
+  assert.deepEqual(validate(SCHEMAS.plugin, man), []);
+  assert.match(readFileSync(path.join(dir, 'server.mjs'), 'utf8'), /export function register\(ctx\)[\s\S]*registerRoute\('GET', '\/ping'[\s\S]*ctx\.on\('run:finish'/);
+  if (spawnSync('git', ['--version']).status === 0) {
+    const log = spawnSync('git', ['-C', dir, 'log', '--oneline'], { encoding: 'utf8' });
+    assert.match(log.stdout, /Demo Plug: estrutura inicial/);
+    assert.equal(spawnSync('git', ['-C', dir, 'status', '--porcelain'], { encoding: 'utf8' }).stdout, '');
+  }
+  const conf = JSON.parse(readFileSync(cfg, 'utf8'));
+  assert.deepEqual(conf.plugins, { paths: [dir], enabled: ['demo-plug'] });
+  assert.equal(conf.$schema, path.join(ROOT, 'schemas', 'squad.schema.json'));
+  assert.equal(existsSync(cfg + '.bak'), false, 'arquivo novo: sem .bak');
+
+  // o loader acha o plugin gerado, sem avisos, e o conteúdo entra (enabled)
+  const loaded = createPluginLoader({ root: t, home, cwd: t, env: { SQUAD_CONFIG: cfg, SQUAD_CONFIG_SHARED: path.join(t, 'nada.json'), SQUAD_PLUGINS_DIR: '' } }).load();
+  assert.deepEqual(loaded.page.warnings, []);
+  const p = loaded.discovery.plugins.find(x => x.id === 'demo-plug');
+  assert.equal(p.status, undefined); assert.deepEqual(p.warnings, []);
+  assert.deepEqual(loaded.page.plugins[0].presets.map(x => [x.name, x.slot, x.role, x.category]), [['DEMO-PLUG-01', 'operator', 'backend', 'demo-plug']]);
+  // e o bridge o carrega como active, com a rota /ping
+  const b = await startBridge({ home, local: conf });
+  const listed = byId(await b.json('/api/plugins'))['demo-plug'];
+  assert.deepEqual([listed.status, listed.routes, listed.events, listed.warnings], ['active', ['GET /api/plugins/demo-plug/ping'], ['run:finish'], []]);
+  assert.deepEqual(await b.json('/api/plugins/demo-plug/ping'), { ok: true, plugin: 'demo-plug' });
+
+  // segunda vez: a pasta existe, recusa; id inválido também
+  const again = pluginNew(['demo-plug', '--dir', dir], env);
+  assert.equal(again.status, 1); assert.match(again.stderr, /já existe/);
+  const bad = pluginNew(['Demo_Plug'], env);
+  assert.equal(bad.status, 1); assert.match(bad.stderr, /id inválido/);
+});
+
+test('plugin:new só conteúdo na pasta .plugins: sem registro no squad.local.json; com --code acrescenta enabled preservando o arquivo (.bak)', () => {
+  const t = scratch('squad-pl-new2-'), repo = path.join(t, '.plugins'), cfg = path.join(t, 'squad.local.json'), home = scratch('squad-pl-new2home-');
+  const env = { SQUAD_CONFIG: cfg, SQUAD_HOME: home, SQUAD_PLUGINS_DIR: repo };
+  const r = pluginNew(['so-conteudo', '--no-git'], env);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(existsSync(path.join(repo, 'so-conteudo', 'agents', '01-SO-CONTEUDO-01.md')));
+  assert.equal(existsSync(path.join(repo, 'so-conteudo', '.git')), false);
+  assert.equal(existsSync(cfg), false, 'nada a registrar: o arquivo não é criado');
+  const loaded = createPluginLoader({ root: t, home, cwd: t, env: { SQUAD_CONFIG_SHARED: path.join(t, 'nada.json'), SQUAD_PLUGINS_DIR: repo } }).load(); // root/squad.local.json = cfg (ausente, sem aviso)
+  assert.deepEqual(loaded.page.warnings, []);
+  assert.deepEqual(loaded.discovery.plugins.map(p => [p.id, p.source, p.status]), [['so-conteudo', 'repo', undefined]]);
+  // arquivo existente: preserva o resto, guarda .bak; --no-content não gera agents/
+  writeJson(cfg, { runtime: { timeoutSec: 60 }, plugins: { enabled: ['outro'] } });
+  const c = pluginNew(['com-codigo', '--code', '--no-content', '--no-git'], env);
+  assert.equal(c.status, 0, c.stderr);
+  assert.deepEqual(JSON.parse(readFileSync(cfg, 'utf8')), { runtime: { timeoutSec: 60 }, plugins: { enabled: ['outro', 'com-codigo'] } });
+  assert.deepEqual(JSON.parse(readFileSync(cfg + '.bak', 'utf8')), { runtime: { timeoutSec: 60 }, plugins: { enabled: ['outro'] } });
+  assert.equal(existsSync(path.join(repo, 'com-codigo', 'agents')), false);
+  assert.ok(existsSync(path.join(repo, 'com-codigo', 'server.mjs')));
+  // dentro de .plugins a pasta precisa ter o nome do id
+  const wrong = pluginNew(['outro-id', '--dir', path.join(repo, 'nome-diferente')], env);
+  assert.equal(wrong.status, 1); assert.match(wrong.stderr, /precisa ter o nome do id/);
+});
+
 test('zero plugins: /api/plugins vazio, health com plugins 0, linha "Plugins: nenhum" e rotas de plugin caem no 404 do núcleo', async () => {
   const b = await startBridge();
   assert.equal((await fetch(b.base + '/api/plugins')).status, 401);
@@ -299,6 +428,19 @@ test('zero plugins: /api/plugins vazio, health com plugins 0, linha "Plugins: ne
   assert.deepEqual(await miss.json(), { ok: false, error: 'Rota não encontrada.' });
   // o núcleo segue igual
   assert.deepEqual(await b.json('/api/runs'), { ok: true, runs: [] });
+});
+
+test('plugin incompatível (squadCode): /api/plugins com status incompatible, a página o lista em others, sem conteúdo; log diz incompatível', async () => {
+  const home = scratch('squad-pl-bcompat-');
+  writeJson(path.join(home, '.squad-code', 'plugins', 'futuro', 'squad-plugin.json'), { id: 'futuro', version: '1.0.0', squadCode: '>=99.0.0', categories: [{ key: 'fut', label: 'Futuro' }] });
+  const b = await startBridge({ home, local: { plugins: { paths: [fx('content-only')] } } });
+  const p = byId(await b.json('/api/plugins')).futuro;
+  assert.deepEqual([p.status, p.source, p.categories], ['incompatible', 'home', []]);
+  assert.match(p.error, /^requer SQUAD\/CODE >=99\.0\.0, este é \d+\.\d+\.\d+/);
+  const tag = JSON.parse((await (await fetch(b.base + '/')).text()).match(/id="squad-plugins">([\s\S]*?)<\/script>/)[1]);
+  assert.deepEqual(tag.plugins.map(x => x.id), ['content-only']);
+  assert.deepEqual(tag.others.map(o => [o.id, o.version, o.status, o.hasCode]), [['futuro', '1.0.0', 'incompatible', false]]);
+  await waitFor(() => /futuro 1\.0\.0 \(incompatível: requer SQUAD\/CODE/.test(b.out()));
 });
 
 test('plugin só de conteúdo: aparece em /api/plugins (status data, com o resumo do conteúdo) e na página, sem exigir enabled', async () => {
@@ -764,7 +906,7 @@ test('/api/health e serveIndex esperam plugins.ready (plugin lento)', async () =
 });
 
 test('zero plugins: o host não fica pending, ready já resolvido, load() não muda nada', async () => {
-  const { createPluginHost } = require('../plugin-host.js');
+  const { createPluginHost } = require('../plugins/host.js');
   const host = createPluginHost({ getDiscovery: () => ({ plugins: [], config: { enabled: [], entries: {} }, warnings: [] }), dataRoot: '/nonexistent', http: {}, maxBody: 1 });
   assert.equal(host.pending, false); assert.equal(host.closing, false);
   const ready = host.ready;

@@ -35,6 +35,15 @@ process.stdin.on('end', () => {
     // Same framing as Claude Code 2.1.x for a foreground subagent's hand-back.
     emit({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'call-1', content: [{ type: 'text', text: '[Subagent hand-back] The text below is the final report of a subagent. The report follows:\n  Contrato confirmado.\nagentId: fake-agent (use SendMessage to continue this agent)\n<usage>subagent_tokens: 10</usage>' }] }] } });
   }
+  // LIMITE: the session limit arrives mid-run (rate_limit_event rejected at 106%, Claude Code's synthetic message, exit 1).
+  if (input.includes('LIMITE')) {
+    const resets = Math.floor(Date.now() / 1000) + 3600;
+    emit({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'README.md' } }] } });
+    emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour', resetsAt: resets, unifiedWindows: { five_hour: { utilization: 1.06, resetsAt: resets } } } });
+    emit({ type: 'assistant', message: { content: [{ type: 'text', text: "You've hit your session limit · resets 3pm" }] } });
+    emit({ type: 'result', subtype: 'success', is_error: true, result: "You've hit your session limit · resets 3pm", session_id: 'fake-session' });
+    process.exit(1);
+  }
   if (input.includes('SLEEP')) { setTimeout(() => {}, 60_000); return; }
   if (input.includes('FAIL')) { process.stderr.write('fake failure\n'); emit({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'fake failure', session_id: 'fake-session' }); process.exit(1); }
   emit({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'README.md' } }] } });

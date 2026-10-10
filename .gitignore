@@ -29,3 +29,8 @@ data/
 
 # Configuração local dos Plugins (docs/plans/plugins-conteudo.md)
 squad.local.json
+
+# Plugins clonados na pasta do app (.plugins/<id>/): só o README e o .gitkeep entram no repositório
+.plugins/*
+!.plugins/README.md
+!.plugins/.gitkeep

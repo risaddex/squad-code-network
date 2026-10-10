@@ -21,6 +21,6 @@ validação com o `schema.js` do projeto.
 - Plugins com código só são ativados pela configuração **local** (`squad.local.json`); o `squad.config.json` versionado não pode
   fazer o bridge executar código de ninguém.
 - O `ctx` é um contrato público com `apiVersion`; só cresce de forma aditiva.
-- Há um só tipo de Plugin, uma só descoberta e um só `GET /api/plugins` para conteúdo e código (`plugins.js` descobre e lê o
-  conteúdo, `plugin-host.js` carrega o código).
+- Há um só tipo de Plugin, uma só descoberta e um só `GET /api/plugins` para conteúdo e código (`plugins/loader.js` descobre e lê o
+  conteúdo, `plugins/host.js` carrega o código).
 - Sem plugins com código, o comportamento do bridge (rotas, execuções, eventos) é o mesmo de antes.

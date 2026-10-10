@@ -14,7 +14,7 @@ import Database from 'better-sqlite3';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { createRegistry, validateAdapter } = require('../adapters/index.js');
-const { CONSTANTS } = require('../plugins.js');
+const { CONSTANTS } = require('../plugins/loader.js');
 const dbModule = require('../db.js');
 
 delete process.env.CODEX_HOME; // the tests set their own account folders
@@ -38,7 +38,7 @@ const fakeAdapter = (kind, over = {}) => ({
 });
 
 /* ---------- registry ---------- */
-test('registry: built-ins are claude and codex, in that order, and builtinKinds() matches the constants of plugins.js and db.js', () => {
+test('registry: built-ins are claude and codex, in that order, and builtinKinds() matches the constants of plugins/loader.js and db.js', () => {
   const reg = createRegistry(hostFor());
   assert.deepEqual(reg.builtinKinds(), CONSTANTS.ADAPTERS);
   assert.deepEqual(reg.builtinKinds(), dbModule.ADAPTERS);
@@ -447,7 +447,7 @@ const bridges = [];
 async function startBridge(dataDir, port, tmpRoot = scratch('squad-ad-btmp-')) {
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js'), '--port', String(port)], {
     cwd: ROOT,
-    env: { ...process.env, SQUAD_HOME: scratch('squad-ad-bhome-'), SQUAD_PROJECTS_DIR: scratch('squad-ad-proj-'), SQUAD_DATA_DIR: dataDir, TMPDIR: tmpRoot, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_CODEX_BIN: path.join(ROOT, 'tests', 'fake-codex.mjs'), SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: path.join(scratch('squad-ad-cfg-'), 'none.json'), SQUAD_CONFIG_SHARED: path.join(scratch('squad-ad-cfg2-'), 'none.json'), SQUAD_PLUGINS: '' },
+    env: { ...process.env, SQUAD_HOME: scratch('squad-ad-bhome-'), SQUAD_PLUGINS_DIR: "", SQUAD_PROJECTS_DIR: scratch('squad-ad-proj-'), SQUAD_DATA_DIR: dataDir, TMPDIR: tmpRoot, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_CODEX_BIN: path.join(ROOT, 'tests', 'fake-codex.mjs'), SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: path.join(scratch('squad-ad-cfg-'), 'none.json'), SQUAD_CONFIG_SHARED: path.join(scratch('squad-ad-cfg2-'), 'none.json'), SQUAD_PLUGINS: '' },
   });
   let out = '';
   const token = await new Promise((resolve, reject) => {

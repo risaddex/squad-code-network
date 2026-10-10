@@ -252,20 +252,15 @@ A lista completa está no [guia](docs/GUIA.md#-controles).
 | `SQUAD_CONFIG` | `./squad.local.json` | Arquivo de configuração local usado no lugar do `squad.local.json` |
 | `SQUAD_CONFIG_SHARED` | `./squad.config.json` | Arquivo usado no lugar do `squad.config.json` (testes) |
 | `SQUAD_PLUGINS` | (vazio) | Pastas de plugins extras, separadas por `:` (`;` no Windows) |
+| `SQUAD_PLUGINS_DIR` | `./.plugins` | Pasta dos plugins do clone (vazio desliga; usado nos testes) |
 | `SQUAD_CODEX_BIN` | `codex` | Executável do Codex usado pelos Perfis Codex sem executável próprio |
-| `SQUAD_PLUGIN_REGISTER_TIMEOUT_MS` | `10000` | Limite do `register(ctx)` de cada plugin com código (testes) |
-| `SQUAD_PLUGIN_LOAD_BUDGET_MS` | `30000` | Tempo total de carga do código de todos os plugins (testes) |
-| `SQUAD_PLUGIN_HOOK_TIMEOUT_MS` | `3000` | Limite de cada handler de evento e de `run:beforeSpawn`; sobrepõe `plugins.hookTimeoutMs` (testes) |
-| `SQUAD_PLUGIN_BEFORESPAWN_BUDGET_MS` | `5000` | Orçamento total dos handlers de `run:beforeSpawn` de uma execução (testes) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | (vazio) | Destino OTLP/HTTP dos traces quando Configurações > Telemetria não define um |
 
 **Perfis.** Cada agente roda num Perfil: uma instância de um Adapter (`claude` ou `codex`) com executável, pasta da conta
 (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), modelo, esforço, teto de execuções e Perfil reserva. Os Perfis ficam no `squad.db`
 (fora do workspace e dos backups). Na criação do banco nasce "Claude (padrão)" e, se o `codex` estiver no `PATH`,
-"Codex (padrão)". Execuções Codex usam `codex exec --json` (prompt pelo stdin, sandbox `read-only` ou `workspace-write`
-conforme as ferramentas do agente, nunca `danger-full-access`); os Chamados entre colegas passam pelo MCP local do bridge
-(`/mcp`, token próprio por execução). Segredos de telemetria nunca são gravados: informe só o nome da variável de ambiente
-que guarda o valor do header.
+"Codex (padrão)". Segredos de telemetria nunca são gravados: informe só o nome da variável de ambiente que guarda o valor do
+header. Detalhes dos motores: [`adapters/README.md`](adapters/README.md).
 
 Exemplos:
 
@@ -333,126 +328,37 @@ de `data/backups/` para o banco e move os arquivos para `data/legacy-json/`.
 Aberto como arquivo (`index.html`, modo demo), o workspace fica só no navegador. Use **Exportar workspace** nas
 configurações para fazer backup em JSON e **Importar workspace** para restaurar.
 
-### Plugins e configuração local
+### Plugins, Adapters e configuração local
 
-Agentes, souls, diretrizes, avatares, temas e defaults de execução próprios (de uma empresa ou de gosto pessoal) vêm
-de **plugins**: pastas fora deste repositório que o bridge lê ao servir a página. Para apontar um plugin, crie
-`squad.local.json` na raiz do SQUAD/CODE (fora do git; `squad.config.json`, versionável, segue o mesmo formato e perde
-para o local):
+Agentes, souls, diretrizes, avatares, temas e padrões de execução próprios (de uma empresa ou de gosto pessoal), rotas,
+observadores de execução e motores novos entram por **plugins**, nunca pelo código do app. Neste clone, um plugin fica em
+`.plugins/<id>/` e é achado sozinho:
+
+```sh
+git clone <url-do-plugin> .plugins/<id>     # instalar (recarregue a página)
+npm run plugin:new -- <id> [--code]         # criar um plugin novo a partir do esqueleto
+```
+
+Plugins em outras pastas, código do bridge (`"enabled"` + `grants`), Perfis declarados em arquivo e padrões de execução vão no
+`squad.local.json` (na raiz, fora do git; `squad.config.json`, versionável, segue o mesmo formato, perde para o local e nunca liga
+código):
 
 ```json
 {
   "$schema": "./schemas/squad.schema.json",
-  "plugins": {
-    "paths": ["../meus-plugins/acme", "~/squad-plugins/pessoal"],
-    "disabled": []
-  },
-  "runtime": { "model": "sonnet", "concurrency": 3 }
-}
-```
-
-Caminhos relativos valem a partir da pasta do arquivo. Um plugin é uma pasta com:
-
-```text
-acme/
-├── squad-plugin.json   # id, name, version, categories, avatars, themes, runtime, conventions (e server, se tiver código)
-├── agents/*.md         # um agente por arquivo: frontmatter (name, slot, role, ...) + instruções
-├── avatars/*.png       # png, jpg ou webp (sem SVG), até 1 MB cada
-└── conventions.json    # diretrizes extras (opcional)
-```
-
-Os mesmos arquivos podem declarar **Perfis** (mesmos campos da aba Configurações > Perfis, mais uma `key`) e o Perfil
-padrão. Segredos nunca entram aqui: só nomes de variáveis de ambiente.
-
-```json
-{
-  "profiles": [
-    { "key": "trabalho", "name": "Claude trabalho", "adapter": "claude", "configDir": "~/.claude-work", "model": "sonnet", "effort": "high" },
-    { "key": "codex", "name": "Codex pessoal", "adapter": "codex", "configDir": "~/.codex", "fallbackId": "" }
-  ],
+  "plugins": { "paths": ["../meus-plugins/acme"], "enabled": ["acme"] },
+  "runtime": { "model": "sonnet", "concurrency": 3 },
+  "profiles": [{ "key": "trabalho", "name": "Claude trabalho", "adapter": "claude", "configDir": "~/.claude-work" }],
   "defaultProfile": "trabalho"
 }
 ```
 
-Eles viram os Perfis `cfg-<key>` no banco; entre `squad.config.json` e `squad.local.json` a mescla é por `key`, campo a
-campo, e Perfil que sai do arquivo sai do banco. Editar, Tornar padrão e Excluir na aba Perfis gravam de volta no arquivo
-(só os campos alterados, com cópia `.bak`). Um item com formato inválido não trava os outros: ele fica como estava e o aviso
-aparece no card. O `$schema` aponta para `schemas/squad.schema.json` (o manifesto do plugin tem `schemas/squad-plugin.schema.json`
-e o frontmatter dos agentes, `schemas/squad-agent.schema.json`), e o editor passa a validar e completar os campos.
+- Guia dos plugins (manifesto, conteúdo x código, compatibilidade `squadCode`, capacidades, `ctx`, eventos, segurança, status,
+  scaffold): [`plugins/README.md`](plugins/README.md). Instalação no clone: [`.plugins/README.md`](.plugins/README.md).
+- Motores (interface do Adapter, registro, como adicionar um, testes golden): [`adapters/README.md`](adapters/README.md).
+- Perfis da configuração (mescla por `key`, gravação de volta no arquivo): [docs/plans/plugins-conteudo.md](docs/plans/plugins-conteudo.md).
 
-Depois de editar o conteúdo de um plugin, basta recarregar a página. Os plugins carregados e os avisos (arquivo recusado,
-valor inválido) aparecem no log do bridge, em Configurações > Plugins e em `GET /api/plugins`. Formato completo e regras:
-[docs/plans/plugins-conteudo.md](docs/plans/plugins-conteudo.md).
-
-### Plugins com código
-
-O mesmo `squad-plugin.json` pode trazer, além do conteúdo (ou no lugar dele), código do bridge: um `server.mjs` que exporta
-`register(ctx)`. Com ele um plugin estende o bridge sem alterar o núcleo: rotas próprias em `/api/plugins/<id>/`,
-observadores dos eventos de execução (`run:start`, `run:event`, `run:finish`, `profile:usage`, `workspace:saved`), veto antes
-de uma execução começar (`run:beforeSpawn`) e Adapters novos ou substitutos dos embutidos (`claude`, `codex`).
-
-> **Aviso:** o código de um plugin roda **no processo do bridge, com as permissões da sua conta**. Não é sandbox: um plugin
-> pode ler e gravar arquivos e executar comandos como você. `capabilities` (pedidas pelo manifesto) e `grants` (concedidas por
-> você) são consentimento auditável, não contenção. Instale só código em que você confia.
-
-Só a configuração **local** (`squad.local.json`, ou o arquivo de `SQUAD_CONFIG`) ativa código: um plugin com `server` achado só
-pelo `squad.config.json` fica bloqueado, com aviso. A pasta do plugin vem de `plugins.paths` (relativos ao arquivo que os
-declara), de `SQUAD_PLUGINS` ou de `~/.squad-code/plugins/<id>/` (a pasta leva o nome do id). Depois, em `plugins`:
-
-- `enabled`: ids dos plugins com código que podem rodar (um plugin só de conteúdo não precisa estar aqui); o conteúdo de um
-  plugin com código só entra no catálogo quando o código carregou;
-- `entries.<id>.grants`: capacidades concedidas; sem elas o plugin fica `denied`;
-- `entries.<id>.settings`: valores validados pelo `configSchema` do manifesto (o aviso de erro cita o campo, nunca o valor);
-  segredos entram como nomes de variáveis declaradas em `env`, nunca como valor;
-- `entries.<id>.failClosed`: `true` faz uma falha de `run:beforeSpawn` bloquear a execução (padrão: a execução segue);
-- `hookTimeoutMs`: limite de cada handler de evento (padrão 3000 ms).
-
-```json
-{
-  "plugins": {
-    "paths": ["../meus-plugins/meu-plugin"],
-    "enabled": ["meu-plugin"],
-    "entries": { "meu-plugin": { "grants": [], "settings": {} } }
-  }
-}
-```
-
-| Capacidade | Libera |
-|---|---|
-| `run.mutate` | `ctx.on('run:beforeSpawn', fn)`: vetar uma execução (`{ block: 'motivo' }`, resposta 403) ou acrescentar texto ao system prompt (`{ appendSystem }`) |
-| `run.content` | Prompt e system prompt em `run:start` e `run:beforeSpawn`; o stream completo em `run:event` (e `{ partial: true }` para os `stream_event`); texto de erro e `sessionId` em `run:finish`. Sem ela, o plugin recebe só metadados |
-| `adapter` | `ctx.registerAdapter(kind, impl)`: um motor novo, que roda com ambiente mínimo e sem telemetria nativa |
-| `adapter.override` | Substituir `claude` ou `codex` embutidos (exige também `adapter`) |
-| `workspace.read` | Reservada: pode ser pedida e concedida, mas nenhuma API a entrega ainda |
-
-Exemplo mínimo. `squad-plugin.json`:
-
-```json
-{
-  "id": "meu-plugin",
-  "name": "Meu plugin",
-  "version": "1.0.0",
-  "apiVersion": 1,
-  "server": "server.mjs"
-}
-```
-
-`server.mjs`:
-
-```js
-export function register(ctx) {
-  let ultimo = null;
-  ctx.on('run:finish', run => { ultimo = { status: run.status, costUsd: run.costUsd }; });
-  ctx.registerRoute('GET', '/ultimo', () => ({ ultimo }));
-}
-```
-
-Com isso, `GET /api/plugins/meu-plugin/ultimo` responde com a última execução (com o token do bridge, como as demais
-chamadas `/api`). `GET /api/plugins` lista todos os plugins, com o resumo do conteúdo, `hasCode` e o `status` (`active`,
-`data`, `disabled`, `error`, `denied`, `invalid`, `blocked`), as capacidades pedidas, concedidas e faltantes, as rotas, os
-eventos, os Adapters e os avisos. O conteúdo é relido a cada página; mudanças no código exigem reiniciar o bridge
-(`restartRequired` avisa). Detalhes e decisões: [docs/plans/plugins.md](docs/plans/plugins.md) e
-[ADR 0004](docs/adr/0004-plugins-nao-alteram-o-nucleo.md).
+> O código de um plugin roda no processo do bridge, com as permissões da sua conta. Instale só código em que você confia.
 
 ---
 
@@ -466,6 +372,7 @@ eventos, os Adapters e os avisos. O conteúdo é relido a cada página; mudança
 | `npm start` | Só o bridge (`node server.js`) |
 | `python build.py` | Build completo: regenera `src/avatars.js` (precisa de Pillow) e `index.html`. No macOS/Linux use `python3` |
 | `python build.py --copy` | O mesmo, e também grava uma cópia em `../squad-code-network.html` (fora da pasta do projeto) |
+| `npm run plugin:new -- <id>` | Cria um plugin em `.plugins/<id>/` (veja [`plugins/README.md`](plugins/README.md#criar-um-plugin)) |
 | `npm test` | Testes do bridge, dos adapters e dos plugins (`node --test` sobre `tests/bridge.test.mjs`, `tests/adapters.test.mjs` e `tests/plugins.test.mjs`, em sequência), com Claude e Codex falsos: sem custo de API |
 | `node --test --test-name-pattern "<nome>" tests/bridge.test.mjs` | Roda um único teste do bridge |
 | `node --check src/app.js` | Verificação rápida de sintaxe depois de editar |
@@ -490,9 +397,9 @@ squad-code-network/
 ├── index.html          # app completo, gerado pelo build (não editar)
 ├── server.js           # bridge local: serve o app e executa claude -p
 ├── db.js               # banco SQLite (workspace, versões, sala, conversas, execuções)
-├── plugins.js          # configuração local, descoberta dos plugins e carregador do conteúdo
-├── plugin-host.js      # código dos plugins: carga, ctx, rotas, eventos e Adapters de plugin
-├── adapters/           # registro dos adapters (claude, codex) e funções de cada motor
+├── plugins/            # loader.js (configuração, descoberta, conteúdo) e host.js (código dos plugins); README.md
+├── adapters/           # registro dos Adapters (claude, codex) e funções de cada motor; README.md
+├── .plugins/           # plugins instalados neste clone (só o README.md e o .gitkeep entram no git)
 ├── schemas/            # JSON Schema da configuração, do manifesto dos plugins e dos agentes
 ├── package.json        # scripts npm e a dependência better-sqlite3
 ├── build.py            # build completo (avatares + index.html)
@@ -509,7 +416,8 @@ squad-code-network/
 ├── scripts/            # dev runner, geração de avatares e vendor do Three.js
 ├── assets/             # imagens fonte dos avatares
 ├── tests/              # testes do bridge (Claude falso) e de interface
-├── docs/GUIA.md        # guia completo das funcionalidades
+├── docs/               # GUIA.md, planos com decisões e desvios (plans/), ADRs (adr/)
+├── CLAUDE.md           # instruções para agentes de código (AGENTS.md é um link para ele)
 └── projects/           # pastas de trabalho dos agentes (criada ao iniciar, fora do git)
 ```
 
@@ -556,6 +464,10 @@ O [**Guia completo**](docs/GUIA.md) detalha todas as funcionalidades:
 - [Projetos, features, documentação e exportação para o Claude Code](docs/GUIA.md#-projetos-e-features)
 - [Mapa da squad: cidade hexagonal e escritório](docs/GUIA.md#️-tela-squad-cidade-hexagonal)
 - [Controles e atalhos](docs/GUIA.md#-controles)
+
+Para quem estende ou mexe no código: [`plugins/README.md`](plugins/README.md), [`adapters/README.md`](adapters/README.md),
+os planos com decisões e desvios em [`docs/plans/`](docs/plans/), as ADRs em [`docs/adr/`](docs/adr/) e o glossário em
+[`CONTEXT.md`](CONTEXT.md).
 
 Links úteis do Claude Code: [instalação](https://code.claude.com/docs/pt/setup) ·
 [início rápido](https://code.claude.com/docs/pt/quickstart) ·

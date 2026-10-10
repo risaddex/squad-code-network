@@ -12,8 +12,9 @@ Code (`claude -p`). The bridge keeps the app's data in a local SQLite database (
 
 ```sh
 npm install                 # better-sqlite3 (prebuilt binary; Node >= 22)
-npm run dev                 # build index.html from src/, start the bridge, rebuild on src/ changes, restart on server.js / db.js / plugins.js / plugin-host.js / schema.js / schemas/ / adapters/ changes
+npm run dev                 # build index.html from src/, start the bridge, rebuild on src/ changes, restart on server.js / db.js / schema.js / schemas/ / adapters/ / plugins/ changes
 npm start                   # node server.js → http://127.0.0.1:4317 (--port N or SQUAD_PORT; SQUAD_CLAUDE_BIN for another claude; SQUAD_PROJECTS_DIR for another projects root; SQUAD_DATA_DIR for another database folder; SQUAD_CONFIG / SQUAD_PLUGINS for plugins)
+npm run plugin:new -- <id> [--code] [--no-content] [--no-git] [--dir <folder>]   # plugin scaffold in .plugins/<id>/ (plugins/README.md)
 python build.py [--copy]    # full build: regenerates src/avatars.js (needs Pillow), writes index.html (--copy: also ../squad-code-network.html)
 npm test                    # bridge, adapter and plugin tests: node --test --test-concurrency=1 tests/bridge.test.mjs tests/adapters.test.mjs tests/plugins.test.mjs (fake engines, no API cost; never `tests/`, which would run the fakes)
 node --test --test-name-pattern "<test name>" tests/bridge.test.mjs   # single test (or tests/adapters.test.mjs / tests/plugins.test.mjs)
@@ -98,28 +99,32 @@ to a temp file passed as `--agents <file>`, and `forwardSubagents:true` adds `--
 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, so an `Agent` tool call runs in the foreground and its tool_result is the colleague's
 report (framed as "[Subagent hand-back] ... The report follows:" with indented lines; `subagentReport` unwraps it).
 
-**Plugins and local config (`plugins.js`, contract in `docs/plans/plugins-conteudo.md`).** Company- or taste-specific catalog content
-(agents, categories, souls, DIRETRIZES, avatars, map themes, runtime defaults) never goes in `src/`: it comes from **plugins**,
-folders outside the repo listed in `"plugins": {"paths", "disabled"}` of `squad.config.json` (shareable, optional) and `squad.local.json` (git-ignored; local wins;
-`SQUAD_CONFIG` replaces the local file, `SQUAD_PLUGINS` adds folders). `createPluginLoader` reads `squad-plugin.json`, `agents/*.md`
-(strict YAML-subset frontmatter, body = the preset's `style`, alphabetical file order = catalog order), `avatars/*` (signature
-checked, data URLs, no SVG), `conventions.json` and themes, inside the plugin's realpath, with size/count limits that mirror
-`pluginLimits()` in the app (an item over a limit is refused with a warning, never cut). Cached by mtime, re-read on every
-`serveIndex`, injected as `#squad-plugins` (content of active plugins only); `GET /api/plugins` (every plugin: content summary
-without image data, `hasCode`, `status` and the state of its code, plus `config` and `restartRequired`), `plugins` in `/api/health`.
-The same `squad-plugin.json` may also carry code (`server`), see "Plugins and adapter registry" below. In `app.js`,
-`readPlugins`/`mergePluginCatalog` (souls, avatars, `TEMPLATE_AVATARS`, DIRETRIZES without overwriting, `Object.hasOwn` on every
-plugin key) run before the seed, `pluginRuntime` feeds `DEFAULT_RUNTIME` (existing workspaces only get keys they lack), and
-`mergePluginPresets` runs right before `AGENT_PRESETS.op` (name clashes, unknown roles and slot/role mismatches are skipped with a
-warning). Themes: `settings.theme` (`'<plugin>/<key>'`, `''` = default); `city.js` builds the scene before `app.js` finishes, so it
-calls the hoisted `squadThemeBoot()`, which resolves the theme with `bootChoice()` (the same workspace decision the boot uses)
-and sets CSS variables + `window.SQUAD_THEME`; `setTheme` reloads only once the change is persisted. Configurações > Plugins
-lists plugins, warnings and the theme picker. Without the tag (demo, upstream) the app behaves exactly as without plugins.
+**Plugins (`plugins/loader.js` + `plugins/host.js`; guide in `plugins/README.md`, decisions in `docs/plans/plugins-conteudo.md` /
+`docs/plans/plugins.md`, ADR 0004).** Company- or taste-specific content and code never go in `src/`, `server.js` or `adapters/`:
+they come from plugins (one folder, one `squad-plugin.json`, content, `server` code or both). Rule: core changes go through
+extension points. Discovery (`load()`): `plugins.paths` of `squad.config.json` (shared) and `squad.local.json` (local; `SQUAD_CONFIG`
+replaces it), `SQUAD_PLUGINS`, `<repo>/.plugins/<id>/` (`SQUAD_PLUGINS_DIR` replaces it, `''` turns it off) and
+`~/.squad-code/plugins/<id>/`; local sources first, dedupe by realpath, at most 20. **Only local sources run code**: a `server` found
+only through `squad.config.json` is `blocked`; code needs the id in `plugins.enabled` and `plugins.entries.<id>.grants` covering the
+manifest's `capabilities` (else `denied`); `enabled`/`entries`/`hookTimeoutMs` and a code plugin's `disabled` only count from the
+local file; shared `runtime.permissionMode`/`addDirs`/`extraAllowedTools` are ignored. A code plugin's content reaches the page
+only while its code is `active` (`selectContent`). Manifest `squadCode` (semver range vs `package.json` version, `satisfies` in the
+loader) out of range → status `incompatible`, nothing loads; absent = accepted silently; `apiVersion` is the separate `ctx`
+contract. A new manifest field needs `MANIFEST_RE`, `schemas/squad-plugin.schema.json` and the schema-keys test. Content is reread
+on every `serveIndex` (mtime cache) and injected as `#squad-plugins` `{plugins, runtime, warnings, others}` (`others` = found but not
+loaded, with status, listed in Configurações > Plugins); code loads once inside the `listen` callback (`pluginHost.ready`), so
+code changes need a bridge restart (`restartRequired`). In `app.js`, `readPlugins`/`mergePluginCatalog` run before the seed,
+`mergePluginPresets` right before `AGENT_PRESETS.op`, and `city.js` calls the hoisted `squadThemeBoot()`; without the tag (demo)
+the app behaves as without plugins. Scaffold: `npm run plugin:new -- <id> [--code]` (`scripts/plugin-new.mjs`; writes only
+`squad.local.json`). Tests: `tests/plugins.test.mjs` with `tests/fixtures/plugins/*`, ports 4700-4714; every bridge/loader test
+isolates `SQUAD_CONFIG`, `SQUAD_CONFIG_SHARED`, `SQUAD_HOME` and `SQUAD_PLUGINS_DIR` (never the clone's `squad.local.json` or
+`.plugins/`). `docs/plans/plugins.md` "Desvios" records what differed from the plan.
 
 **Perfis and Adapters (contract in `docs/plans/perfis-adapters.md`, ADRs in `docs/adr/`, glossary in `CONTEXT.md`).** Every run
-goes through a Perfil (row in `profiles`, outside the workspace): an instance of an Adapter (`claude`, or `codex` via `codex exec
---json`, whose events the bridge translates to Claude's stream-json) with its own executable and account folder (`CLAUDE_CONFIG_DIR`
-/ `CODEX_HOME`), model/effort defaults, concurrency cap and Perfil reserva. Agents keep only `profileId`; `settings.runtime.
+goes through a Perfil (row in `profiles`, outside the workspace): an instance of an Adapter (`claude` or `codex`; engines in `adapters/`,
+see "Adapter registry" below) with its own executable and account folder (`CLAUDE_CONFIG_DIR`
+/ `CODEX_HOME`), model/effort defaults, concurrency cap and Perfil reserva (picked at the start of a run above the threshold; a Claude limit
+hit mid-run ends the exit with `rateLimited`/`retryProfile` and `liveStep` launches the same step once more, on the reserve). Agents keep only `profileId`; `settings.runtime.
 forceProfileId` overrides them. Codex colleagues are called through the bridge's own MCP endpoint (`/mcp`, per-run token). Usage
 (tokens per run, `usage_daily`, 5h/7d windows) feeds Configurações > Perfis and the Painel. Perfis can also be declared in the
 local config (`profiles`/`defaultProfile`): synced as `cfg-<key>` rows (removed when they leave the file, usage kept by
@@ -353,7 +358,13 @@ Retomar; `launchNext`/`scheduleStep` only move in `running`):
 `launchNext` only picks features of `runner.sprintId`. The export orders features sprint by sprint,
 adds `sprint:` to each `spec.md`, a Sprints section to `scope.md` and `/executar-sprint`.
 
-**Plugins and adapter registry.** Engines live in `adapters/`: `adapters/index.js` exports `createRegistry(host)` (a factory, one per start, not a module singleton) that loads the built-ins `claude.js` and `codex.js`; each is `module.exports = host => adapter` with `kind, label, efforts, genAiSystem, colleagues, defaultBin, notFound, catalog, resolveModelEffort, prepare, finish, refreshWindows` and optional `home, profileExtras, status, validateProfile, validateLaunch, nativeTelemetry, onEvent, settingsFile`. `validateAdapter` checks the shape; `register(impl, {override, source, env})` returns an undo; `builtinKinds()` lists what shipped. `server.js` only asks the registry (lookups, `prepare`, `finish`, `onEvent`, `recordWindows`, `refreshWindows`, `engines`, catalog); no engine name is hard-coded there. A plugin is one folder with one `squad-plugin.json` (schema `schemas/squad-plugin.schema.json`) bringing content, code (`server`) or both; there is no separate kind of plugin. `plugins.js` discovers all of them in `load()` (`plugins.paths` of each config file, relative to it, `SQUAD_PLUGINS` and `<home>/.squad-code/plugins/<id>/`; local sources first, deduplicated by realpath; at most 20) and returns `discovery` for the host; `orderPlugins` (Kahn, a cycle disables its members, fail-closed) decides the order. `plugin-host.js` (`createPluginHost`) imports code only inside the `listen` callback (`import()`, `register(ctx)` with 10 s each and a 30 s total budget, `SQUAD_PLUGIN_*` overrides for tests; `register` is never called after the import timed out); `pluginHost.ready` is awaited by `handle()` after `tokenOk`, `serveIndex`, `startRun` and `afterOpen`. Only the local config (`squad.local.json`, `SQUAD_CONFIG`, `SQUAD_PLUGINS`, the home folder) can run code: a `server` plugin found only through `squad.config.json` is `blocked`, and `enabled`, `entries` (`grants`, `settings`, `failClosed`), `hookTimeoutMs` and a `disabled` of a code plugin only count from the local file; `runtime.permissionMode`/`addDirs`/`extraAllowedTools` from a shared source are ignored with a warning. The content of a plugin with code is read only when it is in `enabled` and reaches the page only while its code is `active` (`selectContent`); a plugin without code whose `requires` failed to load is `disabled` and leaves it too (`contentBlocked`). `plugins.entries.<id>.grants` must cover the capabilities the manifest asks for (`run.mutate`, `adapter`, `adapter.override`, `run.content`, `workspace.read`), otherwise the plugin is `denied`. `ctx` is frozen after `register`: `id, apiVersion, log, settings()` (validated before import, 16 KB), `dataDir()` (lazy, `<DATA_DIR>/plugins/<id>/`), `secret(name)` (declared `env` only), `onDispose`, `hasCapability`, `use(id)` (declared `requires` only), `http`, `registerRoute` (under `/api/plugins/<id>/`, same token/Host/Origin as the core; object → JSON, `{status, body}`, a plain throw → generic 500), `on(event, fn, {partial})` and `registerAdapter(kind, impl)`. Events (`run:start`, `run:event`, `run:finish`, `profile:usage`, `workspace:saved`) go to a per-plugin queue (1000, `setImmediate`, `run:event` dropped first, then the oldest), 3 s per handler (`hookTimeoutMs`), a breaker after 20 straight failures per handler; without `run.content` a plugin gets a whitelist projection (`projectRunEvent`, `stripFinish`), never prompt, text, input, content, stderr or cwd; `emit` with no subscriber is an `if`. `run:beforeSpawn` (`run.mutate`) runs in `launchRun` after the synchronous slot reservation (`admitBump`) and before `prepare`: `{block}` is a 403 that returns the slot, `{appendSystem}` (20k per plugin) is appended and the 100k cut is reapplied on the base (with a `bridge/plugin` event); fail-open unless `plugins.entries.<id>.failClosed`; 5 s budget for all handlers; only the bridge's own usage probe (`internal.exact`) skips it, never a `meta.kind` sent by the API. `registerAdapter` needs `adapter`; replacing `claude`/`codex` also needs `adapter.override` and only the built-in can be replaced; a plugin adapter runs (and is probed with `--version`) with a minimal env (`MIN_ENV_RE` plus its declared `env`), `nativeTelemetry` is never called for it, and it receives a restricted run view (no `parent`, `events`, `files`, `child`). `GET /api/plugins` shows status (`active`, `data`, `disabled`, `error`, `denied`, `invalid`, `blocked`), capabilities and observers; `restartRequired` follows the code (hash of the `server` file, manifest fields, `enabled`/`entries`); `/api/health` counts active plugins and reports `adapterSources`. Rule: core changes go through extension points; company code and content go in plugins, never in `server.js`, `adapters/` or the app. Tests: `tests/adapters.test.mjs` (registry, pure adapter functions, the translator against ADR 0001, and `tests/golden-argv.json`, the argv and env of 7 runs generated before the registry, compared with normalized paths and port); `tests/plugins.test.mjs` (single manifest schema, discovery, loading, routes, events, `beforeSpawn`, `registerAdapter`, `denied`, using `tests/fixtures/plugins/*` such as `hello`, `content-only`, `code-and-content`, `event-log`, `policy`, `fake-adapter`, `no-grant`); test ports: plugins 4700-4714, adapters 4800-4949; the files run one at a time (`--test-concurrency=1`). `docs/plans/plugins.md` "Desvios" is the record of what differed from the plan.
+**Adapter registry (guide in `adapters/README.md`).** `adapters/index.js` exports `createRegistry(host)` (a factory, one per
+start, not a singleton) loading the built-ins `claude.js` and `codex.js` (`module.exports = host => adapter`, shape checked by
+`validateAdapter`); plugins add or replace engines through `ctx.registerAdapter` (`adapter`, plus `adapter.override` for a built-in;
+minimal env, no `nativeTelemetry`, restricted run view). `server.js` only asks the registry: no engine name is hard-coded there.
+A new built-in kind also goes in `BUILTIN`, `ADAPTERS` (`plugins/loader.js`, `db.js`) and the schema enum. Tests:
+`tests/adapters.test.mjs` (ports 4800-4949), including `tests/golden-argv.json` (argv and env of 7 runs; update it in the same
+commit when argv changes on purpose). The three test files always run one at a time (`--test-concurrency=1`).
 
 **`src/city.js` (`MapNetwork`).** Three.js scene with two views sharing the same agents: a hexagonal
 city (perspective camera) and an isometric office with desks (orthographic). HTML markers/cards are

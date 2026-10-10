@@ -56,7 +56,7 @@ ignorado (inclusive dentro de `telemetry`); headers de telemetria são configura
 API; vira a coluna `config_dir` e chega ao processo como `CLAUDE_CONFIG_DIR` / `CODEX_HOME`).
 
 - `key`: `/^[a-z0-9][a-z0-9-]{0,40}$/`, única no arquivo. O Perfil fica no banco com o id estável `cfg-<key>`.
-- Caminhos (`plugins.js`): `configDir` e um `bin` com separador, `~` ou `.` resolvem contra a pasta do arquivo que declarou o
+- Caminhos (`plugins/loader.js`): `configDir` e um `bin` com separador, `~` ou `.` resolvem contra a pasta do arquivo que declarou o
   campo (`~` = home); um `bin` sem barra continua sendo um nome procurado no `PATH`.
 - Mescla entre `squad.config.json` e `squad.local.json` (ou `SQUAD_CONFIG`): por `key`, o arquivo posterior sobrescreve campo a
   campo; `telemetry` é mesclado chave a chave. A origem mostrada é o último arquivo que declarou o Perfil.
@@ -153,12 +153,12 @@ Sem lock do sistema operacional (o Node não tem `flock`/`openat` portáveis), t
 
 `schemas/squad.schema.json` (configuração: `$schema`, `plugins` {`paths`, `disabled`}, `runtime`, `profiles`, `defaultProfile`),
 `schemas/squad-plugin.schema.json` (manifesto, só campos de conteúdo) e `schemas/squad-agent.schema.json` (frontmatter de `agents/*.md`, para referência
-e validação), draft 2020-12, descrições em pt-BR, patterns e enums iguais às constantes de `plugins.js` (`CONSTANTS`; um teste
+e validação), draft 2020-12, descrições em pt-BR, patterns e enums iguais às constantes de `plugins/loader.js` (`CONSTANTS`; um teste
 compara). Nos arquivos, `"$schema": "./schemas/squad.schema.json"` (caminho relativo ao arquivo) liga a validação no editor; o
 bridge aceita a chave. `schema.js` é um validador sem dependências do subconjunto usado (`type`, `properties`, `required`,
 `additionalProperties`, `items`, `enum`, `const`, `pattern`, `minimum`/`maximum`, `minLength`/`maxLength`, `minItems`/`maxItems`,
 `exclusiveMinimum`/`exclusiveMaximum`, `$ref` local com detecção de ciclo e limite de 64 refs aninhadas (erro de validação, não
-estouro de pilha), `oneOf`/`anyOf`), com erros por caminho (`profiles[1].effort: ...`). Uso em `plugins.js`: campo desconhecido = aviso e
+estouro de pilha), `oneOf`/`anyOf`), com erros por caminho (`profiles[1].effort: ...`). Uso em `plugins/loader.js`: campo desconhecido = aviso e
 ignorado (configuração, manifesto, itens, frontmatter); outro erro de schema recusa o item (Perfil, categoria, avatar, tema,
 agente) com o caminho do campo. As checagens semânticas continuam e falam primeiro (realpath, assinatura de imagem, limites,
 cores, chaves reservadas); os erros de `runtime` e de `plugins.paths`/`plugins.disabled`/`defaultProfile` seguem com as mensagens de antes.
@@ -296,7 +296,7 @@ Conteúdo específico de uma empresa vive num plugin fora do repositório; o nú
 
 ## Desvios e decisões da implementação
 
-- Bridge (`plugins.js`): presets chegam com todas as chaves (`tools`/`conv` `null` quando ausentes); operador sem `category`
+- Bridge (`plugins/loader.js`): presets chegam com todas as chaves (`tools`/`conv` `null` quando ausentes); operador sem `category`
   vai para `outros`; `conventions.json` é lido se existir mesmo sem o campo no manifesto; avisos citam `[<id>] agents/X.md`.
   `runtime` validado nos tipos de `DEFAULT_RUNTIME` (`timeoutSec` 10..7200, `concurrency` 1..8). Na config, `runtime`
   mescla campo a campo, `plugins.disabled` é do último arquivo que o declara; `profiles` são mesclados por `key` (seção Perfis da configuração). Limites extras: 20 temas,
@@ -328,7 +328,7 @@ Conteúdo específico de uma empresa vive num plugin fora do repositório; o nú
     for o do preset; senão a do role. O Squad Studio usa isso para marcar ATUAL, posicionar o cursor e listar o agente, então um agente
     vindo de uma categoria de plugin (`roles: []`) continua nela.
 
-### Limites efetivos (bridge `plugins.js` e app `pluginLimits()`, iguais nas duas pontas)
+### Limites efetivos (bridge `plugins/loader.js` e app `pluginLimits()`, iguais nas duas pontas)
 
 Texto acima do limite **recusa o item** com aviso (bridge e app), nunca é cortado. Os limites dos agentes seguem o que
 `normalizeWorkspace` guarda de um agente, para nada se perder ao recarregar.

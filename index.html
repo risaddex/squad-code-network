@@ -1709,6 +1709,8 @@ body:not(.reduce-motion) .at-tile.leaving,.at-tile.leaving{animation:at-leave .4
 .prof-usage-age{margin-top:8px}
 @media (max-width:640px){.tel-row{grid-template-columns:minmax(0,1fr) auto}.tel-arrow{display:none}.prof-usage-row{grid-template-columns:minmax(0,1.6fr) repeat(4,minmax(0,1fr));font-size:9px}}
 
+.plugin-status{font:8px var(--mono);letter-spacing:.6px;text-transform:uppercase;padding:2px 6px;margin-left:6px;border:1px solid #8f7e4e;color:#c5b995;vertical-align:2px}.plugin-status.st-disabled,.plugin-status.st-pending,.plugin-status.st-loading{border-color:#496576;color:#7e97a5}.plugin-status.st-error,.plugin-status.st-invalid{border-color:#cc71744f;color:#e8a3a5}
+
 </style>
 </head>
 <body>
@@ -10546,7 +10548,7 @@ const TEMPLATE_AVATARS_V1={ZERO:['avatar-greyman'],'ABELHA-RAINHA':['avatar-moth
    runtime defaults from folders outside the repository. Everything here is a function declaration that touches no const of app.js:
    city.js (same script, earlier) calls squadThemeBoot() while building its scene, before app.js runs. Without the tag (demo, file://)
    nothing changes. Plugin text is escaped (E) wherever it is rendered, like the built-in catalog. */
-// Limits and ids shared with plugins.js (docs/plans/plugins-conteudo.md, "Limites efetivos"): text over a limit refuses the item with a
+// Limits and ids shared with plugins/loader.js (docs/plans/plugins-conteudo.md, "Limites efetivos"): text over a limit refuses the item with a
 // warning, never cut. They follow what normalizeWorkspace keeps of an agent (specialty 40, description 1200, soul 1200, 8 greetings
 // of 300, prompt 20000, tools of TOOLS, a subset's content 8000), so nothing a plugin gives is lost on reload. `tools` is TOOLS itself.
 function pluginLimits(){return pluginLimits.v||(pluginLimits.v={key:/^[a-z0-9][a-z0-9_-]{0,40}$/,convId:/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/,name:/^[A-Z0-9][A-Z0-9-]{1,23}$/,tools:['Read','Glob','Grep','Edit','Write','Bash','WebFetch','WebSearch','NotebookEdit'],cssVar:/^--[a-z0-9-]{1,40}$/,reserved:['__proto__','constructor','prototype'],
@@ -10563,6 +10565,8 @@ function readPlugins(){
  const IMG=/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/,colors=(o,keys)=>{const out={};if(obj(o))for(const k of keys){const c=pluginColor(o[k]);if(c!==null)out[k]=c;}return out;};
  const COLOR=/^(#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})|rgba?\(\s*\d{1,3}(\.\d+)?%?\s*,\s*\d{1,3}(\.\d+)?%?\s*,\s*\d{1,3}(\.\d+)?%?\s*(,\s*(0|1|0?\.\d+|1\.0+|\d{1,3}%)\s*)?\))$/i;
  const out={present:!!raw,plugins:[],runtime:obj(raw?.runtime)?raw.runtime:{},warnings:arr(raw?.warnings).filter(w=>typeof w==='string').map(w=>w.slice(0,600)).slice(0,200),appWarnings:warns};
+ // Plugins found but not loaded (incompatible, invalid, blocked...): only listed in the PLUGINS tab, with their status.
+ const S=(v,max)=>typeof v==='string'?v.slice(0,max):'';out.others=arr(raw?.others).slice(0,40).filter(o=>obj(o)&&typeof o.id==='string'&&/^[a-z0-9][a-z0-9-]{1,40}$/.test(o.id)).map(o=>({id:o.id,name:S(o.name,80)||o.id,version:S(o.version,40),status:S(o.status,20),error:S(o.error,600),hasCode:o.hasCode===true}));
  const each=(list,where,fn)=>{const r=[];for(const x of list){try{if(!obj(x))throw Error('esperado um objeto');r.push(fn(x));}catch(e){warn(`${where} ignorado: ${e.message}.`);}}return r;};
  for(const p of arr(raw?.plugins).slice(0,20)){
   if(!obj(p)||typeof p.id!=='string'||!/^[a-z0-9][a-z0-9-]{1,40}$/.test(p.id)||out.plugins.some(x=>x.id===p.id))continue;
@@ -10675,7 +10679,7 @@ function mergePluginCatalog(){
   if(p.soul)AGENT_SOULS[p.name]={soul:p.soul,hellos:p.hellos.length?[...p.hellos]:genericHellos(p.role,p.specialty)};
   if(p.avatar){const k=['plugin:'+p.plugin+'/'+p.avatar,'avatar-'+p.avatar,p.avatar].find(x=>Object.hasOwn(PORTRAITS,x));if(k)TEMPLATE_AVATARS[p.name]=k;else pluginWarn(`Agente ${p.name}: avatar "${p.avatar}" não encontrado; usa a foto da especialidade.`);}
  }
- // DIRETRIZES: ids as in plugins.js (convId, never a reserved name), own families only (Object.hasOwn: a plugin naming "constructor"
+ // DIRETRIZES: ids as in plugins/loader.js (convId, never a reserved name), own families only (Object.hasOwn: a plugin naming "constructor"
  // must not reach Object's prototype), text within the shared limits or the item is refused; existing ids are never overwritten.
  const L=pluginLimits(),C=L.conv,id=k=>typeof k==='string'&&L.convId.test(k)&&!L.reserved.includes(k);
  const text=(v,max,what)=>{if(v===undefined||v===null||v==='')return'';if(typeof v!=='string')throw Error(`${what}: esperado texto`);if(v.length>max)throw Error(`${what} maior que ${max} caracteres`);return v.trim();};
@@ -13271,10 +13275,16 @@ function advanceRoute(f,a,text,real){
 }
 async function liveStep(f,a){
  const owner=runner,p=project();if(owner.inFlight)return;owner.inFlight=true;render();
- let exit;try{exit=await executeLiveStep(f,a,p,owner);}finally{owner.inFlight=false;}
+ let exit;try{exit=await executeLiveStep(f,a,p,owner);
+  // The Perfil's limit arrived mid-step and the bridge says a reserve would take it now: the same step once more (it picks the reserve).
+  if(runner===owner&&!exit.cancelled&&exit.rateLimited&&exit.retryProfile){const lim=exit.profileName||exit.profileId||'atual';
+   roomTyping(null);roomPush({kind:'system',text:`${a.name} bateu o limite do Perfil ${lim}. Tentando de novo no Perfil reserva ${exit.retryProfile.name}.`,tone:'warn'});
+   log(`${a.name} bateu o limite do Perfil ${lim} em ${f.key}. Nova tentativa no Perfil reserva ${exit.retryProfile.name}.`,'agent',a.id,p);p.logs.at(-1).simulated=false;save();
+   exit=await executeLiveStep(f,a,p,owner);}
+ }finally{owner.inFlight=false;}
  if(runner!==owner||exit.cancelled)return;
  if(exit.error||exit.isError){
-  const message=exit.error||'Falha na execução do Claude Code.';
+  const raw=exit.error||'Falha na execução do Claude Code.',message=exit.rateLimited&&!exit.retryProfile?`o Perfil ${exit.profileName||exit.profileId||'atual'} atingiu o limite de uso e não há Perfil reserva disponível (${raw})`:raw;
   f.outputs.push({agentId:a.id,at:nowISO(),text:`[FALHA] ${message}`,simulated:false,error:true,costUsd:exit.costUsd??null,durationMs:null,sessionId:exit.sessionId??null});
   f.status='ready';f.currentAgentId=null;f.step=0;runner=null;clearTimeout(timer);
   log(`${a.name} falhou em ${f.key}: ${message.slice(0,400)}. A feature voltou para Prontas.`,'agent',a.id,p);p.logs.at(-1).simulated=false;
@@ -13359,16 +13369,18 @@ function openSettings(tab=ui.settingsTab){
    install. A theme change saves and reloads (city.js builds its scene once, at load). */
 function pluginsHTML(){
  const P=readPlugins(),themes=pluginThemes(),cur=state.settings.theme||'',warn=[...P.warnings,...P.appWarnings];
- const install=`<div class="notice" style="margin-bottom:0">${icon('info')}<span><strong>Como instalar um plugin.</strong> Crie <code>squad.local.json</code> na pasta do app (ao lado de <code>server.js</code>) com <code>{"plugins": {"paths": ["caminho/do/plugin"]}}</code> e recarregue a página. Caminhos relativos valem a partir do arquivo e <code>~</code> é a sua pasta pessoal. Um plugin com código do bridge (<code>server</code>) também precisa estar em <code>"enabled"</code> e só carrega ao reiniciar o bridge. Um plugin nunca altera agentes já criados: os agentes, categorias, diretrizes, avatares e temas dele aparecem no catálogo.</span></div>`;
+ const install=`<div class="notice" style="margin-bottom:0">${icon('info')}<span><strong>Como instalar um plugin.</strong> Clone o plugin em <code>.plugins/&lt;id&gt;/</code> na pasta do app (ou rode <code>npm run plugin:new -- &lt;id&gt;</code> para criar um) e recarregue a página. Uma pasta em outro lugar entra por <code>squad.local.json</code> (ao lado de <code>server.js</code>) com <code>{"plugins": {"paths": ["caminho/do/plugin"]}}</code>. Caminhos relativos valem a partir do arquivo e <code>~</code> é a sua pasta pessoal. Um plugin com código do bridge (<code>server</code>) também precisa estar em <code>"enabled"</code> e só carrega ao reiniciar o bridge. Um plugin nunca altera agentes já criados: os agentes, categorias, diretrizes, avatares e temas dele aparecem no catálogo.</span></div>`;
  if(!BRIDGE_TOKEN)return`<div class="notice" style="margin-top:0">${icon('lock')}<span><strong>Disponível com o bridge.</strong> Plugins e temas são lidos pelo bridge local. Rode <code>npm start</code> na pasta do app e abra <code>http://127.0.0.1:4317</code>.</span></div>${install}`;
  const count=(n,one,many)=>`${n} ${n===1?one:many}`;
  const plugins=P.plugins.length?P.plugins.map(pk=>{const c=pk.conventions,diret=c?c.subsets.length+c.groups.length+Object.values(c.families).reduce((n,f)=>n+(Array.isArray(f?.templates)?f.templates.length:0),0):0,ok=pluginPresets().filter(p=>p.plugin===pk.id).length,all=Math.max(pk.declared||0,pk.presets.length);
   return`<div class="settings-row"><div><h3>${E(pk.name)}${pk.version?` <small>v${E(pk.version)}</small>`:''}</h3>${pk.description?`<p>${E(pk.description)}</p>`:''}<p class="hint" style="word-break:break-all">ID <code>${E(pk.id)}</code>${pk.path?` / <code>${E(pk.path)}</code>`:''}${pk.hasCode?' / com código no bridge (ativo)':''}</p><p class="hint">${[count(ok,'agente','agentes')+(ok<all?` (${all-ok} ignorado${all-ok>1?'s':''})`:''),count(pk.categories.length,'categoria','categorias'),count(pk.avatars.length,'avatar','avatares'),count(pk.themes.length,'tema','temas'),count(diret,'diretriz','diretrizes')].join(' / ')}</p></div></div>`;}).join('')
   :`<div class="settings-row"><div><h3>Nenhum plugin carregado</h3><p>${P.present?'O bridge não encontrou plugins na configuração local.':'Esta página não recebeu a lista de plugins do bridge (versão antiga do bridge?).'}</p></div></div>`;
+ const ST={incompatible:'Incompatível',invalid:'Inválido',blocked:'Bloqueado',denied:'Negado',error:'Erro',disabled:'Desligado',pending:'Pendente',loading:'Carregando'};
+ const others=P.others.map(o=>`<div class="settings-row"><div><h3>${E(o.name)}${o.version?` <small>v${E(o.version)}</small>`:''} <small class="plugin-status st-${E(o.status)}">${E(ST[o.status]||o.status)}</small></h3><p class="hint" style="word-break:break-all">ID <code>${E(o.id)}</code>${o.hasCode?' / com código no bridge':''}</p>${o.error?`<p class="hint">${E(o.error)}</p>`:''}</div></div>`).join('');
  const known=!cur||themes.some(t=>t.key===cur),pluginOf=k=>P.plugins.find(pk=>k.startsWith(pk.id+'/'))?.name||'';
  const theme=`<div class="settings-row"><div><h3>Tema</h3><p>Cores da interface, da cidade e do escritório oferecidas pelos plugins. Trocar o tema salva o workspace e recarrega a página.</p>${known?'':`<p class="hint">O tema salvo (<code>${E(cur)}</code>) não está em nenhum plugin carregado; a página usa o tema padrão e mantém a escolha.</p>`}</div><select id="themeSelect" aria-label="Tema" ${runner||diskSync.setup?'disabled':''}><option value="" ${cur?'':'selected'}>Padrão</option>${known?'':`<option value="${E(cur)}" selected>${E(cur)} (não encontrado)</option>`}${themes.map(t=>`<option value="${E(t.key)}" ${t.key===cur?'selected':''}>${E(t.label)}${pluginOf(t.key)?' / '+E(pluginOf(t.key)):''}</option>`).join('')}</select></div>`;
  const warnings=warn.length?`<div class="notice warning">${icon('info')}<span><strong>Avisos dos plugins</strong><br>${warn.map(w=>E(w)).join('<br>')}</span></div>`:'';
- return`${plugins}${theme}${warnings}${install}`;
+ return`${plugins}${others}${theme}${warnings}${install}`;
 }
 // Theme change: saves and reloads only once the current workspace is safe, written to the database (no pending write on its rev)
 // or to this browser's copy (which then wins at the next boot, see bootChoice). The whole wait is capped at 5 s; without either,
