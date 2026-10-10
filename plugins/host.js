@@ -467,7 +467,7 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
 
   const viewOf = r => ({
     id: r.id, name: r.name, version: r.version, description: r.description, path: r.dir, hasCode: r.hasCode, status: r.status, error: r.error,
-    source: r.source === 'home' ? 'home' : 'config', requires: [...r.manifest.requires], env: [...r.manifest.env], capabilities: { asked: [...r.caps.asked], granted: [...r.caps.granted], missing: [...r.caps.missing] },
+    source: r.source === 'home' || r.source === 'repo' ? r.source : 'config', requires: [...r.manifest.requires], env: [...r.manifest.env], capabilities: { asked: [...r.caps.asked], granted: [...r.caps.granted], missing: [...r.caps.missing] },
     routes: r.routes.map(x => x.label), events: [...new Set(r.events.map(e => e.event))], adapters: [...r.adapters], warnings: [...r.warnings],
     // observers (only for a plugin with event handlers): one entry per handler, with what the dispatcher counted.
     ...(r.events.some(e => e.event !== 'run:beforeSpawn') ? { observers: r.events.filter(e => e.event !== 'run:beforeSpawn').map(h => ({ event: h.event, dropped: h.dropped, failures: h.fails, tripped: h.tripped })) } : {}),
@@ -510,6 +510,6 @@ function checkSchemaLimits(node, at = 'configSchema', depth = 0) {
 }
 
 // What the start log and the PLUGINS tab call each status.
-const STATUS_PT = { active: 'ativo', data: 'conteúdo', disabled: 'desligado', error: 'erro', denied: 'negado', invalid: 'inválido', blocked: 'bloqueado', pending: 'pendente', loading: 'carregando' };
+const STATUS_PT = { active: 'ativo', data: 'conteúdo', disabled: 'desligado', error: 'erro', denied: 'negado', invalid: 'inválido', blocked: 'bloqueado', incompatible: 'incompatível', pending: 'pendente', loading: 'carregando' };
 
 module.exports = { createPluginHost, orderPlugins, STATUS_PT, API_VERSION };

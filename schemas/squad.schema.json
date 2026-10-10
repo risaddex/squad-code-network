@@ -21,7 +21,7 @@
             "type": "string",
             "minLength": 1
           },
-          "description": "Pastas de Plugins (com squad-plugin.json). Relativas à pasta deste arquivo; ~ = home. Concatenadas entre os arquivos. Além delas, vale ~/.squad-code/plugins/<id>/."
+          "description": "Pastas de Plugins (com squad-plugin.json). Relativas à pasta deste arquivo; ~ = home. Concatenadas entre os arquivos. Além delas, valem .plugins/<id>/ na pasta do app e ~/.squad-code/plugins/<id>/."
         },
         "disabled": {
           "type": "array",

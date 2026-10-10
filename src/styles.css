@@ -1695,3 +1695,5 @@ body:not(.reduce-motion) .at-tile.leaving,.at-tile.leaving{animation:at-leave .4
 .prof-usage-row.head{font-size:8px;letter-spacing:1.4px;color:#6d808a}
 .prof-usage-age{margin-top:8px}
 @media (max-width:640px){.tel-row{grid-template-columns:minmax(0,1fr) auto}.tel-arrow{display:none}.prof-usage-row{grid-template-columns:minmax(0,1.6fr) repeat(4,minmax(0,1fr));font-size:9px}}
+
+.plugin-status{font:8px var(--mono);letter-spacing:.6px;text-transform:uppercase;padding:2px 6px;margin-left:6px;border:1px solid #8f7e4e;color:#c5b995;vertical-align:2px}.plugin-status.st-disabled,.plugin-status.st-pending,.plugin-status.st-loading{border-color:#496576;color:#7e97a5}.plugin-status.st-error,.plugin-status.st-invalid{border-color:#cc71744f;color:#e8a3a5}

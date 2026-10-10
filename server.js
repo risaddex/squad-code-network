@@ -652,7 +652,11 @@ async function defaultInConfig(pid) {
 /** Plugins + configuration as the page/API get them, with the warnings of the configured Perfis appended. */
 async function pluginsWithProfiles() {
   await syncConfigProfiles();
-  const plugins = activeContent(loadPlugins());
+  const loaded = activeContent(loadPlugins());
+  // others: the plugins found that are not in the page (incompatible, invalid, blocked, denied, error, disabled...), for the PLUGINS tab.
+  const others = pluginHost.view(loaded.discovery).plugins.filter(v => v.status !== 'active' && v.status !== 'data').slice(0, 40)
+    .map(v => ({ id: v.id, name: v.name, version: v.version, status: v.status, error: String(v.error || '').slice(0, 600), hasCode: v.hasCode }));
+  const plugins = { ...loaded, page: { ...loaded.page, others } };
   if (!cfgProfiles.warnings.length) return plugins;
   return { ...plugins, page: { ...plugins.page, warnings: [...plugins.page.warnings, ...cfgProfiles.warnings] }, api: { ...plugins.api, warnings: [...plugins.api.warnings, ...cfgProfiles.warnings] } };
 }

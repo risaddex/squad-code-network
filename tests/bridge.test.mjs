@@ -35,7 +35,7 @@ let server, token, nextPort = PORT + 1;
 async function startBridge(dataDir, port = nextPort++, extraEnv = {}) {
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js'), '--port', String(port)], {
     cwd: workdir,
-    env: { ...process.env, TEMP: tempRoot, TMP: tempRoot, TMPDIR: tempRoot, SQUAD_HOME: home, SQUAD_PROJECTS_DIR: projectsRoot, SQUAD_DATA_DIR: dataDir, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_CODEX_BIN: path.join(ROOT, 'tests', 'fake-codex.mjs'), FAKE_CODEX_LOG: codexLog, SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: emptyConfig, SQUAD_CONFIG_SHARED: path.join(configRoot, 'no-shared.json'), SQUAD_PLUGINS: '', ...extraEnv },
+    env: { ...process.env, TEMP: tempRoot, TMP: tempRoot, TMPDIR: tempRoot, SQUAD_HOME: home, SQUAD_PLUGINS_DIR: "", SQUAD_PROJECTS_DIR: projectsRoot, SQUAD_DATA_DIR: dataDir, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_CODEX_BIN: path.join(ROOT, 'tests', 'fake-codex.mjs'), FAKE_CODEX_LOG: codexLog, SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: emptyConfig, SQUAD_CONFIG_SHARED: path.join(configRoot, 'no-shared.json'), SQUAD_PLUGINS: '', ...extraEnv },
   });
   let out = '';
   const tok = await new Promise((resolve, reject) => {
@@ -534,7 +534,7 @@ const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
 const writeTree = (dir, files) => { for (const [rel, data] of Object.entries(files)) { const f = path.join(dir, rel); mkdirSync(path.dirname(f), { recursive: true }); writeFileSync(f, typeof data === 'string' || Buffer.isBuffer(data) ? data : JSON.stringify(data)); } };
 
 test('without plugins the page gets an empty squad-plugins tag', async () => {
-  assert.deepEqual(pageTag(await page(), 'squad-plugins'), { plugins: [], runtime: {}, warnings: [] });
+  assert.deepEqual(pageTag(await page(), 'squad-plugins'), { plugins: [], runtime: {}, warnings: [], others: [] });
   assert.equal((await (await api('/api/health')).json()).plugins, 0);
   assert.equal((await fetch(BASE + '/api/plugins')).status, 401);
 });

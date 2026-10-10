@@ -447,7 +447,7 @@ const bridges = [];
 async function startBridge(dataDir, port, tmpRoot = scratch('squad-ad-btmp-')) {
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.js'), '--port', String(port)], {
     cwd: ROOT,
-    env: { ...process.env, SQUAD_HOME: scratch('squad-ad-bhome-'), SQUAD_PROJECTS_DIR: scratch('squad-ad-proj-'), SQUAD_DATA_DIR: dataDir, TMPDIR: tmpRoot, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_CODEX_BIN: path.join(ROOT, 'tests', 'fake-codex.mjs'), SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: path.join(scratch('squad-ad-cfg-'), 'none.json'), SQUAD_CONFIG_SHARED: path.join(scratch('squad-ad-cfg2-'), 'none.json'), SQUAD_PLUGINS: '' },
+    env: { ...process.env, SQUAD_HOME: scratch('squad-ad-bhome-'), SQUAD_PLUGINS_DIR: "", SQUAD_PROJECTS_DIR: scratch('squad-ad-proj-'), SQUAD_DATA_DIR: dataDir, TMPDIR: tmpRoot, SQUAD_CLAUDE_BIN: path.join(ROOT, 'tests', 'fake-claude.mjs'), SQUAD_CODEX_BIN: path.join(ROOT, 'tests', 'fake-codex.mjs'), SQUAD_PRINT_TOKEN: '1', SQUAD_CONFIG: path.join(scratch('squad-ad-cfg-'), 'none.json'), SQUAD_CONFIG_SHARED: path.join(scratch('squad-ad-cfg2-'), 'none.json'), SQUAD_PLUGINS: '' },
   });
   let out = '';
   const token = await new Promise((resolve, reject) => {
