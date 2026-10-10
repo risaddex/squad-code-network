@@ -3,7 +3,8 @@ import { fileURLToPath } from 'node:url';
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bin.mjs');
 
-// settings: { kind: 'x-echo', failAfter: true (lança depois de registrar), twice: true (registra o kind duas vezes), invalid: true (impl sem funções) }
+// settings: { kind: 'x-echo', failAfter: true (lança depois de registrar), twice: true (registra o kind duas vezes), invalid: true (impl sem funções),
+//   missingBin: true (o executável padrão não existe) }
 export function register(ctx) {
   const settings = ctx.settings();
   const kind = settings.kind || 'x-echo';
@@ -12,7 +13,7 @@ export function register(ctx) {
   ctx.registerRoute('GET', '/last', () => ({ last }));
   const impl = {
     kind, label: 'X Echo', efforts: ['low'], genAiSystem: 'x-echo', colleagues: 'none',
-    defaultBin: () => BIN,
+    defaultBin: () => (settings.missingBin ? path.join(path.dirname(BIN), 'ausente-x-echo.mjs') : BIN),
     notFound: (bin, profile) => `x-echo não encontrado ("${bin}") no Perfil "${profile.name}".`,
     catalog: () => ({ models: [{ id: 'x-1', label: 'X 1' }], efforts: ['low'] }),
     resolveModelEffort: ({ model, effort }) => ({ model, effort }),

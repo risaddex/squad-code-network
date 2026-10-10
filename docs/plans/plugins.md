@@ -30,34 +30,34 @@ bridge (adapters plugáveis, rotas, eventos, `beforeSpawn`). Extensão da págin
 
 ## Passos
 
-### Passo 1: Contrato: concluído (`064c834`)
+### Passo 1: Contrato: concluído (`58c6e8d`)
 ADR 0004, este documento, `CONTEXT.md` (Plugin: conteúdo e/ou código, código só pela Configuração local; Capacidade; Adapter
 registrado no bridge).
 
-### Passo 2: Registro de adapters e funções puras: concluído (`064c834`)
+### Passo 2: Registro de adapters e funções puras: concluído (`58c6e8d`)
 Apêndice A2 e A5: `adapters/index.js` (registro), `adapters/claude.js` e `adapters/codex.js` com as funções puras movidas do
 `server.js` (uso, janelas, catálogo, esforços, args, tradutor, sessão). Testes unitários em `tests/adapters.test.mjs`. Sem mudança
 de comportamento (pequenas diferenças de robustez registradas em "Desvios").
 
-### Passo 3: `server.js` passa a usar o registro: concluído (`064c834`)
+### Passo 3: `server.js` passa a usar o registro: concluído (`58c6e8d`)
 Apêndice A1/A2: lookups simples, lançamento (`prepare`, `files`, `tail`, `mcpToken`), fim da execução (`finish`, `onEvent`,
 `recordWindows`), `refreshWindows`, `settingsFile`, `engines`, catálogo. `npm test` verde a cada troca; teste novo de Perfil com
 adapter desconhecido.
 
-### Passo 4: Schemas, descoberta e ordem: concluído (`1729838`)
+### Passo 4: Schemas, descoberta e ordem: concluído (`4f26c58`)
 Apêndice A4: `schemas/squad-plugin.schema.json`, `plugins` em `squad.schema.json`, `CONSTANTS` (`PLUGIN_CAPABILITIES`,
 `PLUGIN_EVENTS`); `plugins.js` passa a descobrir todos os plugins (um caminho só, no `load()`, com `orderPlugins`; conteúdo, código ou os
 dois no mesmo manifesto); `plugin-host.js` com o host de código; `GET /api/plugins` único; decisão 2.
 
-### Passo 5: Carga, `register` e rotas: concluído (`1729838`)
+### Passo 5: Carga, `register` e rotas: concluído (`4f26c58`)
 Apêndice A4: `import()` no `listen`, `plugins.ready`, `ctx` (`log`, `settings`, `dataDir`, `secret`, `onDispose`, `hasCapability`,
 `use`), isolamento de erro e congelamento do ctx; `registerRoute` sob `/api/plugins/<id>/` com token/Host/Origin do núcleo.
 
-### Passo 6: Eventos e `beforeSpawn`: concluído (`15e3e19`)
+### Passo 6: Eventos e `beforeSpawn`: concluído (`b216830`)
 Apêndice A3: `run:start`, `run:event`, `run:finish`, `profile:usage`, `workspace:saved`; `run:beforeSpawn` depois da reserva
 síncrona (veto devolve a vaga), `appendSystem`, fail-open/failClosed, `run.content`.
 
-### Passo 7: `registerAdapter`: concluído (`15e3e19`)
+### Passo 7: `registerAdapter`: concluído (`b216830`)
 Adapter de plugin (`adapter`, `adapter.override`), `engines` e catálogo dinâmicos, erro claro com plugin desligado.
 
 ### Passo 8: Documentação e revisão: concluído
@@ -125,6 +125,22 @@ Passos 6 e 7 (eventos, `run:beforeSpawn` e `registerAdapter`). O que divergiu do
 - **Variáveis novas para teste:** `SQUAD_PLUGIN_HOOK_TIMEOUT_MS` (sobrepõe `plugins.hookTimeoutMs`) e `SQUAD_PLUGIN_BEFORESPAWN_BUDGET_MS`.
 - **Testes:** 21 novos (passos 6-7) e mais 12 da revisão em `tests/plugins.test.mjs` (5 do despachante direto, sem rede, com `createPluginHost` e `globalThis.__observer` para fila/disjuntor/tempo limite; 5 de eventos e S-L9 e disjuntor no bridge; 8 de `beforeSpawn`; 4 de `registerAdapter`) e 1 em `tests/adapters.test.mjs` (undo do registro). Fixtures novas: `event-log`, `observer-bad`, `policy` (controlado por `POST /mode`) e `fake-adapter` (`x-echo`, `bin.mjs`; `settings.kind/failAfter/twice/invalid`). O `startBridge` do `plugins.test.mjs` expõe `tmp` (TMPDIR do bridge, para provar que o veto não deixa temporário) e a faixa de portas aleatórias caiu de 40 para 15 (4700-4714 mais as usadas em ordem). No teste do Chamado vetado, o `fake-codex` não repassa `isError` no item da chamada, então o erro de ferramenta é conferido pelo `isError` da resposta MCP (e pelo texto no stream do pai).
 
+
+Revisão do Codex no PR (P2), depois do rebase sobre as correções de `feat/extensoes` e `feat/perfis-adapters`:
+
+- **`/api/health` com o `claude` substituído:** a sonda avulsa do CLI (`SQUAD_CLAUDE_BIN`/`claudePath`) só roda enquanto o Adapter
+  `claude` registrado é o embutido. Com um override, quem decide `engines.claude`, `claudeVersion` e `engineAdapter` são os Perfis
+  Claude (sonda do executável do override); antes, o CLI original instalado deixava a página sair do demo mesmo com o executável do
+  override ausente, e toda execução no Perfil Claude padrão falhava.
+- **Dependência com código que falhou:** depois da carga do código, o host reavalia em ordem topológica os plugins só de conteúdo
+  (`data`): um `requires` que ficou em `error`/`denied`/`disabled` (register que lança ou estoura o tempo) deixa o dependente
+  `disabled` com "depende de "x", que não carregou (error)", e o conteúdo dele sai de `#squad-plugins`, de `/api/plugins` e da
+  contagem de `/api/health` (`host.contentBlocked` no `selectContent`, que agora recebe `keep(id, hasCode)`). Os demais plugins só de
+  conteúdo continuam relidos ao vivo.
+- **Esforço por Adapter:** `validateRunOptions` só conhece a união dos níveis; agora `startRun`, logo depois de escolher o Perfil e
+  antes de tomar a vaga, resolver modelo/esforço ou chamar `prepare`, recusa (400) um esforço explícito fora de `impl.efforts` do
+  Adapter do Perfil escolhido (a reserva tem sempre o mesmo Adapter). `''` (padrão do modelo) não passa por aí; o Codex segue
+  ajustando `max`/`ultra` ao modelo; o golden argv não muda.
 ---
 
 ## Apêndice: blueprint do arquiteto

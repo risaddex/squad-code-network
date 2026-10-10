@@ -1596,3 +1596,66 @@ test('N2: restartRequired detecta mudança no código do plugin (hash do server)
   writeJson(path.join(dir, 'squad-plugin.json'), { ...manifest, env: ['HELLO_SECRET', 'OUTRA'], configSchema: { type: 'object' } });
   assert.equal((await d.json('/api/plugins')).restartRequired, true, 'configSchema mudou');
 });
+
+/* ---------- revisão do Codex no PR (P2) ---------- */
+test('P2-1: com o adapter claude substituído por um plugin, /api/health não usa a sonda avulsa do CLI embutido', async () => {
+  const gone = path.join(scratch('squad-pl-nobin-'), 'codex-ausente');
+  // O executável do override não existe; o CLI embutido (SQUAD_CLAUDE_BIN) existe, mas não é ele que roda o Perfil Claude padrão.
+  const b = await startBridge({ local: adapterCfg(['adapter', 'adapter.override'], { kind: 'claude', missingBin: true }), env: { SQUAD_CODEX_BIN: gone } });
+  assert.equal(byId(await b.json('/api/plugins'))['fake-adapter'].status, 'active');
+  const h = await b.json('/api/health');
+  assert.equal(h.engines.claude, false, 'o executável do override não existe');
+  assert.equal(h.claudeVersion, null, 'a página fica no demo');
+  assert.equal(h.engineAdapter, null);
+  assert.equal(h.adapterSources.claude, 'plugin:fake-adapter');
+  // Com o executável do override presente, o Perfil Claude conta pela sonda do override.
+  const ok = await startBridge({ local: adapterCfg(['adapter', 'adapter.override'], { kind: 'claude' }), env: { SQUAD_CODEX_BIN: gone } });
+  const h2 = await ok.json('/api/health');
+  assert.equal(h2.engines.claude, true); assert.match(h2.claudeVersion, /x-echo 1\.0\.0/); assert.equal(h2.engineAdapter, 'claude');
+  // Sem override, a sonda do CLI embutido segue valendo.
+  const plain = await startBridge({ env: { SQUAD_CODEX_BIN: gone } });
+  const h3 = await plain.json('/api/health');
+  assert.equal(h3.engines.claude, true); assert.ok(h3.claudeVersion); assert.match(h3.claudePath, /fake-claude\.mjs$/);
+});
+
+test('P2-2: plugin só de conteúdo que requer um plugin com código cujo register() falha ou estoura o tempo sai da página e fica disabled', async () => {
+  for (const [dep, env] of [['throws-on-register', {}], ['hangs-on-register', { SQUAD_PLUGIN_REGISTER_TIMEOUT_MS: '300' }]]) {
+    const child = cloneFixture('content-only', `needs-${dep}`, { requires: [dep] });
+    const b = await startBridge({ local: pcfg([fx(dep), fx('content-only'), child], [dep]), env });
+    const listed = byId(await b.json('/api/plugins'));
+    assert.equal(listed[dep].status, 'error');
+    const v = listed[`needs-${dep}`];
+    assert.equal(v.status, 'disabled', dep);
+    assert.match(v.error, new RegExp(`depende de "${dep}", que não carregou \\(error\\)`));
+    assert.deepEqual(v.categories, []);
+    assert.equal(listed['content-only'].status, 'data');
+    const tag = JSON.parse((await (await fetch(b.base + '/')).text()).match(/id="squad-plugins">([\s\S]*?)<\/script>/)[1]);
+    assert.deepEqual(tag.plugins.map(p => p.id), ['content-only'], dep);
+    assert.equal((await b.json('/api/health')).plugins, 1);
+    await b.stop();
+  }
+});
+
+test('P2-3: esforço explícito fora de efforts do adapter do Perfil é recusado (400) antes de preparar a execução', async () => {
+  const b = await startBridge({ local: adapterCfg(['adapter']) });
+  await setupDb(b);
+  const eco = await newProfile(b, { name: 'Eco', adapter: 'x-echo' });
+  let res = await postRun(b, { prompt: 'oi', options: { cwd: WORKDIR, profile: eco.id, effort: 'ultra' } });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /esforço "ultra" não é aceito pelo Adapter "x-echo".*Eco.*low/i);
+  assert.equal((await b.json('/api/plugins/fake-adapter/last')).last, null, 'prepare não foi chamado');
+  assert.equal((await b.json('/api/health')).activeRuns, 0, 'a vaga voltou');
+  // O que o adapter anuncia (e o padrão, sem esforço) segue rodando.
+  assert.equal(exitOf((await runOn(b, { prompt: 'oi', options: { cwd: WORKDIR, profile: eco.id, effort: 'low' } })).events).status, 'done');
+  assert.equal(exitOf((await runOn(b, { prompt: 'oi', options: { cwd: WORKDIR, profile: eco.id } })).events).status, 'done');
+  // Os embutidos: Claude aceita os níveis dele e recusa um só do Codex; Codex aceita os dele (max/ultra o adapter ajusta ao modelo).
+  assert.equal(exitOf((await runOn(b, { prompt: 'oi', options: { cwd: WORKDIR, effort: 'max' } })).events).status, 'done');
+  await waitFor(async () => (await b.json('/api/profiles')).profiles.some(p => p.id === 'codex-default'));
+  assert.equal(exitOf((await runOn(b, { prompt: 'oi', options: { cwd: WORKDIR, profile: 'codex-default', effort: 'ultra' } })).events).status, 'done');
+  res = await postRun(b, { prompt: 'oi', options: { cwd: WORKDIR, effort: 'minimal' } });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /Adapter "claude"/);
+  // Um esforço que nenhum adapter conhece segue com a mensagem de antes.
+  res = await postRun(b, { prompt: 'oi', options: { cwd: WORKDIR, effort: 'turbo' } });
+  assert.equal(res.status, 400); assert.match((await res.json()).error, /Nível de esforço inválido/);
+});

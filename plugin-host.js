@@ -299,6 +299,19 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
           if (host.closing) { r.status = 'disabled'; r.error = 'bridge encerrando'; continue; }
           await loadOne(r, deadline);
         }
+        // A plugin without code that requires one whose register() failed (or timed out) cannot stay as data: its content would
+        // reach the page. `order` is topological, so one pass also covers a chain of them.
+        for (const id of order) {
+          const r = byId.get(id);
+          if (r.hasCode || r.status !== 'data') continue;
+          for (const dep of r.manifest.requires) {
+            const d = byId.get(dep);
+            if (d && (d.status === 'active' || d.status === 'data')) continue;
+            r.status = 'disabled'; r.error = `depende de "${dep}", que não carregou (${d ? d.status : 'ausente'})`; r.depFailed = true;
+            log.warn(`Plugin ${r.id}: ${r.error}`);
+            break;
+          }
+        }
       } catch (e) { log.warn(`Plugins: ${e.message}`); }
       finally { host.pending = false; }
     })();
@@ -468,8 +481,10 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
   host.view = (now = getDiscovery()) => {
     const used = new Set();
     const plugins = now.plugins.map(p => {
-      const r = p.hasCode && recs.get(p.key);
-      if (r && r.hasCode && r.dir === p.dir) { used.add(r); return viewOf(r); }
+      const r = recs.get(p.key);
+      if (r && r.hasCode && p.hasCode && r.dir === p.dir) { used.add(r); return viewOf(r); }
+      // Content is reread live, except one switched off by a requires that failed to load (until the next start).
+      if (r && !r.hasCode && !p.hasCode && r.depFailed && r.dir === p.dir && !p.status) return viewOf(r);
       return viewOf(recordOf(p));
     });
     for (const r of all()) if (r.hasCode && !used.has(r) && r.status === 'active') plugins.push(viewOf(r));
@@ -477,6 +492,8 @@ function createPluginHost({ getDiscovery, dataRoot, http, maxBody, env = process
   };
   /** Status of the plugin that answers to `id` among those loaded at the start ('' when there is none). */
   host.statusOf = id => byId.get(id)?.status || '';
+  // A plugin without code switched off after the code loaded (its requires failed): its content leaves the page until the next start.
+  host.contentBlocked = id => byId.get(id)?.depFailed === true;
   /** Plugins that are doing something: active code plus the content-only ones. */
   host.active = () => all().filter(r => r.status === 'active' || r.status === 'data').length;
   return host;

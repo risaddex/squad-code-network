@@ -578,9 +578,9 @@ function normalizeManifest(meta, id) {
   };
 }
 
-/** The content plugins of a load() result whose `keep(id)` holds for the ones with code (the host decides those), with the runtime redone. */
+/** The content plugins of a load() result for which `keep(id, hasCode)` holds (the host decides), with the runtime redone. */
 function selectContent(result, keep) {
-  const plugins = result.page.plugins.filter(p => !p.hasCode || keep(p.id));
+  const plugins = result.page.plugins.filter(p => keep(p.id, !!p.hasCode));
   if (plugins.length === result.page.plugins.length) return result;
   const runtime = Object.assign({}, ...plugins.map(p => p.runtime), result.cfgRuntime || {});
   const ids = new Set(plugins.map(p => p.id));

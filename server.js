@@ -64,7 +64,9 @@ function loadPlugins() {
   catch (e) { const warnings = [`Plugins não carregados: ${e.message}`]; return { page: { plugins: [], runtime: {}, warnings }, api: { plugins: [], runtime: {}, warnings, config: { files: [], paths: [], disabled: [], enabled: [], profiles: [], defaultProfile: '', defaultProfileFile: '', profilesError: true } }, count: 0, discovery: { plugins: [], config: { enabled: [], entries: {}, hookTimeoutMs: 3000 }, warnings }, cfgRuntime: {} }; }
 }
 /** The loader's result with the content of a plugin with code only while its code is active (register() worked at the start). */
-const activeContent = loaded => require('./plugins.js').selectContent(loaded, id => pluginHost.statusOf(id) === 'active');
+// The page and /api/plugins get the content of a plugin with code only while it is active; a plugin without code is reread live and
+// only leaves when the host switched it off because a plugin it requires failed to load (contentBlocked).
+const activeContent = loaded => require('./plugins.js').selectContent(loaded, (id, hasCode) => hasCode ? pluginHost.statusOf(id) === 'active' : !pluginHost.contentBlocked(id));
 let store = null;
 /* After the database opens: "Codex (padrão)" when codex is on the PATH (once per database). When it is created on a machine without
    claude and the default is still the untouched "Claude (padrão)", it becomes the default, so agents without a Perfil do not all
@@ -917,6 +919,9 @@ async function startRun(body, internal = {}) {
   const { profile, fallbackFrom } = internal.exact ? { profile: getProfile(opts.profile) || defaultProfile(), fallbackFrom: null } : pickProfile(opts.profile);
   const impl = registry.get(profile.adapter);
   if (!impl) throw new Error(missingAdapter(profile));
+  // validateRunOptions only knows the union of every Adapter's levels: an explicit level must be one the Adapter of the chosen Perfil
+  // announces (a reserve has the same Adapter). '' (the model's default) never gets here; codex adjusts max/ultra to the model itself.
+  if (opts.effort && !impl.efforts.includes(opts.effort)) throw new Error(`O esforço "${opts.effort}" não é aceito pelo Adapter "${profile.adapter}" do Perfil "${profile.name}" (aceitos: ${impl.efforts.join(', ')}).`);
   let release = () => {};
   if (!parent) {
     if (activeCount() >= maxConcurrent) throw Object.assign(new Error(`Limite de ${maxConcurrent} execuções simultâneas atingido.`), { status: 429 });
@@ -1260,7 +1265,10 @@ async function handle(req, res) {
     if (parts[1] === 'plugins' && parts.length > 2 && await pluginHost.route(req, res, url)) return;
     if (req.method === 'GET' && url.pathname === '/api/health') {
       const bin = url.searchParams.get('claudePath') || DEFAULT_BIN;
-      let info = await binVersion(bin);
+      // The standalone probe of the Claude CLI only while the registered "claude" Adapter is the built-in one: a plugin that replaced it
+      // runs its own executable, so its Perfis (the loop below, with the override's probe) decide whether Claude can run.
+      const claudeImpl = registry.get('claude'), builtinClaude = !!claudeImpl && claudeImpl.builtin !== false;
+      let info = builtinClaude ? await binVersion(bin) : { resolved: null, version: null, error: claudeImpl ? `O Adapter "claude" vem de ${claudeImpl.source}: vale o executável dos Perfis Claude.` : 'Adapter "claude" não registrado.' };
       // engines: whether some Perfil of each Adapter can run. claudeVersion (the page's live/demo switch) falls back to the version
       // of the first usable Perfil, so a machine with only Codex is not stuck in the demo; enginePath/engineAdapter say which.
       const engines = Object.fromEntries(registry.kinds().map(k => [k, false]));
@@ -1272,6 +1280,7 @@ async function handle(req, res) {
       }
       if (info.version) engines.claude = true;
       const live = info.version ? { adapter: 'claude', ...info } : usable;
+      if (!builtinClaude && live?.adapter === 'claude') info = { ...info, resolved: live.resolved, error: null };
       if (!info.version && live) info = { ...info, version: live.version };
       return json(res, 200, { ok: true, bridge: 'squad-code', claudeVersion: info.version, claudePath: info.resolved, claudeError: info.error, engines, engineAdapter: live?.adapter || null, enginePath: live?.resolved || null, defaultCwd: process.cwd(), projectsDir: longPath(PROJECTS_DIR), home: HOME, platform: process.platform, adapterSources: Object.fromEntries(registry.kinds().map(k => [k, registry.get(k).source])), activeRuns: activeCount(), maxConcurrent, dbReady: !setupNeeded(), dbPath: store?.file || DB_FILE, profiles: listProfiles().length, plugins: pluginsOn(pluginsBody(activeContent(loadPlugins()))) });
     }
