@@ -3,7 +3,7 @@
 // `npm test` roda este arquivo junto de bridge.test.mjs e adapters.test.mjs. Portas 4700-4799 (bridge.test.mjs usa outras, adapters 4800+).
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync, cpSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -344,6 +344,76 @@ const rawRequest = (port, pathname, headers = {}) => new Promise((resolve, rejec
   req.on('error', reject); req.end();
 });
 const byId = body => Object.fromEntries(body.plugins.map(p => [p.id, p]));
+
+/* ---------- scaffold: npm run plugin:new ---------- */
+const GIT_ENV = { GIT_AUTHOR_NAME: 'Teste', GIT_AUTHOR_EMAIL: 'teste@example.com', GIT_COMMITTER_NAME: 'Teste', GIT_COMMITTER_EMAIL: 'teste@example.com', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+const pluginNew = (args, env) => spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'plugin-new.mjs'), ...args], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, ...GIT_ENV, ...env } });
+
+test('plugin:new --code --dir: cria manifesto, agente, server.mjs, README e .gitignore, git init + commit, registra no squad.local.json; o loader e o bridge carregam sem avisos', async () => {
+  const t = scratch('squad-pl-new-'), dir = path.join(t, 'fora', 'demo-plug'), cfg = path.join(t, 'cfg', 'squad.local.json'), home = scratch('squad-pl-newhome-');
+  const env = { SQUAD_CONFIG: cfg, SQUAD_HOME: home, SQUAD_PLUGINS_DIR: path.join(t, 'repo-plugins') };
+  const r = pluginNew(['demo-plug', '--name', 'Demo Plug', '--code', '--dir', dir], env);
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.match(r.stdout, /Plugin "demo-plug" criado/); assert.match(r.stdout, /reinicie o bridge/);
+  const files = p => readdirSync(p, { recursive: true }).filter(f => !f.startsWith('.git' + path.sep) && f !== '.git').sort();
+  assert.deepEqual(files(dir), ['.gitignore', 'README.md', 'agents', path.join('agents', '01-DEMO-PLUG-01.md'), 'server.mjs', 'squad-plugin.json']);
+  const man = JSON.parse(readFileSync(path.join(dir, 'squad-plugin.json'), 'utf8'));
+  const [maj, min] = require('../package.json').version.split('.');
+  assert.deepEqual(man, { id: 'demo-plug', name: 'Demo Plug', version: '0.1.0', description: 'Plugin Demo Plug do SQUAD/CODE.', squadCode: `^${maj}.${min}.0`, apiVersion: 1, server: 'server.mjs', capabilities: [], categories: [{ key: 'demo-plug', label: 'Demo Plug' }] }, 'fora do clone: sem $schema');
+  assert.deepEqual(validate(SCHEMAS.plugin, man), []);
+  assert.match(readFileSync(path.join(dir, 'server.mjs'), 'utf8'), /export function register\(ctx\)[\s\S]*registerRoute\('GET', '\/ping'[\s\S]*ctx\.on\('run:finish'/);
+  if (spawnSync('git', ['--version']).status === 0) {
+    const log = spawnSync('git', ['-C', dir, 'log', '--oneline'], { encoding: 'utf8' });
+    assert.match(log.stdout, /Demo Plug: estrutura inicial/);
+    assert.equal(spawnSync('git', ['-C', dir, 'status', '--porcelain'], { encoding: 'utf8' }).stdout, '');
+  }
+  const conf = JSON.parse(readFileSync(cfg, 'utf8'));
+  assert.deepEqual(conf.plugins, { paths: [dir], enabled: ['demo-plug'] });
+  assert.equal(conf.$schema, path.join(ROOT, 'schemas', 'squad.schema.json'));
+  assert.equal(existsSync(cfg + '.bak'), false, 'arquivo novo: sem .bak');
+
+  // o loader acha o plugin gerado, sem avisos, e o conteúdo entra (enabled)
+  const loaded = createPluginLoader({ root: t, home, cwd: t, env: { SQUAD_CONFIG: cfg, SQUAD_CONFIG_SHARED: path.join(t, 'nada.json'), SQUAD_PLUGINS_DIR: '' } }).load();
+  assert.deepEqual(loaded.page.warnings, []);
+  const p = loaded.discovery.plugins.find(x => x.id === 'demo-plug');
+  assert.equal(p.status, undefined); assert.deepEqual(p.warnings, []);
+  assert.deepEqual(loaded.page.plugins[0].presets.map(x => [x.name, x.slot, x.role, x.category]), [['DEMO-PLUG-01', 'operator', 'backend', 'demo-plug']]);
+  // e o bridge o carrega como active, com a rota /ping
+  const b = await startBridge({ home, local: conf });
+  const listed = byId(await b.json('/api/plugins'))['demo-plug'];
+  assert.deepEqual([listed.status, listed.routes, listed.events, listed.warnings], ['active', ['GET /api/plugins/demo-plug/ping'], ['run:finish'], []]);
+  assert.deepEqual(await b.json('/api/plugins/demo-plug/ping'), { ok: true, plugin: 'demo-plug' });
+
+  // segunda vez: a pasta existe, recusa; id inválido também
+  const again = pluginNew(['demo-plug', '--dir', dir], env);
+  assert.equal(again.status, 1); assert.match(again.stderr, /já existe/);
+  const bad = pluginNew(['Demo_Plug'], env);
+  assert.equal(bad.status, 1); assert.match(bad.stderr, /id inválido/);
+});
+
+test('plugin:new só conteúdo na pasta .plugins: sem registro no squad.local.json; com --code acrescenta enabled preservando o arquivo (.bak)', () => {
+  const t = scratch('squad-pl-new2-'), repo = path.join(t, '.plugins'), cfg = path.join(t, 'squad.local.json'), home = scratch('squad-pl-new2home-');
+  const env = { SQUAD_CONFIG: cfg, SQUAD_HOME: home, SQUAD_PLUGINS_DIR: repo };
+  const r = pluginNew(['so-conteudo', '--no-git'], env);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(existsSync(path.join(repo, 'so-conteudo', 'agents', '01-SO-CONTEUDO-01.md')));
+  assert.equal(existsSync(path.join(repo, 'so-conteudo', '.git')), false);
+  assert.equal(existsSync(cfg), false, 'nada a registrar: o arquivo não é criado');
+  const loaded = createPluginLoader({ root: t, home, cwd: t, env: { SQUAD_CONFIG_SHARED: path.join(t, 'nada.json'), SQUAD_PLUGINS_DIR: repo } }).load(); // root/squad.local.json = cfg (ausente, sem aviso)
+  assert.deepEqual(loaded.page.warnings, []);
+  assert.deepEqual(loaded.discovery.plugins.map(p => [p.id, p.source, p.status]), [['so-conteudo', 'repo', undefined]]);
+  // arquivo existente: preserva o resto, guarda .bak; --no-content não gera agents/
+  writeJson(cfg, { runtime: { timeoutSec: 60 }, plugins: { enabled: ['outro'] } });
+  const c = pluginNew(['com-codigo', '--code', '--no-content', '--no-git'], env);
+  assert.equal(c.status, 0, c.stderr);
+  assert.deepEqual(JSON.parse(readFileSync(cfg, 'utf8')), { runtime: { timeoutSec: 60 }, plugins: { enabled: ['outro', 'com-codigo'] } });
+  assert.deepEqual(JSON.parse(readFileSync(cfg + '.bak', 'utf8')), { runtime: { timeoutSec: 60 }, plugins: { enabled: ['outro'] } });
+  assert.equal(existsSync(path.join(repo, 'com-codigo', 'agents')), false);
+  assert.ok(existsSync(path.join(repo, 'com-codigo', 'server.mjs')));
+  // dentro de .plugins a pasta precisa ter o nome do id
+  const wrong = pluginNew(['outro-id', '--dir', path.join(repo, 'nome-diferente')], env);
+  assert.equal(wrong.status, 1); assert.match(wrong.stderr, /precisa ter o nome do id/);
+});
 
 test('zero plugins: /api/plugins vazio, health com plugins 0, linha "Plugins: nenhum" e rotas de plugin caem no 404 do núcleo', async () => {
   const b = await startBridge();
