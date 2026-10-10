@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "squad-agent.schema.json",
+  "title": "Frontmatter de um agente de Plugin (agents/<NOME>.md)",
+  "description": "Subconjunto de YAML entre as linhas ---; o corpo do arquivo é o estilo do preset (até 16000 caracteres). Textos aceitam número (o YAML pode ler 2024 como número).",
+  "type": "object",
+  "required": [
+    "name",
+    "slot",
+    "role"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Z0-9][A-Z0-9-]{1,23}$",
+      "description": "Codinome único (embutidos + plugins): MAIÚSCULAS, números e hífen."
+    },
+    "slot": {
+      "enum": [
+        "commander",
+        "adr",
+        "prd",
+        "operator"
+      ],
+      "description": "Lugar no squad."
+    },
+    "category": {
+      "type": "string",
+      "description": "Só operator: key de categoria (do Plugin ou embutida). Vazio = outros.",
+      "anyOf": [
+        {
+          "maxLength": 0
+        },
+        {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,40}$"
+        }
+      ]
+    },
+    "role": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]{1,40}$",
+      "description": "Chave de ROLES (o app descarta role desconhecido)."
+    },
+    "specialty": {
+      "type": [
+        "string",
+        "number"
+      ],
+      "maxLength": 40,
+      "description": "Especialidade."
+    },
+    "icon": {
+      "type": "string",
+      "description": "Ícone.",
+      "anyOf": [
+        {
+          "maxLength": 0
+        },
+        {
+          "pattern": "^[a-z0-9-]{1,40}$"
+        }
+      ]
+    },
+    "model": {
+      "type": "string",
+      "description": "Modelo.",
+      "anyOf": [
+        {
+          "maxLength": 0
+        },
+        {
+          "pattern": "^[A-Za-z0-9._\\-\\[\\]]{1,80}$"
+        }
+      ]
+    },
+    "effort": {
+      "enum": [
+        "",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "description": "Esforço."
+    },
+    "tools": {
+      "type": "array",
+      "maxItems": 9,
+      "items": {
+        "type": "string",
+        "enum": [
+          "Read",
+          "Glob",
+          "Grep",
+          "Edit",
+          "Write",
+          "Bash",
+          "WebFetch",
+          "WebSearch",
+          "NotebookEdit"
+        ]
+      },
+      "description": "Ferramentas do agente, sem repetir."
+    },
+    "avatar": {
+      "type": "string",
+      "description": "Avatar: key embutida (avatar-x ou x) ou key de avatar do Plugin.",
+      "anyOf": [
+        {
+          "maxLength": 0
+        },
+        {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9:/_-]{0,80}$"
+        }
+      ]
+    },
+    "description": {
+      "type": [
+        "string",
+        "number"
+      ],
+      "maxLength": 1000,
+      "description": "Descrição."
+    },
+    "soul": {
+      "type": [
+        "string",
+        "number"
+      ],
+      "maxLength": 1200,
+      "description": "SOUL: tom do agente nos chats."
+    },
+    "hellos": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": [
+          "string",
+          "number"
+        ],
+        "maxLength": 300
+      },
+      "description": "Saudações (uma sorteada por chat)."
+    },
+    "conventions": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "DIRETRIZES do preset.",
+      "properties": {
+        "template": {
+          "type": [
+            "string",
+            "number"
+          ],
+          "maxLength": 80,
+          "description": "Id do template base."
+        },
+        "subsets": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$"
+          },
+          "description": "Ids de subsets."
+        }
+      }
+    }
+  }
+}

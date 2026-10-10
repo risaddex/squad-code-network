@@ -1,0 +1,4 @@
+{
+  "id": "bad-settings", "name": "Bad settings", "version": "1.0.0", "server": "server.mjs",
+  "configSchema": { "type": "object", "required": ["token"], "additionalProperties": false, "properties": { "token": { "type": "string", "minLength": 1 } } }
+}

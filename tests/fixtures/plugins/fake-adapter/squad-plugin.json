@@ -1,0 +1,1 @@
+{ "id": "fake-adapter", "name": "Fake adapter", "version": "1.0.0", "description": "Plugin de teste: registra o Adapter x-echo (bin.mjs).", "server": "server.mjs", "capabilities": ["adapter", "adapter.override"], "env": ["XECHO_DECLARED"] }

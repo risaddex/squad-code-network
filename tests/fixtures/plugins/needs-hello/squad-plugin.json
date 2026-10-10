@@ -1,0 +1,1 @@
+{ "id": "needs-hello", "name": "Needs hello", "version": "1.0.0", "server": "server.mjs", "requires": ["hello"] }

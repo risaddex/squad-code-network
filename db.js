@@ -8,7 +8,8 @@
  * in step with the app's normalizeWorkspace. Generated columns (json_extract) expose the usual fields to SQL. The page sends the
  * whole workspace on every save; syncWorkspace writes only rows whose hash or position changed, in one transaction guarded by `rev`.
  *
- * Also here: versions of the workspace (snapshots), operation-room messages, chats and the bridge's run history.
+ * Also here: versions of the workspace (snapshots), operation-room messages, chats, the bridge's run history (with token usage),
+ * the Perfis (profiles: an Adapter instance with its executable and account folder) and their usage windows, and bridge settings.
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -30,7 +31,11 @@ const KEEP_RUNS = 300;
 const REF_RE = /^[A-Za-z0-9_-]{1,100}$/;
 const CHAT_KEY_RE = { feature: REF_RE, agent: REF_RE, doc: /^[A-Za-z0-9_:+-]{1,800}$/ };
 const ROOM_KINDS = new Set(['system', 'say', 'call', 'baton', 'plan', 'review']);
-const RUN_KINDS = new Set(['step', 'plan', 'chat', 'cowrite', 'doc', 'spawn']);
+const RUN_KINDS = new Set(['step', 'plan', 'chat', 'cowrite', 'doc', 'spawn', 'call', 'probe']);
+const ADAPTERS = ['claude', 'codex'];
+const WINDOWS = ['five_hour', 'seven_day'];
+// Fixed ids of the Perfis created by the migration (the bridge uses the Claude one in memory before a database exists).
+const DEFAULT_PROFILE_IDS = { claude: 'claude-default', codex: 'codex-default' };
 
 /* Entity tree of the workspace: `key` is the path of the array on the parent object, `cols` become generated columns, `keyOf`
    names a row inside its parent (default: the entity id). Adding a child array to the workspace means adding it here. */
@@ -133,6 +138,45 @@ CREATE INDEX runs_project ON runs (project_id, started_at);
 CREATE TABLE run_events (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, seq INTEGER NOT NULL, type TEXT, data TEXT NOT NULL, PRIMARY KEY (run_id, seq));
 `;
 }
+/* Migrations after the first schema, one per user_version (ALTER/CREATE only, never DROP). */
+const MIGRATIONS = [
+  // 2: Perfis, their usage windows, bridge settings and token usage per run.
+  db => {
+    db.exec(`
+CREATE TABLE profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, adapter TEXT NOT NULL, bin TEXT NOT NULL DEFAULT '', config_dir TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', effort TEXT NOT NULL DEFAULT '', concurrency INTEGER NOT NULL DEFAULT 2, fallback_id TEXT, threshold INTEGER NOT NULL DEFAULT 90, ignore_user_config INTEGER NOT NULL DEFAULT 1, telemetry TEXT, is_default INTEGER NOT NULL DEFAULT 0, created_at TEXT, updated_at TEXT);
+CREATE TABLE profile_windows (profile_id TEXT NOT NULL, window TEXT NOT NULL, utilization REAL, resets_at TEXT, observed_at TEXT, PRIMARY KEY (profile_id, window));
+CREATE TABLE bridge_settings (key TEXT PRIMARY KEY, value TEXT);
+ALTER TABLE runs ADD COLUMN profile_id TEXT;
+ALTER TABLE runs ADD COLUMN adapter TEXT;
+ALTER TABLE runs ADD COLUMN model TEXT;
+ALTER TABLE runs ADD COLUMN input_tokens INTEGER;
+ALTER TABLE runs ADD COLUMN cache_read_tokens INTEGER;
+ALTER TABLE runs ADD COLUMN cache_write_tokens INTEGER;
+ALTER TABLE runs ADD COLUMN output_tokens INTEGER;
+ALTER TABLE runs ADD COLUMN reasoning_tokens INTEGER;
+ALTER TABLE runs ADD COLUMN parent_run_id TEXT;
+CREATE INDEX runs_started ON runs (started_at);
+`);
+    const at = nowISO();
+    db.prepare("INSERT INTO profiles (id, name, adapter, telemetry, is_default, created_at, updated_at) VALUES (?, 'Claude (padrão)', 'claude', ?, 1, ?, ?)").run(DEFAULT_PROFILE_IDS.claude, JSON.stringify(TELEMETRY_OFF), at, at);
+  },
+  // 3: token usage per day, Perfil, agent and project, kept apart from the run history (which keeps only the last runs).
+  db => {
+    db.exec(`
+CREATE TABLE usage_daily (day TEXT NOT NULL, profile_id TEXT NOT NULL DEFAULT '', agent_id TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '', runs INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0, PRIMARY KEY (day, profile_id, agent_id, project_id));
+INSERT INTO usage_daily SELECT substr(started_at, 1, 10), coalesce(profile_id, ''), coalesce(agent_id, ''), coalesce(project_id, ''), count(*), coalesce(sum(input_tokens), 0), coalesce(sum(cache_read_tokens), 0), coalesce(sum(cache_write_tokens), 0), coalesce(sum(output_tokens), 0), coalesce(sum(reasoning_tokens), 0), coalesce(sum(cost_usd), 0)
+  FROM runs WHERE coalesce(kind, '') != 'probe' AND status != 'running' GROUP BY 1, 2, 3, 4;
+`);
+  },
+  // 4: Perfis declared in the local configuration (squad.config.json / squad.local.json): source 'config' + the declaring file.
+  db => {
+    db.exec(`
+ALTER TABLE profiles ADD COLUMN source TEXT NOT NULL DEFAULT '';
+ALTER TABLE profiles ADD COLUMN source_file TEXT NOT NULL DEFAULT '';
+`);
+  },
+];
+const TELEMETRY_OFF = { enabled: false, native: false, content: false };
 
 /** Synchronous rename that waits a little when Windows holds the file (antivirus, an editor). */
 function moveSync(from, to) {
@@ -151,6 +195,7 @@ function openStore(dataDir) {
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
   if (db.pragma('user_version', { simple: true }) < 1) db.transaction(() => { db.exec(schema()); db.pragma('user_version = 1'); })();
+  for (let v = db.pragma('user_version', { simple: true }); v <= MIGRATIONS.length; v++) db.transaction(() => { MIGRATIONS[v - 1](db); db.pragma(`user_version = ${v + 1}`); })();
 
   const q = {
     metaGet: db.prepare('SELECT value FROM meta WHERE key = ?').pluck(),
@@ -171,10 +216,30 @@ function openStore(dataDir) {
     chatUpsert: db.prepare('INSERT INTO chats (kind, key, project_id, ref_id, updated_at, data) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (kind, key) DO UPDATE SET project_id = excluded.project_id, ref_id = excluded.ref_id, updated_at = excluded.updated_at, data = excluded.data'),
     chatDelete: db.prepare('DELETE FROM chats WHERE kind = ? AND key = ?'),
     chatAll: db.prepare('SELECT kind, key, data FROM chats'),
-    runInsert: db.prepare('INSERT INTO runs (id, status, label, kind, project, project_id, agent_id, feature_id, cwd, started_at, args) VALUES (@id, @status, @label, @kind, @project, @projectId, @agentId, @featureId, @cwd, @startedAt, @args)'),
+    runInsert: db.prepare('INSERT INTO runs (id, status, label, kind, project, project_id, agent_id, feature_id, cwd, started_at, args, profile_id, adapter, model, parent_run_id) VALUES (@id, @status, @label, @kind, @project, @projectId, @agentId, @featureId, @cwd, @startedAt, @args, @profileId, @adapter, @model, @parentRunId)'),
     runEvent: db.prepare('INSERT OR IGNORE INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)'),
     runCount: db.prepare('UPDATE runs SET events = max(events, ?) WHERE id = ?'),
     runFinish: db.prepare('UPDATE runs SET status = @status, ended_at = @endedAt, result = @result, cost_usd = @costUsd, duration_ms = @durationMs, session_id = @sessionId WHERE id = @id'),
+    usageAdd: db.prepare(`INSERT INTO usage_daily (day, profile_id, agent_id, project_id, runs, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens, cost_usd) VALUES (@day, @profileId, @agentId, @projectId, 1, @input, @cacheRead, @cacheWrite, @output, @reasoning, @costUsd)
+      ON CONFLICT (day, profile_id, agent_id, project_id) DO UPDATE SET runs = runs + 1, input_tokens = input_tokens + excluded.input_tokens, cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens, output_tokens = output_tokens + excluded.output_tokens, reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens, cost_usd = cost_usd + excluded.cost_usd`),
+    runUsage: db.prepare('UPDATE runs SET model = coalesce(@model, model), input_tokens = @input, cache_read_tokens = @cacheRead, cache_write_tokens = @cacheWrite, output_tokens = @output, reasoning_tokens = @reasoning WHERE id = @id'),
+    profAll: db.prepare('SELECT * FROM profiles ORDER BY is_default DESC, created_at, name'),
+    profGet: db.prepare('SELECT * FROM profiles WHERE id = ?'),
+    profDefault: db.prepare('SELECT * FROM profiles WHERE is_default = 1 ORDER BY created_at LIMIT 1'),
+    profInsert: db.prepare('INSERT INTO profiles (id, name, adapter, bin, config_dir, model, effort, concurrency, fallback_id, threshold, ignore_user_config, telemetry, is_default, created_at, updated_at) VALUES (@id, @name, @adapter, @bin, @configDir, @model, @effort, @concurrency, @fallbackId, @threshold, @ignoreUserConfig, @telemetry, 0, @at, @at)'),
+    profUpdate: db.prepare('UPDATE profiles SET name = @name, adapter = @adapter, bin = @bin, config_dir = @configDir, model = @model, effort = @effort, concurrency = @concurrency, fallback_id = @fallbackId, threshold = @threshold, ignore_user_config = @ignoreUserConfig, telemetry = @telemetry, updated_at = @at WHERE id = @id'),
+    profDelete: db.prepare('DELETE FROM profiles WHERE id = ?'),
+    profUpsertCfg: db.prepare(`INSERT INTO profiles (id, name, adapter, bin, config_dir, model, effort, concurrency, fallback_id, threshold, ignore_user_config, telemetry, is_default, created_at, updated_at, source, source_file) VALUES (@id, @name, @adapter, @bin, @configDir, @model, @effort, @concurrency, NULL, @threshold, @ignoreUserConfig, @telemetry, 0, @at, @at, 'config', @sourceFile)
+      ON CONFLICT (id) DO UPDATE SET name = excluded.name, adapter = excluded.adapter, bin = excluded.bin, config_dir = excluded.config_dir, model = excluded.model, effort = excluded.effort, concurrency = excluded.concurrency, fallback_id = NULL, threshold = excluded.threshold, ignore_user_config = excluded.ignore_user_config, telemetry = excluded.telemetry, updated_at = excluded.updated_at, source = 'config', source_file = excluded.source_file`),
+    profSetFallback: db.prepare('UPDATE profiles SET fallback_id = ? WHERE id = ?'),
+    profUnfallback: db.prepare('UPDATE profiles SET fallback_id = NULL WHERE fallback_id = ?'),
+    profClearDefault: db.prepare('UPDATE profiles SET is_default = 0 WHERE is_default = 1'),
+    profSetDefault: db.prepare('UPDATE profiles SET is_default = 1 WHERE id = ?'),
+    winUpsert: db.prepare('INSERT INTO profile_windows (profile_id, window, utilization, resets_at, observed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (profile_id, window) DO UPDATE SET utilization = excluded.utilization, resets_at = excluded.resets_at, observed_at = excluded.observed_at'),
+    winOf: db.prepare('SELECT window, utilization, resets_at AS resetsAt, observed_at AS observedAt FROM profile_windows WHERE profile_id = ?'),
+    winDelete: db.prepare('DELETE FROM profile_windows WHERE profile_id = ?'),
+    setGet: db.prepare('SELECT value FROM bridge_settings WHERE key = ?').pluck(),
+    setSet: db.prepare('INSERT INTO bridge_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value'),
     runGet: db.prepare('SELECT * FROM runs WHERE id = ?'),
     runEvents: db.prepare('SELECT data FROM run_events WHERE run_id = ? ORDER BY seq').pluck(),
     runLastSeq: db.prepare('SELECT coalesce(max(seq), 0) FROM run_events WHERE run_id = ?').pluck(),
@@ -365,12 +430,38 @@ function openStore(dataDir) {
   }
 
   /* ---------- run history ---------- */
-  function insertRun(r) { q.runInsert.run({ id: r.id, status: r.status, label: r.label, kind: r.meta.kind, project: r.project || null, projectId: r.meta.projectId, agentId: r.meta.agentId, featureId: r.meta.featureId, cwd: r.cwd, startedAt: r.startedAt, args: JSON.stringify(r.args) }); }
+  function insertRun(r) { q.runInsert.run({ id: r.id, status: r.status, label: r.label, kind: r.meta.kind, project: r.project || null, projectId: r.meta.projectId, agentId: r.meta.agentId, featureId: r.meta.featureId, cwd: r.cwd, startedAt: r.startedAt, args: JSON.stringify(r.args), profileId: r.profileId || null, adapter: r.adapter || null, model: r.model || null, parentRunId: r.parentRunId || null }); }
   const appendRunEvents = db.transaction((runId, events) => { for (const e of events) q.runEvent.run(runId, e.seq, e.type, e.data); if (events.length) q.runCount.run(events.at(-1).seq, runId); });
-  function finishRun(r, exit) {
-    q.runFinish.run({ id: r.id, status: r.status, endedAt: r.endedAt, result: JSON.stringify(exit).slice(0, 40000), costUsd: exit.costUsd ?? null, durationMs: exit.durationMs ?? null, sessionId: exit.sessionId ?? null });
+  const num = v => Number.isFinite(v) ? Math.round(v) : null;
+  /** Adds a finished run (its row in runs) to the daily usage; done once per run, at finishRun or interruptRuns. */
+  function addUsage(row, costUsd) {
+    if (!row) return;
+    q.usageAdd.run({ day: String(row.started_at).slice(0, 10), profileId: row.profile_id || '', agentId: row.agent_id || '', projectId: row.project_id || '', input: row.input_tokens || 0, cacheRead: row.cache_read_tokens || 0, cacheWrite: row.cache_write_tokens || 0, output: row.output_tokens || 0, reasoning: row.reasoning_tokens || 0, costUsd: Number.isFinite(costUsd) ? costUsd : 0 });
   }
-  const summary = r => r && { id: r.id, status: r.status, label: r.label || '', kind: r.kind, project: r.project, projectId: r.project_id, agentId: r.agent_id, featureId: r.feature_id, cwd: r.cwd, startedAt: r.started_at, endedAt: r.ended_at, costUsd: r.cost_usd, durationMs: r.duration_ms, sessionId: r.session_id, events: r.events };
+  function finishRun(r, exit) {
+    db.transaction(() => {
+      q.runFinish.run({ id: r.id, status: r.status, endedAt: r.endedAt, result: JSON.stringify(exit).slice(0, 40000), costUsd: exit.costUsd ?? null, durationMs: exit.durationMs ?? null, sessionId: exit.sessionId ?? null });
+      const u = exit.usage || {};
+      q.runUsage.run({ id: r.id, model: exit.model || null, input: num(u.input), cacheRead: num(u.cacheRead), cacheWrite: num(u.cacheWrite), output: num(u.output), reasoning: num(u.reasoning) });
+      if (r.meta?.kind !== 'probe') addUsage(q.runGet.get(r.id), exit.costUsd);
+    })();
+  }
+  const summary = r => r && { id: r.id, status: r.status, label: r.label || '', kind: r.kind, project: r.project, projectId: r.project_id, agentId: r.agent_id, featureId: r.feature_id, cwd: r.cwd, startedAt: r.started_at, endedAt: r.ended_at, costUsd: r.cost_usd, durationMs: r.duration_ms, sessionId: r.session_id, events: r.events,
+    profileId: r.profile_id ?? null, adapter: r.adapter ?? null, model: r.model ?? null, parentRunId: r.parent_run_id ?? null,
+    usage: r.input_tokens == null && r.output_tokens == null ? null : { input: r.input_tokens, cacheRead: r.cache_read_tokens, cacheWrite: r.cache_write_tokens, output: r.output_tokens, reasoning: r.reasoning_tokens } };
+  /** Token sums of the app's runs (probes left out) grouped by profile, agent, project or day, from usage_daily (it outlives the
+      run history). Day granularity (UTC days of the run start): `from` takes its day, `to` is exclusive (a mid-day `to` keeps its day). */
+  function usage({ from = '', to = '', by = 'profile' } = {}) {
+    const col = { profile: 'profile_id', agent: 'agent_id', project: 'project_id', day: 'day' }[by];
+    if (!col) throw bad('Agrupamento inválido. Use profile, agent, project ou day.');
+    const fromDay = from ? from.slice(0, 10) : '0000';
+    let toDay = '9999';
+    if (to) { toDay = to.slice(0, 10); if (!/T00:00:00(\.0+)?Z$/.test(to)) toDay = new Date(Date.parse(toDay + 'T00:00:00Z') + 86400000).toISOString().slice(0, 10); }
+    const label = by === 'profile' ? '(SELECT name FROM profiles WHERE id = usage_daily.profile_id)' : 'NULL';
+    const rows = db.prepare(`SELECT ${col} AS key, ${label} AS label, sum(runs) AS runs, sum(input_tokens) AS input, sum(cache_read_tokens) AS cacheRead, sum(cache_write_tokens) AS cacheWrite, sum(output_tokens) AS output, sum(reasoning_tokens) AS reasoning, sum(cost_usd) AS costUsd
+      FROM usage_daily WHERE day >= ? AND day < ? GROUP BY key ORDER BY key`).all(fromDay, toDay);
+    return rows.map(r => { if (r.label == null) delete r.label; if (r.key === '') r.key = null; return r; });
+  }
   function listRuns({ projectId = '', limit = 50 } = {}) {
     const n = Math.min(Math.max(Number(limit) || 50, 1), KEEP_RUNS);
     const rows = projectId ? db.prepare('SELECT * FROM runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?').all(projectId, n) : db.prepare('SELECT * FROM runs ORDER BY started_at DESC LIMIT ?').all(n);
@@ -387,11 +478,99 @@ function openStore(dataDir) {
         const seq = q.runLastSeq.get(id) + 1;
         q.runEvent.run(id, seq, 'exit', JSON.stringify(exit)); q.runCount.run(seq, id);
         q.runFinish.run({ id, status: 'interrupted', endedAt: nowISO(), result: JSON.stringify(exit), costUsd: null, durationMs: null, sessionId: null });
+        const row = q.runGet.get(id);
+        if (row && row.kind !== 'probe') addUsage(row, null);
       }
       q.runPrune.run();
     })();
     return left.length;
   }
+
+  /* ---------- Perfis (profiles) ---------- */
+  const profileOut = r => {
+    if (!r) return null;
+    let telemetry = TELEMETRY_OFF; try { telemetry = { ...TELEMETRY_OFF, ...JSON.parse(r.telemetry || '{}') }; } catch {}
+    return { id: r.id, name: r.name, adapter: r.adapter, bin: r.bin || '', configDir: r.config_dir || '', model: r.model || '', effort: r.effort || '', concurrency: r.concurrency, fallbackId: r.fallback_id || '', threshold: r.threshold, ignoreUserConfig: !!r.ignore_user_config, telemetry, isDefault: !!r.is_default, source: r.source || '', sourceFile: r.source_file || '' };
+  };
+  const profileRow = (p, at = nowISO()) => ({ id: p.id, name: p.name, adapter: p.adapter, bin: p.bin || '', configDir: p.configDir || '', model: p.model || '', effort: p.effort || '', concurrency: p.concurrency, fallbackId: p.fallbackId || null, threshold: p.threshold, ignoreUserConfig: p.ignoreUserConfig ? 1 : 0, telemetry: JSON.stringify({ ...TELEMETRY_OFF, ...p.telemetry }), at });
+  const listProfiles = () => q.profAll.all().map(profileOut);
+  const getProfile = id => profileOut(q.profGet.get(String(id || '')));
+  const defaultProfile = () => profileOut(q.profDefault.get());
+  const nameTaken = e => e?.code === 'SQLITE_CONSTRAINT_UNIQUE' ? bad('Já existe um Perfil com esse nome.', 409) : e;
+  /** `p` comes validated from the bridge (validateProfile). */
+  function createProfile(p) {
+    const id = p.id || 'pf-' + crypto.randomBytes(5).toString('hex');
+    try { q.profInsert.run(profileRow({ ...p, id })); } catch (e) { throw nameTaken(e); }
+    return getProfile(id);
+  }
+  function updateProfile(id, p) {
+    try { q.profUpdate.run(profileRow({ ...p, id })); } catch (e) { throw nameTaken(e); }
+    return getProfile(id);
+  }
+  /** The default Perfil cannot be deleted; reserves that pointed to the removed one are cleared. */
+  function deleteProfile(id) {
+    const p = getProfile(id);
+    if (!p) throw bad('Perfil não encontrado.', 404);
+    if (p.isDefault) throw bad('O Perfil padrão não pode ser excluído. Torne outro Perfil padrão antes.', 409);
+    db.transaction(() => { q.profUnfallback.run(id); q.winDelete.run(id); q.profDelete.run(id); })();
+    return { ok: true };
+  }
+  function setDefaultProfile(id) {
+    if (!getProfile(id)) throw bad('Perfil não encontrado.', 404);
+    db.transaction(() => { q.profClearDefault.run(); q.profSetDefault.run(id); })();
+    return getProfile(id);
+  }
+  /* Perfis of the configuration (server.js applyConfigProfiles): id `cfg-<key>`, upserted with every field from the file and the
+     reserve cleared (set again by setProfileFallback once all of them exist); one that leaves the configuration is removed, its
+     windows and usage_daily rows stay under the same id, so it relinks if it comes back. */
+  function upsertConfigProfile(p, sourceFile) {
+    try { q.profUpsertCfg.run({ ...profileRow(p), sourceFile: String(sourceFile || '') }); } catch (e) { throw nameTaken(e); }
+    return getProfile(p.id);
+  }
+  const setProfileFallback = (id, fallbackId) => q.profSetFallback.run(fallbackId || null, id);
+  /** Removes a configured Perfil; when it was the default, "Claude (padrão)" (or the first one left) becomes the default, and when no
+   *  Perfil is left (the built-in one may have been deleted before) "Claude (padrão)" is created again, so a default always exists. */
+  function removeConfigProfile(id) {
+    const p = getProfile(id);
+    if (!p || p.source !== 'config') return false;
+    db.transaction(() => {
+      q.profUnfallback.run(id); q.profDelete.run(id);
+      if (q.profDefault.get()) return;
+      let next = getProfile(DEFAULT_PROFILE_IDS.claude) || listProfiles()[0];
+      if (!next) { q.profInsert.run(profileRow({ id: DEFAULT_PROFILE_IDS.claude, name: 'Claude (padrão)', adapter: 'claude', concurrency: 2, threshold: 90, ignoreUserConfig: true, telemetry: TELEMETRY_OFF })); next = getProfile(DEFAULT_PROFILE_IDS.claude); }
+      q.profSetDefault.run(next.id);
+    })();
+    return true;
+  }
+  /** Creates "Codex (padrão)" once per database (the bridge calls it when codex is on the PATH); a deleted one stays deleted. */
+  function ensureCodexDefault() {
+    if (q.metaGet.get('codexDefault')) return null;
+    let made = null;
+    db.transaction(() => {
+      setMeta('codexDefault', nowISO());
+      if (q.profGet.get(DEFAULT_PROFILE_IDS.codex) || listProfiles().some(p => p.name === 'Codex (padrão)')) return;
+      q.profInsert.run(profileRow({ id: DEFAULT_PROFILE_IDS.codex, name: 'Codex (padrão)', adapter: 'codex', concurrency: 2, threshold: 90, ignoreUserConfig: true, telemetry: TELEMETRY_OFF }));
+      made = getProfile(DEFAULT_PROFILE_IDS.codex);
+    })();
+    return made;
+  }
+  /** Usage windows: {five_hour: {utilization 0..1, resetsAt ISO}, seven_day: {...}} as observed now. */
+  function saveWindows(profileId, windows) {
+    const at = nowISO();
+    db.transaction(() => {
+      for (const w of WINDOWS) {
+        const v = windows?.[w];
+        if (v && Number.isFinite(v.utilization)) q.winUpsert.run(profileId, w, Math.min(Math.max(v.utilization, 0), 10), v.resetsAt || null, at);
+      }
+    })();
+  }
+  function windowsOf(profileId) {
+    const out = {};
+    for (const r of q.winOf.all(profileId)) out[r.window] = { utilization: r.utilization, resetsAt: r.resetsAt, observedAt: r.observedAt };
+    return out;
+  }
+  const getSetting = key => { const v = q.setGet.get(key); if (v == null) return null; try { return JSON.parse(v); } catch { return null; } };
+  const setSetting = (key, value) => q.setSet.run(key, JSON.stringify(value));
 
   const migration = migrateLegacy();
   const interrupted = interruptRuns();
@@ -400,10 +579,13 @@ function openStore(dataDir) {
     file, migration, interrupted, runMeta,
     syncWorkspace, readWorkspace, backupWorkspace, listSnapshots, getSnapshot,
     saveRoom, loadRooms, saveChat, deleteChat, loadChats, sweep,
-    insertRun, appendRunEvents, finishRun, listRuns, getRun, runEvents,
+    insertRun, appendRunEvents, finishRun, listRuns, getRun, runEvents, usage,
+    listProfiles, getProfile, defaultProfile, createProfile, updateProfile, deleteProfile, setDefaultProfile, ensureCodexDefault, saveWindows, windowsOf,
+    upsertConfigProfile, setProfileFallback, removeConfigProfile, transaction: fn => db.transaction(fn)(),
+    getSetting, setSetting,
     close: () => db.close(),
   };
 }
 
 // driverError: why better-sqlite3 did not load ('' when it did); the bridge checks it at start, before any database exists.
-module.exports = { openStore, hash, checkWorkspace, runMeta, driverError };
+module.exports = { openStore, hash, checkWorkspace, runMeta, driverError, ADAPTERS, WINDOWS, DEFAULT_PROFILE_IDS, TELEMETRY_OFF };

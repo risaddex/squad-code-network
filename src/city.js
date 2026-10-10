@@ -8,6 +8,11 @@ const MapNetwork = (() => {
   const canvas = document.getElementById('cityCanvas');
   const SQ3 = Math.sqrt(3), GRID = 10, TILE_H = .14, PLAZA_H = .34, FOV = 32;
   const C = { bg: 0x070a0b, tile: 0x182226, rim: 0x2b3d46, build: 0x34444b, cyan: 0x30c5e8, purple: 0xad85dd, plaza: 0x0e2229, green: 0x7fcf9d, amber: 0xe0a84a };
+  // Theme of a plugin (docs/plans/plugins-conteudo.md): squadThemeBoot (app.js, same script, hoisted) resolves the saved one before the scene is
+  // built and leaves it in window.SQUAD_THEME; colours arrive as numbers. Only known keys are taken; no theme = the look below.
+  const THEME = (typeof squadThemeBoot === 'function' ? squadThemeBoot() : window.SQUAD_THEME) || {};
+  const themed = (base, over) => { if (over && typeof over === 'object') for (const k of Object.keys(base)) if (typeof over[k] === 'number' && Number.isFinite(over[k])) base[k] = over[k]; return base; };
+  themed(C, THEME.office);
 
   /* ---------- hex math (axial, pointy-top) ---------- */
   const hexToWorld = (q, r) => ({ x: SQ3 * (q + r / 2), z: 1.5 * r });
@@ -130,7 +135,7 @@ const MapNetwork = (() => {
     const markDirty = () => { geoDirty = true; };
     // The city is a dark monochrome island (.inspo/city.jpg): charcoal buildings, light-grey street lines, black water. Cyan stays
     // for what belongs to the agents (plazas, rims, selection, links). The office keeps C and its own exposure.
-    const CITY = { bg: 0x0a0b0c, build: 0x2d3135, tree: 0x222a25, water: 0x07090a, wall: 0x131619, exposure: 1.06 };
+    const CITY = themed({ bg: 0x0a0b0c, build: 0x2d3135, tree: 0x222a25, water: 0x07090a, wall: 0x131619, exposure: 1.06 }, THEME.city);
     const s = new T.Scene(); s.fog = new T.Fog(CITY.bg, 14, 46);
     const camera = new T.PerspectiveCamera(FOV, 16 / 9, .1, 400);
     const hemi = new T.HemisphereLight(0xd9e1e5, 0x0b0c0e, .62); s.add(hemi);
@@ -479,7 +484,7 @@ vFcT = position.y + 0.5;
     const plazas = new Map();
     /* Agents' slots, vivid against the charcoal city: an electric blue body that lights itself, a rim above the bloom threshold
        (HDR colour, so it glows like neon), an outer line and a soft pool of light on the ground. Handoffs keep the purple rims. */
-    const AGENT_BLUE = 0x29c8ff, hdr = (hex, k) => new T.Color(hex).multiplyScalar(k);
+    const AGENT_BLUE = themed({ blue: 0x29c8ff }, THEME.agent).blue, hdr = (hex, k) => new T.Color(hex).multiplyScalar(k);
     const rimColor = () => hdr(linkMode ? C.purple : AGENT_BLUE, 2.6);
     const rimMat = () => new T.LineBasicMaterial({ color: rimColor(), transparent: true, opacity: 1 });
     const poolTex = (() => { const cv = document.createElement('canvas'); cv.width = cv.height = 128; const g = cv.getContext('2d'), grd = g.createRadialGradient(64, 64, 18, 64, 64, 64); grd.addColorStop(0, 'rgba(255,255,255,.75)'); grd.addColorStop(.55, 'rgba(255,255,255,.3)'); grd.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = grd; g.fillRect(0, 0, 128, 128); return new T.CanvasTexture(cv); })();
@@ -579,7 +584,7 @@ vFcT = position.y + 0.5;
     /* ----- the run in the city (ops data from the app): every agent at work glows in the tone of what it does (breathing plaza,
        two rings going out, a light column); a call is a two-way link between caller and callee (runLinks, in rebuildLinks); every
        errand (briefing, baton, delivery for review) sends a comet along the arc from the sender to the receiver, which pulses. ----- */
-    const RUN_TONE = { work: 0x30c5e8, plan: 0xff5a66, wait: 0xe0a84a, call: 0x8fc6ff, baton: 0xad85dd, done: 0x7fcf9d };
+    const RUN_TONE = themed({ work: 0x30c5e8, plan: 0xff5a66, wait: 0xe0a84a, call: 0x8fc6ff, baton: 0xad85dd, done: 0x7fcf9d }, THEME.run);
     const beamTex = (() => { const cv = document.createElement('canvas'); cv.width = 4; cv.height = 128; const g = cv.getContext('2d'), grd = g.createLinearGradient(0, 128, 0, 0); grd.addColorStop(0, 'rgba(255,255,255,.95)'); grd.addColorStop(.25, 'rgba(255,255,255,.45)'); grd.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = grd; g.fillRect(0, 0, 4, 128); return new T.CanvasTexture(cv); })();
     const beamGeo = new T.CylinderGeometry(.42, .62, 3.4, 6, 10, true).translate(0, 1.7, 0);
     const runFx = new Map(), runGroup = new T.Group(); s.add(runGroup);

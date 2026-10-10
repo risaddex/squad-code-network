@@ -1,0 +1,6 @@
+{
+  "id": "code-and-content", "name": "Código e conteúdo", "version": "0.2.0", "description": "Plugin com server e com conteúdo de catálogo no mesmo manifesto.",
+  "server": "server.mjs",
+  "categories": [{ "key": "cc-cat", "label": "Categoria do plugin com código" }],
+  "runtime": { "timeoutSec": 77 }
+}

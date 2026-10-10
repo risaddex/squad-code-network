@@ -7,7 +7,7 @@
     "start": "node server.js",
     "dev": "node scripts/dev.mjs",
     "build": "python build.py",
-    "test": "node --test tests/bridge.test.mjs"
+    "test": "node --test --test-concurrency=1 tests/bridge.test.mjs tests/adapters.test.mjs tests/plugins.test.mjs"
   },
   "engines": {
     "node": ">=22"

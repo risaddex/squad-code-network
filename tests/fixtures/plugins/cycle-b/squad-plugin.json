@@ -1,0 +1,1 @@
+{ "id": "cycle-b", "name": "Cycle b", "version": "1.0.0", "server": "server.mjs", "requires": ["cycle-a"] }
