@@ -1620,6 +1620,15 @@ body:not(.reduce-motion) .at-tile.leaving,.at-tile.leaving{animation:at-leave .4
 .at-chat .fe-typing{border-radius:6px}
 .at-chat .fe-compose{border-top:1px solid #ffffff12;background:#060a0c}
 .at-chat .fe-pill{border-radius:6px}
+.at-feats{display:flex;flex-direction:column;align-items:flex-start;gap:6px;margin:8px 0 2px 30px;max-width:88%}
+.at-feat{align-self:stretch;display:grid;gap:5px;border:1px solid #30c5e833;border-radius:6px;background:#0c1519;padding:8px 10px;font:12.5px/1.4 var(--sans);color:#dfe7ea}
+.at-feat header{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px}
+.at-feat header em{font-style:normal;font-size:11px;color:var(--im-muted)}
+.at-feat p{margin:0;color:#b9c6cb}
+.at-feat .ac-opt,.at-feats>.ac-opt{justify-self:start;padding:4px 11px;font-size:12px}
+.at-feats .ac-opt:disabled{opacity:.45;cursor:not-allowed}
+.at-feat.done{border-color:#3ddc8455}
+.at-feat-link{justify-self:start;color:#3ddc84}
 @keyframes at-join{from{opacity:0;transform:scale(.94) translateY(10px)}to{opacity:1;transform:none}}
 @keyframes at-breathe{0%,100%{transform:translate(-50%,-50%) scale(1)}50%{transform:translate(-50%,-50%) scale(1.025)}}
 @keyframes at-talk{0%,100%{box-shadow:0 0 0 2px #30c5e8cc,0 0 0 7px #30c5e81f,0 18px 50px #000a}50%{box-shadow:0 0 0 3px var(--cyan),0 0 0 15px #30c5e80d,0 18px 50px #000a}}
