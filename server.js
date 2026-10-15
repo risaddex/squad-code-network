@@ -28,7 +28,8 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { spawn, execFile } = require('node:child_process');
+const { execFile } = require('node:child_process');
+const localProcess = require('./execution/local-process');
 
 const ROOT = __dirname;
 const argPort = process.argv.indexOf('--port');
@@ -202,18 +203,6 @@ function projectDir(name) {
   return path.join(longPath(PROJECTS_DIR), folder);
 }
 
-const cmdQuote = s => /^[A-Za-z0-9_\-.:\\/=@,+]+$/.test(s) ? s : `"${String(s).replace(/"/g, '""')}"`;
-
-/** Spawn an executable; .cmd/.bat on Windows must go through cmd.exe. Args are simple tokens only. */
-function spawnBin(resolved, args, opts) {
-  if (IS_WIN && /\.(cmd|bat)$/i.test(resolved)) {
-    const line = [resolved, ...args].map(cmdQuote).join(' ');
-    return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${line}"`], { ...opts, windowsVerbatimArguments: true });
-  }
-  if (/\.(mjs|cjs|js)$/i.test(resolved)) return spawn(process.execPath, [resolved, ...args], opts);
-  return spawn(resolved, args, opts);
-}
-
 /** The environment a child of this Adapter gets: the whole one for a built-in, a minimal one (plus its manifest's `env`) for a plugin's. */
 function adapterEnv(impl) {
   if (!impl || impl.builtin !== false) return process.env;
@@ -239,7 +228,7 @@ function remember(map, key, promise, ok) {
 }
 function probeVersion(resolved, env = null) {
   return new Promise(resolve => {
-    const child = spawnBin(resolved, ['--version'], { windowsHide: true, ...(env ? { env } : {}) });
+    const child = localProcess.spawnBin(resolved, ['--version'], { windowsHide: true, ...(env ? { env } : {}) });
     let out = ''; let err = '';
     const timer = setTimeout(() => child.kill(), 15000);
     child.stdout.on('data', d => { out += d; });
@@ -251,12 +240,6 @@ function probeVersion(resolved, env = null) {
       else resolve({ resolved, version: null, error: (err || out).trim().slice(0, 500) || `exit ${code}` });
     });
   });
-}
-
-function killTree(child) {
-  if (!child || child.exitCode !== null || child.killed) return;
-  if (IS_WIN) execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }, () => {});
-  else { try { process.kill(-child.pid, 'SIGTERM'); } catch { child.kill('SIGTERM'); } }
 }
 
 /* ---------- Adapters (adapters/): everything that depends on the engine behind a Perfil is asked of the registry ---------- */
@@ -1012,7 +995,7 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
     if (shuttingDown) throw Object.assign(new Error('O bridge está encerrando.'), { status: 503 });
     // A Chamado never outlives its caller: checked again here, with no await before the spawn and parent.children.add below.
     if (parent && !parentAlive(parent)) throw Object.assign(new Error('A execução que fez o Chamado já terminou ou foi cancelada.'), { status: 409 });
-    child = spawnBin(resolved, prep.args, { cwd: opts.cwd, windowsHide: true, detached: !IS_WIN, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    child = localProcess.start(resolved, prep.args, { cwd: opts.cwd, env });
   } catch (e) { dropFiles(); throw e; }
   const args = prep.args, stdin = prep.stdin;
   Object.assign(run, { child, files, args: args.map(a => files.find(f => f.path === a)?.mask ?? a) });
@@ -1028,7 +1011,7 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
   for (const n of pluginNotes) pushEvent(run, { type: 'bridge', subtype: 'plugin', plugin: n.plugin, message: `plugin ${n.plugin} acrescentou ${n.chars} caracteres ao system prompt${n.cut ? ` (cortado de ${n.cut} pelo teto de 20000 por plugin)` : ''}` });
   for (const message of warnings) pushEvent(run, { type: 'bridge', subtype: 'warning', message });
 
-  run.timer = setTimeout(() => { run.timedOut = true; pushEvent(run, { type: 'bridge', subtype: 'timeout', timeoutSec: opts.timeoutSec }); killTree(child); }, opts.timeoutSec * 1000);
+  run.timer = setTimeout(() => { run.timedOut = true; pushEvent(run, { type: 'bridge', subtype: 'timeout', timeoutSec: opts.timeoutSec }); localProcess.cancel(child); }, opts.timeoutSec * 1000);
 
   const onLine = line => {
     let evt; try { evt = JSON.parse(line); } catch { evt = null; }
@@ -1038,25 +1021,21 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
     pushEvent(run, evt);
   };
   let buffer = '';
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', chunk => {
+  const onStdout = chunk => {
     buffer += chunk;
     let nl;
     while ((nl = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, nl).trim(); buffer = buffer.slice(nl + 1);
       if (line) onLine(line);
     }
-  });
+  };
   let stderrTail = '';
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk).slice(-4000); pushEvent(run, { type: 'stderr', text: chunk.slice(0, 4000) }); });
-  child.on('error', err => { stderrTail += err.message; run.spawnFailed = true; });
-  child.on('close', code => {
+  const onClose = code => {
     run.closing = true;
     clearTimeout(run.timer);
     if (buffer.trim()) onLine(buffer.trim());
     if (run.mcpKey) mcpTokens.delete(run.mcpKey); // revoked: the run's colleagues can no longer be called
-    for (const c of run.children) if (c.status === 'running') { c.cancelled = true; killTree(c.child); }
+    for (const c of run.children) if (c.status === 'running') { c.cancelled = true; localProcess.cancel(c.child); }
     run.endedAt = new Date().toISOString();
     let fin = {};
     try { fin = impl.finish(forAdapter, { code, durationMs: Date.parse(run.endedAt) - Date.parse(run.startedAt) }) || {}; }
@@ -1101,10 +1080,15 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
     // Keep finished runs for 30 minutes so late subscribers can replay (without the links that would keep their families alive).
     run.parent = null; run.toolSpans = null;
     setTimeout(() => runs.delete(id), 30 * 60 * 1000).unref();
-  });
+  };
 
-  child.stdin.on('error', () => {});
-  child.stdin.end(stdin, 'utf8');
+  localProcess.observe(child, {
+    onStdout,
+    onStderr: chunk => { stderrTail = (stderrTail + chunk).slice(-4000); pushEvent(run, { type: 'stderr', text: chunk.slice(0, 4000) }); },
+    onError: err => { stderrTail += err.message; run.spawnFailed = true; },
+    onClose,
+  });
+  localProcess.writeInput(child, stdin);
   return run;
 }
 
@@ -1358,7 +1342,7 @@ async function handle(req, res) {
         return;
       }
       if (req.method === 'POST' && parts[3] === 'cancel') {
-        if (run.status === 'running') { run.cancelled = true; pushEvent(run, { type: 'bridge', subtype: 'cancel' }); killTree(run.child); }
+        if (run.status === 'running') { run.cancelled = true; pushEvent(run, { type: 'bridge', subtype: 'cancel' }); localProcess.cancel(run.child); }
         return json(res, 200, { ok: true, status: run.status });
       }
       if (req.method === 'GET' && !parts[3]) return json(res, 200, { ok: true, run: runSummary(run), result: run.result });
@@ -1470,7 +1454,7 @@ const server = http.createServer((req, res) => { handle(req, res).catch(err => {
 
 function shutdown() {
   shuttingDown = true;
-  for (const run of runs.values()) { if (run.child) { run.cancelled = true; killTree(run.child); } flushRun(run); }
+  for (const run of runs.values()) { if (run.child) { run.cancelled = true; localProcess.cancel(run.child); } flushRun(run); }
   try { fs.rmSync(TMP_DIR, { recursive: true, force: true }); } catch {}
   server.close();
   // onDispose of the plugins (1 s each, in parallel; a register() still loading gets 1 s first) runs while the process waits to exit; without any, the wait stays 300 ms.

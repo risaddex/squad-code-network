@@ -1719,3 +1719,77 @@ test('schemas: maxBudgetUsd igual ao código e $ref circular vira erro', () => {
   v = {}; for (let i = 0; i < 200; i++) v = { c: v };
   assert.match(validate(tree, v)[0].message, /profunda demais/);
 });
+
+// Characterization of the local transport boundary, independent of its implementation.
+test('local transport preserves fragmented UTF-8 JSONL and a final result without newline', async () => {
+  const dir = tmp('squad-transport-'); extraDirs.push(dir);
+  const engine = path.join(dir, 'fragmented.mjs');
+  writeFileSync(engine, [
+    "if (process.argv.includes('--version')) { console.log('transport-fixture'); process.exit(0); }",
+    "let input = ''; process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', chunk => { input += chunk; });",
+    "process.stdin.on('end', () => {",
+    "  const line = Buffer.from(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'ação 🧪' }] } }) + '\\n');",
+    "  const split = line.indexOf(Buffer.from('ç')) + 1;",
+    "  process.stdout.write(line.subarray(0, split));",
+    "  setTimeout(() => {",
+    "    process.stdout.write(line.subarray(split));",
+    "    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: input }));",
+    "  }, 20);",
+    "});",
+  ].join('\n'));
+  const b = await startBridge(dir, nextPort++, { SQUAD_CLAUDE_BIN: engine });
+  try {
+    const prompt = 'linha 1\nlinha 2: ação 🧪 "texto" $HOME';
+    const res = await b.api('/api/runs', { method: 'POST', body: JSON.stringify({ prompt, options: { cwd: workdir } }) });
+    assert.equal(res.status, 201, await res.clone().text());
+    const { runId } = await res.json();
+    const events = await collect(runId, b.base, b.token);
+    assert.equal(events.find(e => e.type === 'assistant')?.message.content[0].text, 'ação 🧪');
+    assert.equal(events.some(e => e.type === 'raw'), false);
+    assert.equal(events.filter(e => e.type === 'result').length, 1);
+    assert.equal(events.filter(e => e.type === 'exit').length, 1);
+    assert.equal(events.at(-1).status, 'done');
+    assert.equal(events.at(-1).result, prompt);
+    assert.equal((await collect(runId, b.base, b.token)).at(-1).result, prompt);
+  } finally { await b.stop(); }
+});
+
+test('local transport reports asynchronous spawn failure once and releases admission', { skip: process.platform === 'win32' }, async () => {
+  const dir = tmp('squad-spawn-error-'); extraDirs.push(dir);
+  const engine = path.join(dir, 'broken-engine');
+  writeFileSync(engine, '#!' + path.join(dir, 'missing-interpreter') + '\n', { mode: 0o700 });
+  const b = await startBridge(dir);
+  try {
+    const res = await b.api('/api/runs', { method: 'POST', body: JSON.stringify({ prompt: 'spawn failure', systemPrompt: 'temporary instructions', options: { cwd: workdir, claudePath: engine } }) });
+    assert.equal(res.status, 201, await res.clone().text());
+    const events = await collect((await res.json()).runId, b.base, b.token);
+    assert.equal(events.filter(e => e.type === 'exit').length, 1);
+    assert.equal(events.at(-1).status, 'error');
+    assert.equal(events.at(-1).isError, true);
+    assert.match(events.at(-1).error, /ENOENT/);
+    const health = await (await b.api('/api/health')).json();
+    assert.equal(health.ok, true);
+    assert.equal(health.activeRuns, 0);
+    const again = await b.api('/api/runs', { method: 'POST', body: JSON.stringify({ prompt: 'after spawn failure', options: { cwd: workdir } }) });
+    assert.equal(again.status, 201);
+    assert.equal((await collect((await again.json()).runId, b.base, b.token)).at(-1).status, 'done');
+  } finally { await b.stop(); }
+});
+
+test('local transport timeout precedes one terminal event and releases admission', async () => {
+  const dir = tmp('squad-timeout-'); extraDirs.push(dir);
+  const b = await startBridge(dir);
+  try {
+    const res = await b.api('/api/runs', { method: 'POST', body: JSON.stringify({ prompt: 'SLEEP', options: { cwd: workdir, timeoutSec: 10 } }) });
+    assert.equal(res.status, 201);
+    const events = await collect((await res.json()).runId, b.base, b.token);
+    const timeout = events.findIndex(e => e.type === 'bridge' && e.subtype === 'timeout');
+    assert.ok(timeout >= 0 && timeout < events.length - 1);
+    assert.equal(events[timeout].timeoutSec, 10);
+    assert.equal(events.filter(e => e.type === 'exit').length, 1);
+    assert.equal(events.at(-1).status, 'timeout');
+    assert.equal(events.at(-1).isError, true);
+    assert.equal((await (await b.api('/api/health')).json()).activeRuns, 0);
+  } finally { await b.stop(); }
+});
