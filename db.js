@@ -175,6 +175,13 @@ ALTER TABLE profiles ADD COLUMN source TEXT NOT NULL DEFAULT '';
 ALTER TABLE profiles ADD COLUMN source_file TEXT NOT NULL DEFAULT '';
 `);
   },
+  // 5: remote bindings and resumable runs. Local runs still become interrupted on restart.
+  db => db.exec(`ALTER TABLE profiles ADD COLUMN remote TEXT;
+ALTER TABLE runs ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE runs ADD COLUMN remote_profile TEXT;
+ALTER TABLE runs ADD COLUMN remote_deadline INTEGER;
+ALTER TABLE runs ADD COLUMN remote_cancel_requested INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE removed_remote_profiles (id TEXT PRIMARY KEY);`),
 ];
 const TELEMETRY_OFF = { enabled: false, native: false, content: false };
 
@@ -216,7 +223,7 @@ function openStore(dataDir) {
     chatUpsert: db.prepare('INSERT INTO chats (kind, key, project_id, ref_id, updated_at, data) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (kind, key) DO UPDATE SET project_id = excluded.project_id, ref_id = excluded.ref_id, updated_at = excluded.updated_at, data = excluded.data'),
     chatDelete: db.prepare('DELETE FROM chats WHERE kind = ? AND key = ?'),
     chatAll: db.prepare('SELECT kind, key, data FROM chats'),
-    runInsert: db.prepare('INSERT INTO runs (id, status, label, kind, project, project_id, agent_id, feature_id, cwd, started_at, args, profile_id, adapter, model, parent_run_id) VALUES (@id, @status, @label, @kind, @project, @projectId, @agentId, @featureId, @cwd, @startedAt, @args, @profileId, @adapter, @model, @parentRunId)'),
+    runInsert: db.prepare('INSERT INTO runs (id, status, label, kind, project, project_id, agent_id, feature_id, cwd, started_at, args, profile_id, adapter, model, parent_run_id, execution_mode, remote_profile, remote_deadline) VALUES (@id, @status, @label, @kind, @project, @projectId, @agentId, @featureId, @cwd, @startedAt, @args, @profileId, @adapter, @model, @parentRunId, @executionMode, @remoteProfile, @remoteDeadline)'),
     runEvent: db.prepare('INSERT OR IGNORE INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)'),
     runCount: db.prepare('UPDATE runs SET events = max(events, ?) WHERE id = ?'),
     runFinish: db.prepare('UPDATE runs SET status = @status, ended_at = @endedAt, result = @result, cost_usd = @costUsd, duration_ms = @durationMs, session_id = @sessionId WHERE id = @id'),
@@ -226,11 +233,11 @@ function openStore(dataDir) {
     profAll: db.prepare('SELECT * FROM profiles ORDER BY is_default DESC, created_at, name'),
     profGet: db.prepare('SELECT * FROM profiles WHERE id = ?'),
     profDefault: db.prepare('SELECT * FROM profiles WHERE is_default = 1 ORDER BY created_at LIMIT 1'),
-    profInsert: db.prepare('INSERT INTO profiles (id, name, adapter, bin, config_dir, model, effort, concurrency, fallback_id, threshold, ignore_user_config, telemetry, is_default, created_at, updated_at) VALUES (@id, @name, @adapter, @bin, @configDir, @model, @effort, @concurrency, @fallbackId, @threshold, @ignoreUserConfig, @telemetry, 0, @at, @at)'),
-    profUpdate: db.prepare('UPDATE profiles SET name = @name, adapter = @adapter, bin = @bin, config_dir = @configDir, model = @model, effort = @effort, concurrency = @concurrency, fallback_id = @fallbackId, threshold = @threshold, ignore_user_config = @ignoreUserConfig, telemetry = @telemetry, updated_at = @at WHERE id = @id'),
+    profInsert: db.prepare('INSERT INTO profiles (id, name, adapter, bin, config_dir, model, effort, concurrency, fallback_id, threshold, ignore_user_config, telemetry, remote, is_default, created_at, updated_at) VALUES (@id, @name, @adapter, @bin, @configDir, @model, @effort, @concurrency, @fallbackId, @threshold, @ignoreUserConfig, @telemetry, @remote, 0, @at, @at)'),
+    profUpdate: db.prepare('UPDATE profiles SET name = @name, adapter = @adapter, bin = @bin, config_dir = @configDir, model = @model, effort = @effort, concurrency = @concurrency, fallback_id = @fallbackId, threshold = @threshold, ignore_user_config = @ignoreUserConfig, telemetry = @telemetry, remote = @remote, updated_at = @at WHERE id = @id'),
     profDelete: db.prepare('DELETE FROM profiles WHERE id = ?'),
-    profUpsertCfg: db.prepare(`INSERT INTO profiles (id, name, adapter, bin, config_dir, model, effort, concurrency, fallback_id, threshold, ignore_user_config, telemetry, is_default, created_at, updated_at, source, source_file) VALUES (@id, @name, @adapter, @bin, @configDir, @model, @effort, @concurrency, NULL, @threshold, @ignoreUserConfig, @telemetry, 0, @at, @at, 'config', @sourceFile)
-      ON CONFLICT (id) DO UPDATE SET name = excluded.name, adapter = excluded.adapter, bin = excluded.bin, config_dir = excluded.config_dir, model = excluded.model, effort = excluded.effort, concurrency = excluded.concurrency, fallback_id = NULL, threshold = excluded.threshold, ignore_user_config = excluded.ignore_user_config, telemetry = excluded.telemetry, updated_at = excluded.updated_at, source = 'config', source_file = excluded.source_file`),
+    profUpsertCfg: db.prepare(`INSERT INTO profiles (id, name, adapter, bin, config_dir, model, effort, concurrency, fallback_id, threshold, ignore_user_config, telemetry, remote, is_default, created_at, updated_at, source, source_file) VALUES (@id, @name, @adapter, @bin, @configDir, @model, @effort, @concurrency, NULL, @threshold, @ignoreUserConfig, @telemetry, @remote, 0, @at, @at, 'config', @sourceFile)
+      ON CONFLICT (id) DO UPDATE SET name = excluded.name, adapter = excluded.adapter, bin = excluded.bin, config_dir = excluded.config_dir, model = excluded.model, effort = excluded.effort, concurrency = excluded.concurrency, fallback_id = NULL, threshold = excluded.threshold, ignore_user_config = excluded.ignore_user_config, telemetry = excluded.telemetry, remote = excluded.remote, updated_at = excluded.updated_at, source = 'config', source_file = excluded.source_file`),
     profSetFallback: db.prepare('UPDATE profiles SET fallback_id = ? WHERE id = ?'),
     profUnfallback: db.prepare('UPDATE profiles SET fallback_id = NULL WHERE fallback_id = ?'),
     profClearDefault: db.prepare('UPDATE profiles SET is_default = 0 WHERE is_default = 1'),
@@ -430,7 +437,7 @@ function openStore(dataDir) {
   }
 
   /* ---------- run history ---------- */
-  function insertRun(r) { q.runInsert.run({ id: r.id, status: r.status, label: r.label, kind: r.meta.kind, project: r.project || null, projectId: r.meta.projectId, agentId: r.meta.agentId, featureId: r.meta.featureId, cwd: r.cwd, startedAt: r.startedAt, args: JSON.stringify(r.args), profileId: r.profileId || null, adapter: r.adapter || null, model: r.model || null, parentRunId: r.parentRunId || null }); }
+  function insertRun(r) { q.runInsert.run({ id: r.id, status: r.status, label: r.label, kind: r.meta.kind, project: r.project || null, projectId: r.meta.projectId, agentId: r.meta.agentId, featureId: r.meta.featureId, cwd: r.cwd, startedAt: r.startedAt, args: JSON.stringify(r.args), profileId: r.profileId || null, adapter: r.adapter || null, model: r.model || null, parentRunId: r.parentRunId || null, executionMode: r.executionMode || 'local', remoteProfile: r.executionMode === 'remote' ? JSON.stringify(r.profile) : null, remoteDeadline: r.remoteDeadline || null }); }
   const appendRunEvents = db.transaction((runId, events) => { for (const e of events) q.runEvent.run(runId, e.seq, e.type, e.data); if (events.length) q.runCount.run(events.at(-1).seq, runId); });
   const num = v => Number.isFinite(v) ? Math.round(v) : null;
   /** Adds a finished run (its row in runs) to the daily usage; done once per run, at finishRun or interruptRuns. */
@@ -438,16 +445,24 @@ function openStore(dataDir) {
     if (!row) return;
     q.usageAdd.run({ day: String(row.started_at).slice(0, 10), profileId: row.profile_id || '', agentId: row.agent_id || '', projectId: row.project_id || '', input: row.input_tokens || 0, cacheRead: row.cache_read_tokens || 0, cacheWrite: row.cache_write_tokens || 0, output: row.output_tokens || 0, reasoning: row.reasoning_tokens || 0, costUsd: Number.isFinite(costUsd) ? costUsd : 0 });
   }
-  function finishRun(r, exit) {
-    db.transaction(() => {
-      q.runFinish.run({ id: r.id, status: r.status, endedAt: r.endedAt, result: JSON.stringify(exit).slice(0, 40000), costUsd: exit.costUsd ?? null, durationMs: exit.durationMs ?? null, sessionId: exit.sessionId ?? null });
+  function finishRun(r, exit, terminalEvents = []) {
+    return db.transaction(() => {
+      q.runFinish.run({ id: r.id, status: r.status, endedAt: r.endedAt, result: r.executionMode === 'remote' ? JSON.stringify(exit) : JSON.stringify(exit).slice(0, 40000), costUsd: exit.costUsd ?? null, durationMs: exit.durationMs ?? null, sessionId: exit.sessionId ?? null });
       const u = exit.usage || {};
       q.runUsage.run({ id: r.id, model: exit.model || null, input: num(u.input), cacheRead: num(u.cacheRead), cacheWrite: num(u.cacheWrite), output: num(u.output), reasoning: num(u.reasoning) });
-      if (r.meta?.kind !== 'probe') addUsage(q.runGet.get(r.id), exit.costUsd);
+      if (r.executionMode !== 'remote' && r.meta?.kind !== 'probe') addUsage(q.runGet.get(r.id), exit.costUsd);
+      if (r.executionMode === 'remote') {
+        // A restart must replay a terminal exit even if the bridge died before notifying its SSE clients.
+        for (const e of r.pending || []) q.runEvent.run(r.id, e.seq, e.type, e.data);
+        let seq = Math.max(q.runLastSeq.get(r.id), r.saved || 0);
+        for (const event of terminalEvents) q.runEvent.run(r.id, ++seq, event.type, JSON.stringify(event));
+        q.runCount.run(seq, r.id);
+        return seq;
+      }
     })();
   }
   const summary = r => r && { id: r.id, status: r.status, label: r.label || '', kind: r.kind, project: r.project, projectId: r.project_id, agentId: r.agent_id, featureId: r.feature_id, cwd: r.cwd, startedAt: r.started_at, endedAt: r.ended_at, costUsd: r.cost_usd, durationMs: r.duration_ms, sessionId: r.session_id, events: r.events,
-    profileId: r.profile_id ?? null, adapter: r.adapter ?? null, model: r.model ?? null, parentRunId: r.parent_run_id ?? null,
+    profileId: r.profile_id ?? null, adapter: r.adapter ?? null, model: r.model ?? null, parentRunId: r.parent_run_id ?? null, executionMode: r.execution_mode || 'local', ...(r.execution_mode === 'remote' ? { remoteDeadline: r.remote_deadline, cancelRequested: !!r.remote_cancel_requested } : {}),
     usage: r.input_tokens == null && r.output_tokens == null ? null : { input: r.input_tokens, cacheRead: r.cache_read_tokens, cacheWrite: r.cache_write_tokens, output: r.output_tokens, reasoning: r.reasoning_tokens } };
   /** Token sums of the app's runs (probes left out) grouped by profile, agent, project or day, from usage_daily (it outlives the
       run history). Day granularity (UTC days of the run start): `from` takes its day, `to` is exclusive (a mid-day `to` keeps its day). */
@@ -471,7 +486,7 @@ function openStore(dataDir) {
   const runEvents = id => q.runEvents.all(id).map(d => JSON.parse(d));
   /** Runs left 'running' by a bridge that died (Windows kills skip the shutdown) get a closing exit event, which the page needs. */
   function interruptRuns() {
-    const left = db.prepare("SELECT id FROM runs WHERE status = 'running'").pluck().all();
+    const left = db.prepare("SELECT id FROM runs WHERE status = 'running' AND execution_mode != 'remote'").pluck().all();
     db.transaction(() => {
       for (const id of left) {
         const exit = { type: 'exit', status: 'interrupted', code: null, isError: true, result: '', costUsd: null, durationMs: null, numTurns: null, sessionId: null, error: 'O bridge foi encerrado durante a execução.' };
@@ -486,13 +501,18 @@ function openStore(dataDir) {
     return left.length;
   }
 
+  function requestRemoteCancel(id) { db.prepare("UPDATE runs SET remote_cancel_requested = 1 WHERE id = ? AND execution_mode = 'remote' AND status = 'running'").run(id); }
+  function pendingRemoteRuns() {
+    return db.prepare("SELECT * FROM runs WHERE status = 'running' AND execution_mode = 'remote' ORDER BY started_at").all().map(r => ({ run: summary(r), profile: JSON.parse(r.remote_profile), events: runEvents(r.id), saved: q.runLastSeq.get(r.id) }));
+  }
+
   /* ---------- Perfis (profiles) ---------- */
   const profileOut = r => {
     if (!r) return null;
     let telemetry = TELEMETRY_OFF; try { telemetry = { ...TELEMETRY_OFF, ...JSON.parse(r.telemetry || '{}') }; } catch {}
-    return { id: r.id, name: r.name, adapter: r.adapter, bin: r.bin || '', configDir: r.config_dir || '', model: r.model || '', effort: r.effort || '', concurrency: r.concurrency, fallbackId: r.fallback_id || '', threshold: r.threshold, ignoreUserConfig: !!r.ignore_user_config, telemetry, isDefault: !!r.is_default, source: r.source || '', sourceFile: r.source_file || '' };
+    return { id: r.id, name: r.name, adapter: r.adapter, bin: r.bin || '', configDir: r.config_dir || '', model: r.model || '', effort: r.effort || '', concurrency: r.concurrency, fallbackId: r.fallback_id || '', threshold: r.threshold, ignoreUserConfig: !!r.ignore_user_config, telemetry, ...(r.remote ? { remote: JSON.parse(r.remote) } : {}), isDefault: !!r.is_default, source: r.source || '', sourceFile: r.source_file || '' };
   };
-  const profileRow = (p, at = nowISO()) => ({ id: p.id, name: p.name, adapter: p.adapter, bin: p.bin || '', configDir: p.configDir || '', model: p.model || '', effort: p.effort || '', concurrency: p.concurrency, fallbackId: p.fallbackId || null, threshold: p.threshold, ignoreUserConfig: p.ignoreUserConfig ? 1 : 0, telemetry: JSON.stringify({ ...TELEMETRY_OFF, ...p.telemetry }), at });
+  const profileRow = (p, at = nowISO()) => ({ id: p.id, name: p.name, adapter: p.adapter, bin: p.bin || '', configDir: p.configDir || '', model: p.model || '', effort: p.effort || '', concurrency: p.concurrency, fallbackId: p.fallbackId || null, threshold: p.threshold, ignoreUserConfig: p.ignoreUserConfig ? 1 : 0, telemetry: JSON.stringify({ ...TELEMETRY_OFF, ...p.telemetry }), remote: p.remote ? JSON.stringify(p.remote) : null, at });
   const listProfiles = () => q.profAll.all().map(profileOut);
   const getProfile = id => profileOut(q.profGet.get(String(id || '')));
   const defaultProfile = () => profileOut(q.profDefault.get());
@@ -508,11 +528,13 @@ function openStore(dataDir) {
     return getProfile(id);
   }
   /** The default Perfil cannot be deleted; reserves that pointed to the removed one are cleared. */
+  const wasRemoteProfile = id => !!db.prepare('SELECT 1 FROM removed_remote_profiles WHERE id = ?').get(String(id || ''));
+  const rememberRemoteProfile = p => { if (p.remote) db.prepare('INSERT OR IGNORE INTO removed_remote_profiles (id) VALUES (?)').run(p.id); };
   function deleteProfile(id) {
     const p = getProfile(id);
     if (!p) throw bad('Perfil não encontrado.', 404);
     if (p.isDefault) throw bad('O Perfil padrão não pode ser excluído. Torne outro Perfil padrão antes.', 409);
-    db.transaction(() => { q.profUnfallback.run(id); q.winDelete.run(id); q.profDelete.run(id); })();
+    db.transaction(() => { rememberRemoteProfile(p); q.profUnfallback.run(id); q.winDelete.run(id); q.profDelete.run(id); })();
     return { ok: true };
   }
   function setDefaultProfile(id) {
@@ -534,7 +556,7 @@ function openStore(dataDir) {
     const p = getProfile(id);
     if (!p || p.source !== 'config') return false;
     db.transaction(() => {
-      q.profUnfallback.run(id); q.profDelete.run(id);
+      rememberRemoteProfile(p); q.profUnfallback.run(id); q.profDelete.run(id);
       if (q.profDefault.get()) return;
       let next = getProfile(DEFAULT_PROFILE_IDS.claude) || listProfiles()[0];
       if (!next) { q.profInsert.run(profileRow({ id: DEFAULT_PROFILE_IDS.claude, name: 'Claude (padrão)', adapter: 'claude', concurrency: 2, threshold: 90, ignoreUserConfig: true, telemetry: TELEMETRY_OFF })); next = getProfile(DEFAULT_PROFILE_IDS.claude); }
@@ -579,8 +601,8 @@ function openStore(dataDir) {
     file, migration, interrupted, runMeta,
     syncWorkspace, readWorkspace, backupWorkspace, listSnapshots, getSnapshot,
     saveRoom, loadRooms, saveChat, deleteChat, loadChats, sweep,
-    insertRun, appendRunEvents, finishRun, listRuns, getRun, runEvents, usage,
-    listProfiles, getProfile, defaultProfile, createProfile, updateProfile, deleteProfile, setDefaultProfile, ensureCodexDefault, saveWindows, windowsOf,
+    insertRun, appendRunEvents, finishRun, listRuns, getRun, runEvents, pendingRemoteRuns, requestRemoteCancel, usage,
+    listProfiles, getProfile, wasRemoteProfile, defaultProfile, createProfile, updateProfile, deleteProfile, setDefaultProfile, ensureCodexDefault, saveWindows, windowsOf,
     upsertConfigProfile, setProfileFallback, removeConfigProfile, transaction: fn => db.transaction(fn)(),
     getSetting, setSetting,
     close: () => db.close(),

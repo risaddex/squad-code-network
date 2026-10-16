@@ -9,7 +9,7 @@ const BUILTIN = ['claude', 'codex'];
 const KIND_RE = /^[a-z][a-z0-9-]{0,39}$/;
 const COLLEAGUES = ['native', 'mcp', 'none'];
 const REQUIRED_FNS = ['defaultBin', 'notFound', 'catalog', 'resolveModelEffort', 'prepare', 'finish', 'refreshWindows'];
-const OPTIONAL_FNS = ['home', 'profileExtras', 'status', 'validateProfile', 'validateLaunch', 'nativeTelemetry', 'onEvent', 'settingsFile'];
+const OPTIONAL_FNS = ['home', 'profileExtras', 'status', 'validateProfile', 'validateLaunch', 'nativeTelemetry', 'onEvent', 'settingsFile', 'prepareRemote'];
 
 /** Throws a message naming the first thing wrong with an Adapter implementation. */
 function validateAdapter(impl) {
@@ -20,7 +20,9 @@ function validateAdapter(impl) {
   if (!Array.isArray(impl.efforts) || !impl.efforts.every(e => typeof e === 'string' && e)) throw new Error(`${at}: "efforts" deve ser uma lista de textos.`);
   if (typeof impl.genAiSystem !== 'string' || !impl.genAiSystem) throw new Error(`${at}: "genAiSystem" deve ser um texto.`);
   if (!COLLEAGUES.includes(impl.colleagues)) throw new Error(`${at}: "colleagues" deve ser ${COLLEAGUES.join(', ')}.`);
-  for (const f of REQUIRED_FNS) if (typeof impl[f] !== 'function') throw new Error(`${at}: "${f}" deve ser uma função.`);
+  if (impl.executionMode !== undefined && !['local', 'remote'].includes(impl.executionMode)) throw new Error(`${at}: executionMode inválido.`);
+  const required = impl.executionMode === 'remote' ? ['catalog', 'status', 'startRemote', 'resumeRemote'] : REQUIRED_FNS;
+  for (const f of required) if (typeof impl[f] !== 'function') throw new Error(`${at}: "${f}" deve ser uma função.`);
   for (const f of OPTIONAL_FNS) if (impl[f] !== undefined && typeof impl[f] !== 'function') throw new Error(`${at}: "${f}", quando existe, deve ser uma função.`);
 }
 

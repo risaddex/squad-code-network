@@ -64,7 +64,7 @@ const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp'];
 // Perfis declared in the configuration (`profiles`): the same fields POST /api/profiles takes (server.js PROFILE_FIELDS) plus `key`.
 // The bridge validates them with validateProfile; here only the shape, the key and the paths (resolved against the declaring file).
 const PROFILE_KEY_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
-const PROFILE_FIELDS = ['name', 'adapter', 'bin', 'configDir', 'model', 'effort', 'concurrency', 'fallbackId', 'threshold', 'ignoreUserConfig', 'telemetry'];
+const PROFILE_FIELDS = ['name', 'adapter', 'bin', 'configDir', 'model', 'effort', 'concurrency', 'fallbackId', 'threshold', 'ignoreUserConfig', 'telemetry', 'remote'];
 const MAX_CONFIG_PROFILES = 50;
 const TELEMETRY_KEYS = ['enabled', 'native', 'content'];
 // Plugins with code (docs/plans/plugins.md): what a manifest may ask for (capabilities) and the events the bridge can emit. The schemas
