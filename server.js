@@ -86,6 +86,7 @@ async function afterOpen() {
   })();
   if (pluginHost.pending) await pluginHost.ready; // register(ctx) of the plugins first (they may add Adapters the configured Perfis name)
   await syncConfigProfiles(codex);
+  recoverRemoteRuns();
 }
 function openDb() {
   store = dbModule.openStore(DATA_DIR);
@@ -276,8 +277,10 @@ function overLimit(p) {
 }
 /** Perfil of a run: the one asked (unknown/empty: the default), or its reserve when it is over the threshold and the reserve is not. */
 function pickProfile(id) {
-  const asked = getProfile(id) || defaultProfile();
-  if (asked.fallbackId && overLimit(asked)) {
+  const found = getProfile(id);
+  if (!found && store?.wasRemoteProfile(id)) throw Object.assign(new Error('O Perfil remoto foi removido. Escolha explicitamente outro Perfil.'), { status: 409 });
+  const asked = found || defaultProfile();
+  if (registry.get(asked.adapter)?.executionMode !== 'remote' && asked.fallbackId && overLimit(asked)) {
     const reserve = getProfile(asked.fallbackId);
     if (reserve && reserve.adapter === asked.adapter && reserve.id !== asked.id && !overLimit(reserve)) return { profile: reserve, fallbackFrom: asked.id };
   }
@@ -287,7 +290,7 @@ function pickProfile(id) {
    reserved synchronously, so parallel requests cannot all pass a cap of 1. */
 const admitting = { total: 0, byProfile: new Map() };
 const admitBump = (pid, n) => { admitting.total += n; admitting.byProfile.set(pid, (admitting.byProfile.get(pid) || 0) + n); };
-function activeOf(profileId) { return [...runs.values()].filter(r => r.status === 'running' && !r.parentRunId && r.profileId === profileId).length + (admitting.byProfile.get(profileId) || 0); }
+function activeOf(profileId) { return [...runs.values()].filter(r => r.status === 'running' && (!r.parentRunId || r.remoteOrphan) && r.profileId === profileId).length + (admitting.byProfile.get(profileId) || 0); }
 function callsOf(profileId) { return [...runs.values()].filter(r => r.status === 'running' && r.parentRunId && r.profileId === profileId).length; }
 
 async function profileStatus(p) {
@@ -315,7 +318,7 @@ async function profileView(p) {
   return view;
 }
 
-function adaptersCatalog() { return Object.fromEntries(registry.kinds().map(k => [k, { ...registry.get(k).catalog(), adapterSource: registry.get(k).source }])); }
+function adaptersCatalog() { return Object.fromEntries(registry.kinds().map(k => [k, { ...registry.get(k).catalog(), ...(registry.get(k).executionMode === 'remote' ? { executionMode: 'remote' } : {}), adapterSource: registry.get(k).source }])); }
 
 const PROFILE_FIELDS = require('./plugins/loader.js').CONSTANTS.PROFILE_FIELDS;
 /** Checks a Perfil sent by the page (a PUT may send only some fields: the rest comes from `current`). */
@@ -332,6 +335,12 @@ async function validateProfile(body, current = null) {
   if (current && src.adapter !== current.adapter) throw new Error('O Adapter de um Perfil não muda depois de criado.');
   const impl = registry.get(src.adapter);
   p.adapter = src.adapter;
+  if (src.remote !== undefined) {
+    if (!src.remote || typeof src.remote !== 'object' || Array.isArray(src.remote) || Buffer.byteLength(JSON.stringify(src.remote)) > 4096) throw new Error('Vínculo remoto inválido ou grande demais.');
+    p.remote = JSON.parse(JSON.stringify(src.remote));
+  }
+  if (impl.executionMode === 'remote' && (src.bin || src.configDir || src.fallbackId || src.model || src.effort || src.telemetry?.native)) throw new Error('Perfil remoto não aceita executável, configuração local, modelo, esforço, telemetria nativa ou reserva.');
+  if (impl.executionMode !== 'remote' && src.remote !== undefined) throw new Error('Vínculo remoto exige um Adapter remoto.');
   p.configDir = typeof src.configDir === 'string' ? src.configDir.trim() : '';
   if (p.configDir) {
     p.configDir = expandHome(p.configDir);
@@ -548,14 +557,14 @@ function expandFrom(dir, p) {
   if (/^~[\\/]/.test(p)) return path.join(HOME, p.slice(2));
   return path.resolve(dir, p);
 }
-const BODY_TYPES = { name: 'string', adapter: 'string', bin: 'string', configDir: 'string', model: 'string', effort: 'string', fallbackId: 'string', concurrency: 'integer', threshold: 'integer', ignoreUserConfig: 'boolean', telemetry: 'object' };
+const BODY_TYPES = { remote: 'remote', name: 'string', adapter: 'string', bin: 'string', configDir: 'string', model: 'string', effort: 'string', fallbackId: 'string', concurrency: 'integer', threshold: 'integer', ignoreUserConfig: 'boolean', telemetry: 'object' };
 /** Types first (null, numbers as text...): nothing is coerced into the file. */
 function checkBodyTypes(body) {
   if (!isPlain(body)) throw badRequest('Perfil inválido.');
   for (const [k, t] of Object.entries(BODY_TYPES)) {
     if (body[k] === undefined) continue;
     const v = body[k];
-    const ok = t === 'integer' ? Number.isInteger(v) : t === 'object' ? isPlain(v) && Object.entries(v).every(([tk, tv]) => ['enabled', 'native', 'content'].includes(tk) && typeof tv === 'boolean') : typeof v === t;
+    const ok = t === 'remote' ? isPlain(v) && Buffer.byteLength(JSON.stringify(v)) <= 4096 : t === 'integer' ? Number.isInteger(v) : t === 'object' ? isPlain(v) && Object.entries(v).every(([tk, tv]) => ['enabled', 'native', 'content'].includes(tk) && typeof tv === 'boolean') : typeof v === t;
     if (!ok) throw badRequest(`Campo ${k}: ${t === 'integer' ? 'deve ser um número inteiro' : t === 'object' ? 'deve ser um objeto {enabled, native, content} com true ou false' : t === 'boolean' ? 'deve ser true ou false' : 'deve ser texto'}.`);
   }
 }
@@ -752,14 +761,14 @@ function nativeTelemetry(run, impl, profile, env, args, warn) {
 }
 
 /* ---------- runs ---------- */
-function activeCount() { return [...runs.values()].filter(r => r.status === 'running' && !r.parentRunId).length + admitting.total; }
+function activeCount() { return [...runs.values()].filter(r => r.status === 'running' && (!r.parentRunId || r.remoteOrphan)).length + admitting.total; }
 
-function pushEvent(run, event) {
+function pushEvent(run, event, persist = true) {
   run.events.push(event);
   if (run.events.length > MAX_EVENTS) run.events.splice(0, run.events.length - MAX_EVENTS);
   const line = `data: ${JSON.stringify(event)}\n\n`;
   for (const res of run.clients) res.write(line);
-  persistEvent(run, event);
+  if (persist) persistEvent(run, event);
   observe(run, event);
   // stream_event only reaches the handlers that asked ({partial: true}, with run.content); nothing is built without a listener.
   const seq = ++run.evSeq;
@@ -805,6 +814,111 @@ function storedEvent(event) {
   if (event.type !== 'user' || !Array.isArray(event.message?.content)) return event;
   const block = b => b?.type !== 'tool_result' ? b : { ...b, content: Array.isArray(b.content) ? b.content.map(x => x?.type === 'text' ? { ...x, text: cut4k(x.text) } : x) : cut4k(b.content) };
   return { ...event, message: { ...event.message, content: event.message.content.map(block) } };
+}
+
+/** Remote options never create local directories or forward CLI flags. The gateway owns its environment. */
+function validateRemoteOptions(o = {}, profile) {
+  if (!o || typeof o !== 'object' || Array.isArray(o)) throw new Error('Opções inválidas.');
+  const project = typeof o.project === 'string' && o.project.trim() ? o.project.trim() : profile.remote?.localProject || '';
+  if (!project || project !== profile.remote?.localProject) throw new Error('A operação não corresponde ao vínculo do Perfil remoto.');
+  const timeout = Number(o.timeoutSec);
+  return { profile: profile.id, project, cwd: '', timeoutSec: Number.isFinite(timeout) && timeout >= 10 && timeout <= 7200 ? timeout : 900 };
+}
+
+function remoteRunState({ id, profile, opts, body = {}, saved = null, parent = null }) {
+  const run = {
+    id, executionMode: 'remote', status: 'running', startedAt: saved?.run.startedAt || new Date().toISOString(), endedAt: null,
+    label: saved?.run.label ?? String(body.label || '').slice(0, 200), cwd: '', args: [], child: null,
+    events: saved ? saved.events.slice(-MAX_EVENTS) : [], clients: new Set(), result: null, timer: null, cancelled: false,
+    meta: dbModule.runMeta(saved?.run || body.meta), project: saved?.run.project || opts.project, persist: true, saved: saved?.saved || 0, pending: [], flushTimer: null,
+    profile, impl: registry.get(profile.adapter), profileId: profile.id, profileName: profile.name, adapter: profile.adapter, model: '', opts,
+    parent, parentRunId: saved?.run.parentRunId || parent?.id || null, rootRunId: parent?.rootRunId || id, children: new Set(), evSeq: saved?.saved || 0, toolSpans: null,
+    remoteDeadline: saved ? saved.run.remoteDeadline : Date.now() + opts.timeoutSec * 1000,
+    remoteOrphan: !!saved?.run.parentRunId,
+    cancelRequested: !!saved?.run.cancelRequested,
+  };
+  run.done = new Promise(resolve => { run.resolveDone = resolve; });
+  return run;
+}
+
+function finishRemoteRun(run, terminal) {
+  if (run.status !== 'running') return;
+  const r = terminal.result && typeof terminal.result === 'object' ? terminal.result : { result: typeof terminal.result === 'string' ? terminal.result : '' };
+  const result = typeof r.result === 'string' ? r.result : '';
+  const endedAt = new Date().toISOString(), isError = terminal.status !== 'done';
+  const exit = { type: 'exit', status: terminal.status, code: null, isError, result, costUsd: null, usage: null,
+    durationMs: Date.parse(endedAt) - Date.parse(run.startedAt), numTurns: null, sessionId: typeof r.session_id === 'string' ? r.session_id : null,
+    error: isError ? String(terminal.error || (terminal.status === 'cancelled' ? 'Cancelamento remoto confirmado.' : 'Execução remota falhou.')).slice(0, 1500) : null,
+    profileId: run.profileId, adapter: run.adapter, model: null, ...(terminal.remote ? { remote: terminal.remote } : {}) };
+  if (Buffer.byteLength(JSON.stringify(exit)) > 1048576) throw new Error('Resultado remoto excede o limite.');
+  // The plugin has already durably observed a terminal task. Commit the bridge history before notifying subscribers.
+  const resultEvent = { type: 'result', result, is_error: isError, ...(exit.sessionId ? { session_id: exit.sessionId } : {}) };
+  run.saved = store.finishRun({ ...run, status: terminal.status, endedAt }, exit, [resultEvent, exit]);
+  clearTimeout(run.flushTimer); run.flushTimer = null; run.pending.length = 0;
+  run.status = terminal.status; run.endedAt = endedAt; clearTimeout(run.timer);
+  run.result = resultEvent;
+  pushEvent(run, structuredClone(run.result), false);
+  pushEvent(run, exit, false);
+  pluginHost.emit('run:finish', () => ({ runId: run.id, parentRunId: run.parentRunId, kind: run.meta.kind, profileId: run.profileId, adapter: run.adapter,
+    model: null, status: run.status, isError, error: exit.error, errorCode: isError ? run.status === 'cancelled' ? 'cancelled' : 'agent-error' : null,
+    code: null, costUsd: null, durationMs: exit.durationMs, numTurns: null, usage: null, sessionId: exit.sessionId }));
+  for (const res of run.clients) res.end();
+  run.clients.clear(); run.closeRemote?.(); run.parent?.children.delete(run); run.parent = null; run.resolveDone(exit);
+  setTimeout(() => runs.delete(run.id), 30 * 60 * 1000).unref();
+}
+
+function attachRemoteRun(run, resume, prompt, systemPrompt) {
+  require('./execution/remote-run.js').attachRemote(run, emit => {
+    const impl = registry.get(run.adapter);
+    if (!impl || impl.executionMode !== 'remote') throw new Error('Adapter remoto indisponível.');
+    const args = { id: run.id, profile: structuredClone(run.profile), emit };
+    return resume ? impl.resumeRemote(args) : impl.startRemote({ ...args, prompt, systemPrompt, opts: { ...run.opts } });
+  }, { pushEvent, finish: finishRemoteRun, flush: flushRun, recordCancel: r => store.requestRemoteCancel(r.id) });
+  if (run.remoteDeadline) run.timer = setTimeout(() => {
+    pushEvent(run, { type: 'bridge', subtype: 'timeout', message: 'Prazo local atingido; aguardando cancelamento remoto confirmado.' });
+    run.cancelRemote().catch(() => pushEvent(run, { type: 'bridge', subtype: 'remote_uncertain', message: 'Não foi possível persistir o pedido de cancelamento.' }));
+  }, Math.max(0, run.remoteDeadline - Date.now()));
+}
+
+async function launchRemoteRun(body, internal, opts, profile, impl, prompt, systemPrompt) {
+  if (!store) throw new Error('Crie o banco do SQUAD/CODE antes de executar um agente remoto.');
+  impl.validateLaunch?.(opts, profile);
+  const parent = internal.parent || null, id = crypto.randomUUID();
+  if (internal.exact) throw new Error('Sondas de uso não são suportadas por Perfis remotos.');
+  if (pluginHost.listens('run:beforeSpawn')) {
+    const hook = await pluginHost.beforeSpawn({ runId: id, parentRunId: parent?.id || null, isCall: !!parent, kind: dbModule.runMeta(body.meta).kind, project: opts.project,
+      projectId: body.meta?.projectId || null, agentId: body.meta?.agentId || null, featureId: body.meta?.featureId || null,
+      profile: { id: profile.id, name: profile.name, adapter: profile.adapter }, model: '', effort: '', tools: null, permissionMode: null, cwd: '',
+      promptChars: prompt.length, hasSystemPrompt: !!systemPrompt.trim(), agentSlugs: [], prompt, systemPrompt });
+    if (hook.appendSystem) systemPrompt = [systemPrompt, hook.appendSystem].filter(Boolean).join('\n\n');
+  }
+  if (shuttingDown) throw Object.assign(new Error('O bridge está encerrando.'), { status: 503 });
+  if (parent && !parentAlive(parent)) throw Object.assign(new Error('A execução que fez o Chamado já terminou ou foi cancelada.'), { status: 409 });
+  const run = remoteRunState({ id, profile: structuredClone(profile), opts, body, parent });
+  // Optional durable preparation must not dispatch. A crash here may leave an unsent plugin intent, never a submitted task without bridge history.
+  if (impl.prepareRemote) await impl.prepareRemote({ id, profile: structuredClone(run.profile), prompt, systemPrompt, opts: { ...opts } });
+  if (shuttingDown) throw Object.assign(new Error('O bridge está encerrando.'), { status: 503 });
+  if (parent && !parentAlive(parent)) throw Object.assign(new Error('A execução que fez o Chamado já terminou ou foi cancelada.'), { status: 409 });
+  // A durable local intent is mandatory before the plugin can send anything to the gateway.
+  store.insertRun(run); runs.set(id, run); parent?.children.add(run);
+  pluginHost.emit('run:start', () => ({ runId: id, parentRunId: run.parentRunId, rootRunId: run.rootRunId, kind: run.meta.kind, label: run.label, project: run.project,
+    projectId: run.meta.projectId, agentId: run.meta.agentId, featureId: run.meta.featureId, profileId: profile.id, profileName: profile.name, adapter: profile.adapter,
+    model: null, cwd: '', pid: null, startedAt: run.startedAt, fallbackFrom: null, prompt, systemPrompt }));
+  pushEvent(run, { type: 'bridge', subtype: 'profile', profileId: profile.id, name: profile.name, adapter: profile.adapter, executionMode: 'remote' });
+  pushEvent(run, { type: 'bridge', subtype: 'remote', message: 'Ambiente, modelo, permissões e ferramentas são definidos no gateway; opções locais de CLI não são encaminhadas.' });
+  attachRemoteRun(run, false, prompt, systemPrompt);
+  return run;
+}
+
+function recoverRemoteRuns() {
+  if (!store || shuttingDown || pluginHost.pending) return;
+  for (const saved of store.pendingRemoteRuns()) {
+    if (runs.has(saved.run.id)) continue;
+    const profile = saved.profile;
+    const run = remoteRunState({ id: saved.run.id, profile, opts: { profile: profile.id, project: saved.run.project, cwd: '' }, saved });
+    runs.set(run.id, run);
+    attachRemoteRun(run, true);
+  }
 }
 
 function validateRunOptions(o = {}) {
@@ -896,16 +1010,17 @@ async function startRun(body, internal = {}) {
   if (!prompt.trim()) throw new Error('Prompt vazio.');
   if (prompt.length > 400000) throw new Error('Prompt muito grande.');
   const systemPrompt = typeof body.systemPrompt === 'string' ? body.systemPrompt.slice(0, 100000) : '';
-  const opts = validateRunOptions(body.options);
   const parent = internal.parent || null;
   // A sync of the configured Perfis still running (database just opened, configuration changed) finishes first; awaited before the
   // slot below is taken, which stays synchronous.
   if (pluginHost.pending) await pluginHost.ready;
   await configProfilesReady();
   // internal.exact: that Perfil and no other (the usage probe of Configurações > Perfis).
-  const { profile, fallbackFrom } = internal.exact ? { profile: getProfile(opts.profile) || defaultProfile(), fallbackFrom: null } : pickProfile(opts.profile);
+  const requestedProfile = typeof body.options?.profile === 'string' ? body.options.profile.trim().slice(0, 100) : '';
+  const { profile, fallbackFrom } = internal.exact ? { profile: getProfile(requestedProfile) || defaultProfile(), fallbackFrom: null } : pickProfile(requestedProfile);
   const impl = registry.get(profile.adapter);
   if (!impl) throw new Error(missingAdapter(profile));
+  const opts = impl.executionMode === 'remote' ? validateRemoteOptions(body.options, profile) : validateRunOptions(body.options);
   // validateRunOptions only knows the union of every Adapter's levels: the effective level (the run's, else the Perfil's) must be one
   // the Adapter of the chosen Perfil announces (a reserve has the same Adapter; a Perfil saved before an override may hold a level the
   // new one lacks). '' (the model's default) never gets here; codex adjusts max/ultra to the model itself.
@@ -926,6 +1041,7 @@ async function startRun(body, internal = {}) {
 }
 
 async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prompt, systemPrompt) {
+  if (impl.executionMode === 'remote') return launchRemoteRun(body, internal, opts, profile, impl, prompt, systemPrompt);
   const parent = internal.parent || null;
   const adapter = profile.adapter;
   // claudePath (runtime) only counts when the Perfil has no executable of its own.
@@ -1035,7 +1151,7 @@ async function launchRun(body, internal, opts, profile, impl, fallbackFrom, prom
     clearTimeout(run.timer);
     if (buffer.trim()) onLine(buffer.trim());
     if (run.mcpKey) mcpTokens.delete(run.mcpKey); // revoked: the run's colleagues can no longer be called
-    for (const c of run.children) if (c.status === 'running') { c.cancelled = true; localProcess.cancel(c.child); }
+    for (const c of run.children) if (c.status === 'running') { if (c.executionMode === 'remote') { c.remoteOrphan = true; c.cancelRemote?.().catch(() => {}); } else { c.cancelled = true; localProcess.cancel(c.child); } }
     run.endedAt = new Date().toISOString();
     let fin = {};
     try { fin = impl.finish(forAdapter, { code, durationMs: Date.parse(run.endedAt) - Date.parse(run.startedAt) }) || {}; }
@@ -1153,11 +1269,12 @@ async function handleMcp(req, res) {
 async function refreshWindows(p) {
   const impl = registry.get(p.adapter);
   if (!impl) throw new Error(missingAdapter(p));
+  if (impl.executionMode === 'remote') throw new Error('Uso remoto não é informado por este Adapter.');
   return impl.refreshWindows(p);
 }
 
 function runSummary(r) {
-  return { id: r.id, status: r.status, label: r.label, ...r.meta, project: r.project, startedAt: r.startedAt, endedAt: r.endedAt, cwd: r.cwd, events: r.events.length, profileId: r.profileId, adapter: r.adapter, model: r.model || null, parentRunId: r.parentRunId, usage: r.usage || null, costUsd: r.result?.total_cost_usd ?? r.result?.cost_usd ?? null, durationMs: r.result?.duration_ms ?? null, sessionId: r.result?.session_id ?? null };
+  return { executionMode: r.executionMode || 'local', cancelRequested: !!r.cancelRequested, id: r.id, status: r.status, label: r.label, ...r.meta, project: r.project, startedAt: r.startedAt, endedAt: r.endedAt, cwd: r.cwd, events: r.events.length, profileId: r.profileId, adapter: r.adapter, model: r.model || null, parentRunId: r.parentRunId, usage: r.usage || null, costUsd: r.result?.total_cost_usd ?? r.result?.cost_usd ?? null, durationMs: r.result?.duration_ms ?? null, sessionId: r.result?.session_id ?? null };
 }
 
 /* ---------- settings.json ---------- */
@@ -1259,6 +1376,7 @@ async function handle(req, res) {
   if (!tokenOk(req, url)) return fail(res, 401, 'Token do bridge inválido. Recarregue a página servida pelo bridge.');
 
   if (pluginHost.pending) await pluginHost.ready;
+  recoverRemoteRuns();
 
   const parts = url.pathname.split('/').filter(Boolean); // ['api', ...]
   try {
@@ -1276,8 +1394,8 @@ async function handle(req, res) {
       let usable = null;
       for (const p of listProfiles()) {
         if (!registry.has(p.adapter)) continue; // its Adapter is not registered (plugin off): the Perfil cannot run
-        const v = await binVersion(profileBin(p, bin), registry.get(p.adapter));
-        if (v.version) { engines[p.adapter] = true; if (!usable) usable = { adapter: p.adapter, ...v }; }
+        const v = registry.get(p.adapter).executionMode === 'remote' ? await profileStatus(p) : await binVersion(profileBin(p, bin), registry.get(p.adapter));
+        if (registry.get(p.adapter).executionMode === 'remote' ? v.available === true : !!v.version) { engines[p.adapter] = true; if (!usable) usable = { adapter: p.adapter, ...v }; }
       }
       if (info.version) engines.claude = true;
       const live = info.version ? { adapter: 'claude', ...info } : usable;
@@ -1342,7 +1460,7 @@ async function handle(req, res) {
         return;
       }
       if (req.method === 'POST' && parts[3] === 'cancel') {
-        if (run.status === 'running') { run.cancelled = true; pushEvent(run, { type: 'bridge', subtype: 'cancel' }); localProcess.cancel(run.child); }
+        if (run.status === 'running') { if (run.executionMode === 'remote') await run.cancelRemote(); else { run.cancelled = true; pushEvent(run, { type: 'bridge', subtype: 'cancel' }); localProcess.cancel(run.child); } }
         return json(res, 200, { ok: true, status: run.status });
       }
       if (req.method === 'GET' && !parts[3]) return json(res, 200, { ok: true, run: runSummary(run), result: run.result });
@@ -1420,7 +1538,7 @@ async function handle(req, res) {
       }
       if (parts[3] === 'test' && req.method === 'POST') {
         const status = await profileStatus(current);
-        return json(res, 200, { ok: !!status.version && status.configDirOk, status });
+        return json(res, 200, { ok: registry.get(current.adapter)?.executionMode === 'remote' ? status.available === true : !!status.version && status.configDirOk, status });
       }
       if (parts[3] === 'refresh' && req.method === 'POST') {
         const out = await refreshWindows(current);
@@ -1454,7 +1572,7 @@ const server = http.createServer((req, res) => { handle(req, res).catch(err => {
 
 function shutdown() {
   shuttingDown = true;
-  for (const run of runs.values()) { if (run.child) { run.cancelled = true; localProcess.cancel(run.child); } flushRun(run); }
+  for (const run of runs.values()) { if (run.executionMode === 'remote') run.closeRemote?.(); if (run.child) { run.cancelled = true; localProcess.cancel(run.child); } flushRun(run); }
   try { fs.rmSync(TMP_DIR, { recursive: true, force: true }); } catch {}
   server.close();
   // onDispose of the plugins (1 s each, in parallel; a register() still loading gets 1 s first) runs while the process waits to exit; without any, the wait stays 300 ms.

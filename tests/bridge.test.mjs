@@ -50,7 +50,7 @@ async function startBridge(dataDir, port = nextPort++, extraEnv = {}) {
     api: (p, init = {}) => fetch(base + p, { ...init, headers: { 'content-type': 'application/json', 'x-squad-token': tok, ...(init.headers || {}) } }),
     // hard: SIGKILL, no shutdown, like closing the terminal (what proc.kill() already is on Windows; elsewhere SIGTERM runs the
     // graceful shutdown, which cancels the live runs itself).
-    stop: async (hard = false) => { if (proc.exitCode === null) { const exited = new Promise(r => proc.once('exit', r)); proc.kill(hard ? 'SIGKILL' : 'SIGTERM'); await exited; } },
+    stop: async (hard = false) => { if (proc.exitCode === null && proc.signalCode === null) { const exited = new Promise(r => proc.once('exit', r)); proc.kill(hard ? 'SIGKILL' : 'SIGTERM'); await exited; } },
   };
   bridges.push(b);
   return b;
@@ -697,7 +697,7 @@ test('Perfis: the in-memory default before the database, the migration creates C
   await b.stop();
   const db = new Database(path.join(dir, 'squad.db'), { readonly: true });
   try {
-    assert.equal(db.pragma('user_version', { simple: true }), 4);
+    assert.equal(db.pragma('user_version', { simple: true }), 5);
     assert.ok(db.prepare('PRAGMA table_info(runs)').all().some(c => c.name === 'parent_run_id'));
   } finally { db.close(); }
   // A deleted Codex (padrão) is not created again at the next start.
@@ -1488,7 +1488,7 @@ test('Perfis da configuração: item inválido não trava os outros; o Perfil fi
   assert.equal(byId['cfg-nova'], undefined); // not created
   const w = body.configWarnings.join('\n');
   assert.match(w, /profiles\[0\]: "key" ausente ou inválida \(Bad Key/);
-  assert.match(w, /Perfil nova: adapter: valor "gemini" não aceito/);
+  assert.match(w, /Perfil nova \(squad\.local\.json\): Adapter inválido/);
   // Writing to an invalid item is refused until the file is fixed.
   const res = await b.api('/api/profiles/cfg-ruim', { method: 'PUT', body: JSON.stringify({ model: 'opus' }) });
   assert.equal(res.status, 409);
@@ -1504,7 +1504,8 @@ test('schemas: patterns e enums iguais às constantes do código; o validador co
   const same = (node, re, label) => assert.equal(pat(node), re.source, label);
   const cfg = SCHEMAS.config, prof = cfg.$defs.profile.properties, plugin = SCHEMAS.plugin, agent = SCHEMAS.agent.properties;
   same(prof.key, C.PROFILE_KEY_RE, 'profile.key'); same(prof.model, C.MODEL_RE, 'profile.model');
-  assert.deepEqual(prof.adapter.enum, C.ADAPTERS);
+  for (const kind of [...C.ADAPTERS, 'a2a', 'x-echo']) assert.deepEqual(validate(prof.adapter, kind), []);
+  for (const kind of ['Bad Kind', '../a2a', '']) assert.ok(validate(prof.adapter, kind).length);
   assert.deepEqual(new Set(prof.effort.enum), new Set(['', ...C.EFFORTS, ...C.CODEX_EFFORTS]));
   assert.deepEqual(Object.keys(prof).sort(), ['key', ...C.PROFILE_FIELDS].sort());
   assert.deepEqual(Object.keys(prof.telemetry.properties), C.TELEMETRY_KEYS);

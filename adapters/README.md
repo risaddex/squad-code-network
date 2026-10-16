@@ -31,7 +31,7 @@ const undo = registry.register(impl, { override, source, env }); // plugins; dev
 
 ## Interface
 
-Campos obrigatórios:
+Campos obrigatórios do modo local (padrão):
 
 | Campo | Tipo | Para quê |
 |---|---|---|
@@ -67,9 +67,24 @@ Recebe `{ id, run, opts, profile, model, effort, prompt, systemPrompt, env, tmpD
   telemetria).
 - `env`: o ambiente da execução, já montado pelo núcleo; o Adapter acrescenta o seu (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`...).
 
-Regras que valem para todo Adapter: execução de projeto roda com cwd `projects/<pasta>` e `GIT_CEILING_DIRECTORIES`; o Claude
+Regras do modo local: execução de projeto roda com cwd `projects/<pasta>` e `GIT_CEILING_DIRECTORIES`; o Claude
 recebe `--settings` com `claudeMdExcludes` (`APP_MEMORY_EXCLUDES`: `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/CLAUDE.md`,
 `.claude/rules/**` deste app) e `permissions.blockReadsOutsideWorkingDirectories`; o Codex nunca roda com `danger-full-access`.
+
+## Modo remoto
+
+Declare `executionMode: 'remote'`. Os campos `kind`, `label`, `efforts`, `genAiSystem`, `colleagues` e `catalog()` continuam obrigatórios; os métodos de subprocesso são substituídos por:
+
+- `status(profile)`: dados públicos; `available: true` indica configuração utilizável, sem exigir versão de CLI. Não é prova de execução no provedor.
+- `prepareRemote({id, profile, opts, prompt, systemPrompt})` (opcional no contrato genérico): chamado após os hooks e antes de persistir/admitir no bridge; deve preparar intenção durável sem enviar tarefa. O plugin A2A o implementa para fechar a janela entre seus dois journals.
+- `startRemote({id, profile, opts, prompt, systemPrompt, emit})`: inicia acompanhamento da intenção preparada.
+- `resumeRemote({id, profile, emit})`: retoma exclusivamente por identidade persistida, sem prompt nem novo ID.
+
+Os dois últimos retornam `{done: Promise, cancel(), close()}`. `done` resolve somente para `{status: 'done'|'error'|'cancelled', result: {type:'result', result: texto, is_error: boolean}, remote?, error?}` confirmado. Uma falha de transporte não confirma um desfecho. `close()` interrompe observação local; não cancela a tarefa nem resolve `done`. O core guarda cancelamento e deadline e os reaplica após restart.
+
+Eventos públicos vão para `emit(event)`; `result` e `exit` são gerados pelo core quando `done` resolve. `{type:'remote_task', remote:{taskId, agentId, projectId, environmentId}}` alimenta console/histórico. O catálogo pode anunciar `executionMode: 'remote'` e `discoveryPath` sob `/api/plugins/` para o formulário genérico. Perfis guardam binding em `remote`, sem usar `bin`/`configDir` como URL.
+
+Veja o [cliente A2A](../plugins/a2a-client/README.md) e [ADR 0005](../docs/adr/0005-remote-executor-a2a.md). O core não cria pasta/Git, não lança CLI e não transfere opções locais nesse modo. Adapters remotos são responsáveis pela idempotência, autenticação e autoridade de seu journal. Custos e tokens desconhecidos permanecem `null` por execução e fora dos agregados locais.
 
 ## Adicionar um motor
 
@@ -100,7 +115,7 @@ export function register(ctx) {
 - Exemplo completo e testado: `tests/fixtures/plugins/fake-adapter/`. Guia dos plugins: [`plugins/README.md`](../plugins/README.md).
 
 Para um Adapter embutido novo: um arquivo `adapters/<kind>.js` no mesmo formato, o kind em `BUILTIN`, nas constantes `ADAPTERS`
-de `plugins/loader.js` e `db.js` e no enum de `schemas/squad.schema.json` (um teste confere que as listas batem).
+de `plugins/loader.js` e `db.js` ; o schema aceita kinds de plugin pelo mesmo formato do registro, e a disponibilidade é validada pelo bridge.
 
 ## Testes
 
@@ -114,5 +129,4 @@ node --test --test-concurrency=1 tests/adapters.test.mjs
 node --test --test-name-pattern "golden" tests/adapters.test.mjs
 ```
 
-Os testes usam `tests/fake-claude.mjs` e `tests/fake-codex.mjs` (sem custo de API). `npm test` roda os três arquivos de teste em
-sequência (`--test-concurrency=1`).
+Os testes usam `tests/fake-claude.mjs` e `tests/fake-codex.mjs` (sem custo de API). `npm test` roda as suítes de regressão local e remota em sequência (`--test-concurrency=1`).
