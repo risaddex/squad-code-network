@@ -8,7 +8,9 @@
     "dev": "node scripts/dev.mjs",
     "build": "python build.py",
     "plugin:new": "node scripts/plugin-new.mjs",
-    "test": "node --test --test-concurrency=1 tests/bridge.test.mjs tests/adapters.test.mjs tests/plugins.test.mjs"
+    "test": "node --test --test-concurrency=1 tests/bridge.test.mjs tests/adapters.test.mjs tests/plugins.test.mjs tests/core-remote.test.mjs tests/a2a-client.test.mjs tests/a2a-ui.test.mjs tests/remote-lifecycle.test.mjs",
+    "test:a2a-runtime": "node scripts/probe-a2a-runtime.mjs",
+    "test:remote:coverage": "node --test --test-concurrency=1 --experimental-test-coverage --test-coverage-include='plugins/a2a-client/*.mjs' --test-coverage-include='execution/remote-run.js' --test-coverage-lines=80 --test-coverage-functions=80 --test-coverage-branches=80 tests/a2a-client.test.mjs tests/core-remote.test.mjs tests/remote-lifecycle.test.mjs"
   },
   "engines": {
     "node": ">=22"

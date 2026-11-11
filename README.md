@@ -360,6 +360,9 @@ código):
 
 > O código de um plugin roda no processo do bridge, com as permissões da sua conta. Instale só código em que você confia.
 
+O plugin versionado [`a2a-client`](plugins/a2a-client/README.md) permite selecionar agentes remotos por Card, vincular uma operação a um ambiente stateful e acompanhar tarefas no histórico. É opt-in pela configuração local e usa um gateway central autenticado. Claude e Codex locais continuam disponíveis. O adapter remoto usa o ponto de extensão descrito no [ADR 0005](docs/adr/0005-remote-executor-a2a.md). Custos e tokens remotos não informados ficam desconhecidos no histórico e são excluídos dos agregados de uso local.
+
+
 ---
 
 ## 🛠️ Desenvolvimento, build e testes
@@ -373,7 +376,9 @@ código):
 | `python build.py` | Build completo: regenera `src/avatars.js` (precisa de Pillow) e `index.html`. No macOS/Linux use `python3` |
 | `python build.py --copy` | O mesmo, e também grava uma cópia em `../squad-code-network.html` (fora da pasta do projeto) |
 | `npm run plugin:new -- <id>` | Cria um plugin em `.plugins/<id>/` (veja [`plugins/README.md`](plugins/README.md#criar-um-plugin)) |
-| `npm test` | Testes do bridge, dos adapters e dos plugins (`node --test` sobre `tests/bridge.test.mjs`, `tests/adapters.test.mjs` e `tests/plugins.test.mjs`, em sequência), com Claude e Codex falsos: sem custo de API |
+| `npm run test:remote:coverage` | Cobertura dos novos módulos de transporte remoto e cliente A2A; limiares de 80% para linhas, funções e branches. |
+| `npm run test:a2a-runtime -- /caminho/agent-runtime` | Prova opt-in contra gateway real compilado e executor fake; loopback e arquivos temporários. `--inspect` mantém a UI de teste aberta até Ctrl+C. |
+| `npm test` | Testes do bridge, adapters, plugins, cliente A2A e helpers da UI, em sequência, com fixtures: sem custo de API |
 | `node --test --test-name-pattern "<nome>" tests/bridge.test.mjs` | Roda um único teste do bridge |
 | `node --check src/app.js` | Verificação rápida de sintaxe depois de editar |
 | `node scripts/vendor-three.mjs [versão]` | Regenera `src/vendor/three.min.js` (baixa three + esbuild numa pasta temporária) |

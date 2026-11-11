@@ -1,0 +1,5 @@
+{
+ "id":"a2a-client","name":"A2A Client","version":"1.0.0","squadCode":"^2.1.0","apiVersion":1,
+ "description":"Cliente autenticado de tarefas A2A com retomada persistente.","server":"server.mjs","capabilities":["adapter"],"env":["SQUAD_A2A_TOKEN"],
+ "configSchema":{"type":"object","additionalProperties":false,"required":["gatewayUrl"],"properties":{"gatewayUrl":{"type":"string","maxLength":2048},"pollIntervalMs":{"type":"integer","minimum":10,"maximum":30000},"requestTimeoutMs":{"type":"integer","minimum":20,"maximum":60000}}}
+}

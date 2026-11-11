@@ -190,11 +190,9 @@
           "description": "Nome mostrado no app, único entre os Perfis."
         },
         "adapter": {
-          "enum": [
-            "claude",
-            "codex"
-          ],
-          "description": "Tipo de CLI: claude (claude -p) ou codex (codex exec)."
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,39}$",
+          "description": "Adapter embutido ou registrado por plugin local habilitado."
         },
         "bin": {
           "type": "string",
@@ -270,6 +268,39 @@
               "description": "Incluir prompt e resposta."
             }
           }
+        },
+        "remote": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "projectId",
+            "agentId",
+            "environmentId",
+            "localProject"
+          ],
+          "properties": {
+            "projectId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "agentId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "environmentId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "localProject": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          },
+          "description": "Vínculo público do ambiente remoto; nunca contém token ou endpoint arbitrário."
         }
       }
     },

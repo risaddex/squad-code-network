@@ -230,6 +230,18 @@ invalid item only freezes that Perfil. Config, plugin manifest and agent frontma
   `preventDefault`ed inside `<summary>`), all refreshed by `refreshDocAgents` when the squad changes. It starts from the page
   form's current values; "Salvar no projeto" (`#docForm` → `saveProjectDoc`) writes back into `#projectForm`, calls `saveProject`
   (a new operation only fills the form: "Aplicar ao formulário") and opens and highlights every page place.
+  Features in the meetup: the commander and the PRD (never a guest or the ADR) may send `"features":[{title, scope, priority,
+  summary, criteria?, sprint?}]` (system prompt; the prompt lists the operation's features and sprints). `applyDocWrite` →
+  `docFeatures` validates them (title required, editor scopes/priorities, editor limits, at most `TEAMS_FEATS` 5, none already in the
+  operation; the rest is dropped with a console warning) and `chatApply` keeps them on the message (`m.feats`, persisted with the chat);
+  `docFeatsHTML` shows one card each with "Criar feature" / "Criar todas" (`teams-feat` → `teamsCreateFeatures`). Nothing is created
+  without that click: it goes through `newFeatureFor` + `addFeature` (the same helpers `featureDraftFor`/`saveFeature` use: next F key,
+  F00 dependency, `ensureSetup`, `log`), the asked sprint (`docSprint`) or `currentSprint`, then `save()`; `x.created` turns the card
+  into "Criada: F0X" (`teams-feature` opens it), so it never creates twice. The doc chat knows its operation by `c.pid` (null for
+  `ui.opsNew`: cards disabled, "Salve a operação no projeto..."). `meetingHandoff(p)` gives the feature co-writer (`coWritePrompt`)
+  and the commander/PRD agent chat (`agentChatPrompt`) a "## Reuniões recentes" section: lines of this operation's doc chats
+  (`ui.docChats` keys `<projectId>:...` plus the open meetup), oldest first, cut from the oldest side to `MEETING_MAX` (6000) chars,
+  plus the features created from cards; '' without a meetup.
 
 **Domain model.**
 - Positions (`a.hex`, `a.desk`) are unique per squad, not per workspace: `takenHexes`/`takenDesks` only look at `squad()`
